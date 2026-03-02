@@ -13,14 +13,17 @@ model sampling shift, and guide frame lifecycle management.
 
 import contextlib
 import math
+import types
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
+import comfy.ldm.common_dit
 import comfy.ldm.modules.attention
 import comfy.model_patcher
 import comfy.model_sampling
 import comfy.nested_tensor
+import comfy.patcher_extension
 import comfy.sample
 import comfy.samplers
 import comfy.utils
@@ -103,6 +106,173 @@ class STGBlockWrapper:
 
 
 # ---------------------------------------------------------------------------
+# VRAM-efficient block forward — based on kjnodes LTX2ForwardPatch
+# ---------------------------------------------------------------------------
+
+def _ltx2_forward(
+    self,
+    x: Tuple[torch.Tensor, torch.Tensor],
+    v_context=None, a_context=None, attention_mask=None,
+    v_timestep=None, a_timestep=None,
+    v_pe=None, a_pe=None, v_cross_pe=None, a_cross_pe=None,
+    v_cross_scale_shift_timestep=None, a_cross_scale_shift_timestep=None,
+    v_cross_gate_timestep=None, a_cross_gate_timestep=None,
+    transformer_options=None, **extra_kwargs,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """VRAM-efficient LTXAV block forward with per-modality attention scaling.
+
+    Replaces the default block forward with explicit intermediate tensor
+    deletion to reduce peak VRAM usage for long video generation.
+    Based on kjnodes ltx2_forward.
+    """
+    run_vx = transformer_options.get("run_vx", True)
+    run_ax = transformer_options.get("run_ax", True)
+    video_scale = getattr(self, "video_scale", 1.0)
+    audio_scale = getattr(self, "audio_scale", 1.0)
+    audio_to_video_scale = getattr(self, "audio_to_video_scale", 1.0)
+    video_to_audio_scale = getattr(self, "video_to_audio_scale", 1.0)
+
+    vx, ax = x
+    run_ax = run_ax and ax.numel() > 0 and audio_scale != 0.0
+    run_a2v = (run_vx and transformer_options.get("a2v_cross_attn", True)
+               and ax.numel() > 0 and audio_to_video_scale != 0.0)
+    run_v2a = (run_ax and transformer_options.get("v2a_cross_attn", True)
+               and video_to_audio_scale != 0.0)
+
+    # Video self-attention
+    if run_vx:
+        vshift_msa, vscale_msa = self.get_ada_values(
+            self.scale_shift_table, vx.shape[0], v_timestep, slice(0, 2))
+        norm_vx = comfy.ldm.common_dit.rms_norm(vx) * (1 + vscale_msa) + vshift_msa
+        del vshift_msa, vscale_msa
+        attn1_out = self.attn1(norm_vx, pe=v_pe, transformer_options=transformer_options)
+        del norm_vx
+        vgate_msa = self.get_ada_values(
+            self.scale_shift_table, vx.shape[0], v_timestep, slice(2, 3))[0]
+        vx += attn1_out * vgate_msa * video_scale
+        del vgate_msa, attn1_out
+        vx.add_(self.attn2(
+            comfy.ldm.common_dit.rms_norm(vx), context=v_context,
+            mask=attention_mask, transformer_options=transformer_options,
+        ), alpha=video_scale)
+
+    # Audio self-attention
+    if run_ax:
+        ashift_msa, ascale_msa = self.get_ada_values(
+            self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(0, 2))
+        norm_ax = comfy.ldm.common_dit.rms_norm(ax) * (1 + ascale_msa) + ashift_msa
+        del ashift_msa, ascale_msa
+        attn1_out = self.audio_attn1(norm_ax, pe=a_pe, transformer_options=transformer_options)
+        del norm_ax
+        agate_msa = self.get_ada_values(
+            self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(2, 3))[0]
+        ax += attn1_out * agate_msa * audio_scale
+        del agate_msa, attn1_out
+        ax.add_(self.audio_attn2(
+            comfy.ldm.common_dit.rms_norm(ax), context=a_context,
+            mask=attention_mask, transformer_options=transformer_options,
+        ), alpha=audio_scale)
+
+    # Audio-Video cross attention
+    if run_a2v or run_v2a:
+        vx_norm3 = comfy.ldm.common_dit.rms_norm(vx)
+        ax_norm3 = comfy.ldm.common_dit.rms_norm(ax)
+
+        if run_a2v:
+            scale_v, shift_v = self.get_ada_values(
+                self.scale_shift_table_a2v_ca_video[:4, :], vx.shape[0],
+                v_cross_scale_shift_timestep, slice(0, 2))
+            vx_scaled = vx_norm3 * (1 + scale_v) + shift_v
+            del scale_v, shift_v
+            scale_a, shift_a = self.get_ada_values(
+                self.scale_shift_table_a2v_ca_audio[:4, :], ax.shape[0],
+                a_cross_scale_shift_timestep, slice(0, 2))
+            ax_scaled = ax_norm3 * (1 + scale_a) + shift_a
+            del scale_a, shift_a
+            a2v_out = self.audio_to_video_attn(
+                vx_scaled, context=ax_scaled, pe=v_cross_pe,
+                k_pe=a_cross_pe, transformer_options=transformer_options)
+            del vx_scaled, ax_scaled
+            gate_a2v = self.get_ada_values(
+                self.scale_shift_table_a2v_ca_video[4:, :], vx.shape[0],
+                v_cross_gate_timestep, slice(0, 1))[0]
+            vx += a2v_out * gate_a2v * audio_to_video_scale
+            del gate_a2v, a2v_out
+
+        if run_v2a:
+            scale_v, shift_v = self.get_ada_values(
+                self.scale_shift_table_a2v_ca_video[:4, :], vx.shape[0],
+                v_cross_scale_shift_timestep, slice(2, 4))
+            vx_scaled = vx_norm3 * (1 + scale_v) + shift_v
+            del scale_v, shift_v, vx_norm3
+            scale_a, shift_a = self.get_ada_values(
+                self.scale_shift_table_a2v_ca_audio[:4, :], ax.shape[0],
+                a_cross_scale_shift_timestep, slice(2, 4))
+            ax_scaled = ax_norm3 * (1 + scale_a) + shift_a
+            del scale_a, shift_a, ax_norm3
+            v2a_out = self.video_to_audio_attn(
+                ax_scaled, context=vx_scaled, pe=a_cross_pe,
+                k_pe=v_cross_pe, transformer_options=transformer_options)
+            del ax_scaled, vx_scaled
+            gate_v2a = self.get_ada_values(
+                self.scale_shift_table_a2v_ca_audio[4:, :], ax.shape[0],
+                a_cross_gate_timestep, slice(0, 1))[0]
+            ax += v2a_out * gate_v2a * video_to_audio_scale
+            del gate_v2a, v2a_out
+
+    # Video feedforward
+    if run_vx:
+        vshift_mlp, vscale_mlp = self.get_ada_values(
+            self.scale_shift_table, vx.shape[0], v_timestep, slice(3, 5))
+        vx_scaled = comfy.ldm.common_dit.rms_norm(vx) * (1 + vscale_mlp) + vshift_mlp
+        del vshift_mlp, vscale_mlp
+        ff_out = self.ff(vx_scaled)
+        del vx_scaled
+        vgate_mlp = self.get_ada_values(
+            self.scale_shift_table, vx.shape[0], v_timestep, slice(5, 6))[0]
+        vx += ff_out * vgate_mlp * video_scale
+        del vgate_mlp, ff_out
+
+    # Audio feedforward
+    if run_ax:
+        ashift_mlp, ascale_mlp = self.get_ada_values(
+            self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(3, 5))
+        ax_scaled = comfy.ldm.common_dit.rms_norm(ax) * (1 + ascale_mlp) + ashift_mlp
+        del ashift_mlp, ascale_mlp
+        ff_out = self.audio_ff(ax_scaled)
+        del ax_scaled
+        agate_mlp = self.get_ada_values(
+            self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(5, 6))[0]
+        ax += ff_out * agate_mlp * audio_scale
+        del agate_mlp, ff_out
+
+    return vx, ax
+
+
+class _AttentionTunerPatch:
+    """Descriptor that wraps a block's forward with _ltx2_forward + scale factors."""
+    def __init__(self, video_scale=1.0, audio_scale=1.0,
+                 a2v_scale=1.0, v2a_scale=1.0):
+        self.video_scale = video_scale
+        self.audio_scale = audio_scale
+        self.a2v_scale = a2v_scale
+        self.v2a_scale = v2a_scale
+
+    def __get__(self, obj, objtype=None):
+        vs = self.video_scale
+        as_ = self.audio_scale
+        a2vs = self.a2v_scale
+        v2as = self.v2a_scale
+        def wrapped_forward(self_module, *args, **kwargs):
+            self_module.video_scale = vs
+            self_module.audio_scale = as_
+            self_module.audio_to_video_scale = a2vs
+            self_module.video_to_audio_scale = v2as
+            return _ltx2_forward(self_module, *args, **kwargs)
+        return types.MethodType(wrapped_forward, obj)
+
+
+# ---------------------------------------------------------------------------
 # MultimodalGuider
 # ---------------------------------------------------------------------------
 
@@ -123,9 +293,31 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
         modality_scale=3.0,
         video_cfg_end=None,
         stg_scale_end=None,
+        # Per-modality overrides (None = use shared value above)
+        audio_stg_scale=None,
+        audio_rescale=None,
+        audio_modality_scale=None,
+        video_modality_scale=None,
+        # VRAM-efficient forward + attention scaling
+        video_attn_scale=1.0,
     ):
         if stg_blocks is None:
             stg_blocks = [29]
+
+        # Clone model to isolate guider modifications (matching official)
+        model = model.clone()
+
+        self._current_step = 0
+        self._total_steps = 1
+        self.last_denoised_v = None
+        self.last_denoised_a = None
+
+        # Register ON_PRE_RUN callback to reset step counter (matching official)
+        model.add_callback_with_key(
+            comfy.patcher_extension.CallbacksMP.ON_PRE_RUN,
+            "mm_guider_on_pre_run",
+            self._reset_state,
+        )
 
         super().__init__(model)
 
@@ -137,15 +329,30 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
         self.modality_scale = modality_scale
         self.video_cfg_end = video_cfg_end if video_cfg_end is not None else video_cfg
         self.stg_scale_end = stg_scale_end if stg_scale_end is not None else stg_scale
+
+        # Per-modality parameters (fall back to shared values)
+        self.audio_stg_scale = audio_stg_scale if audio_stg_scale is not None else stg_scale
+        self.audio_rescale = audio_rescale if audio_rescale is not None else rescale
+        self.audio_modality_scale = audio_modality_scale if audio_modality_scale is not None else modality_scale
+        self.video_modality_scale = video_modality_scale if video_modality_scale is not None else modality_scale
+
         self._latent_shapes = None
-        self._current_step = 0
-        self._total_steps = 1
 
         self.inner_set_conds({"positive": positive, "negative": negative})
 
         # Install STG block wrappers on ALL blocks (matching official)
         self.stg_flag = STGFlag(skip_layers=list(stg_blocks))
         self._patch_model(self.model_patcher, self.stg_flag)
+
+        # Apply VRAM-efficient forward with attention scaling (LTXAV only)
+        self._apply_attention_tuner(self.model_patcher,
+                                    video_scale=video_attn_scale)
+
+    def _reset_state(self, model_patcher=None):
+        """Reset per-run state. Called via ON_PRE_RUN callback."""
+        self._current_step = 0
+        self.last_denoised_v = None
+        self.last_denoised_a = None
 
     @classmethod
     def _patch_model(cls, model, stg_flag):
@@ -164,6 +371,29 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
         if diffusion_model.__class__.__name__ == "LTXVTransformer3D":
             key = "diffusion_model.transformer.transformer_blocks"
         return model.get_model_object(key)
+
+    @classmethod
+    def _apply_attention_tuner(cls, model, video_scale=1.0, audio_scale=1.0):
+        """Patch all LTXAV blocks with VRAM-efficient forward + attention scales.
+
+        Replaces each block's forward with _ltx2_forward, which aggressively
+        deletes intermediate tensors to reduce peak VRAM for long generations.
+        Only applies to LTXAV models (skips plain LTXV).
+        """
+        diffusion_model = model.get_model_object("diffusion_model")
+        if diffusion_model.__class__.__name__ == "LTXVTransformer3D":
+            return  # Plain LTXV — different block structure
+        blocks = cls._get_transformer_blocks(model)
+        for idx in range(len(blocks)):
+            block = blocks[idx]
+            patched = _AttentionTunerPatch(
+                video_scale=video_scale, audio_scale=audio_scale,
+            ).__get__(block, block.__class__)
+            model.add_object_patch(
+                f"diffusion_model.transformer_blocks.{idx}.forward", patched,
+            )
+        print(f"[MultimodalGuider] Attention tuner: {len(blocks)} blocks "
+              f"(video_scale={video_scale})")
 
     @staticmethod
     def _calc_stg_indexes(run_vx, run_ax):
@@ -207,14 +437,17 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
         model = self.inner_model
 
         # Per-step interpolation (plain floats — no tensor graph retention)
-        t = self._current_step / max(self._total_steps - 1, 1)
-        self._current_step += 1
+        current_step = self._current_step
+        self._current_step = current_step + 1
+        t = current_step / max(self._total_steps - 1, 1)
         cur_cfg = float(self.video_cfg + t * (self.video_cfg_end - self.video_cfg))
         cur_stg = float(self.stg_scale + t * (self.stg_scale_end - self.stg_scale))
 
         is_av = self._latent_shapes is not None and len(self._latent_shapes) > 1
-        need_stg = self.stg_scale > 0 or self.stg_scale_end > 0
-        need_mod = self.modality_scale != 1.0 and is_av
+        need_stg = (self.stg_scale > 0 or self.stg_scale_end > 0
+                    or (is_av and self.audio_stg_scale > 0))
+        need_mod = is_av and (self.video_modality_scale != 1.0
+                              or self.audio_modality_scale != 1.0)
         need_cfg = (self.video_cfg != 1.0 or self.video_cfg_end != 1.0
                     or self.audio_cfg != 1.0)
 
@@ -225,28 +458,40 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
 
         run_vx = True
         run_ax = is_av
+        # Explicit cross-attention flags (matching official — always set
+        # even though the model defaults to True when absent)
+        run_a2v = True
+        run_v2a = True
         to = model_options.setdefault("transformer_options", {})
 
-        # --- Pass 1: positive ---
+        # Track packed outputs for post-cfg hooks
+        noise_pred_neg = 0
+        noise_pred_perturbed = 0
+
+        # --- Pass 1: positive (with explicit cross-attn flags) ---
         try:
             to["run_vx"] = run_vx
             to["run_ax"] = run_ax
-            pos_out = comfy.samplers.calc_cond_batch(
+            to["a2v_cross_attn"] = run_a2v
+            to["v2a_cross_attn"] = run_v2a
+            noise_pred_pos = comfy.samplers.calc_cond_batch(
                 model, [positive], x, timestep, model_options
             )[0]
         finally:
-            to.pop("run_vx", None)
-            to.pop("run_ax", None)
+            del to["run_vx"], to["run_ax"]
+            del to["a2v_cross_attn"], to["v2a_cross_attn"]
 
-        # Initialize all per-modality predictions as pos (so any unused
-        # guidance term gives pos - pos = 0 in the formula)
+        # Unpack per-modality predictions; initialize guidance terms to pos
+        # so that any unused term gives (pos - pos) = 0 in the formula.
+        # (The official code uses 0, but that only works because it always
+        # runs in AV mode where need_mod is gated by do_modality().)
         if is_av:
-            v_pos, a_pos = comfy.utils.unpack_latents(pos_out, self._latent_shapes)
+            v_pos, a_pos = comfy.utils.unpack_latents(noise_pred_pos, self._latent_shapes)
             v_neg, a_neg = v_pos, a_pos
             v_stg, a_stg = v_pos, a_pos
             v_mod, a_mod = v_pos, a_pos
         else:
-            v_pos = pos_out
+            v_pos = noise_pred_pos
             v_neg = v_stg = v_mod = v_pos
 
         # --- Pass 2: negative ---
@@ -254,18 +499,20 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
             try:
                 to["run_vx"] = run_vx
                 to["run_ax"] = run_ax
-                neg_out = comfy.samplers.calc_cond_batch(
+                to["a2v_cross_attn"] = run_a2v
+                to["v2a_cross_attn"] = run_v2a
+                noise_pred_neg = comfy.samplers.calc_cond_batch(
                     model, [negative], x, timestep, model_options
                 )[0]
                 if is_av:
                     v_neg, a_neg = comfy.utils.unpack_latents(
-                        neg_out, self._latent_shapes
+                        noise_pred_neg, self._latent_shapes
                     )
                 else:
-                    v_neg = neg_out
+                    v_neg = noise_pred_neg
             finally:
-                to.pop("run_vx", None)
-                to.pop("run_ax", None)
+                del to["run_vx"], to["run_ax"]
+                del to["a2v_cross_attn"], to["v2a_cross_attn"]
 
         # --- Pass 3: STG (perturbed) ---
         if need_stg:
@@ -273,24 +520,25 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
             try:
                 to["run_vx"] = run_vx
                 to["run_ax"] = run_ax
+                to["a2v_cross_attn"] = run_a2v
+                to["v2a_cross_attn"] = run_v2a
                 to["ptb_index"] = 0
                 to["stg_indexes"] = stg_indexes
                 self.stg_flag.do_skip = True
-                stg_out = comfy.samplers.calc_cond_batch(
+                noise_pred_perturbed = comfy.samplers.calc_cond_batch(
                     model, [positive], x, timestep, model_options
                 )[0]
                 if is_av:
                     v_stg, a_stg = comfy.utils.unpack_latents(
-                        stg_out, self._latent_shapes
+                        noise_pred_perturbed, self._latent_shapes
                     )
                 else:
-                    v_stg = stg_out
+                    v_stg = noise_pred_perturbed
             finally:
                 self.stg_flag.do_skip = False
-                to.pop("ptb_index", None)
-                to.pop("stg_indexes", None)
-                to.pop("run_vx", None)
-                to.pop("run_ax", None)
+                del to["ptb_index"], to["stg_indexes"]
+                del to["run_vx"], to["run_ax"]
+                del to["a2v_cross_attn"], to["v2a_cross_attn"]
 
         # --- Pass 4: modality-isolated (no cross-modal attention) ---
         if need_mod:
@@ -306,20 +554,51 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
                     mod_out, self._latent_shapes
                 )
             finally:
-                to.pop("a2v_cross_attn", None)
-                to.pop("v2a_cross_attn", None)
-                to.pop("run_vx", None)
-                to.pop("run_ax", None)
+                del to["a2v_cross_attn"], to["v2a_cross_attn"]
+                del to["run_vx"], to["run_ax"]
 
         # --- Apply per-modality guidance ---
-        v_out = self._calculate(v_pos, v_neg, v_stg, v_mod, cur_cfg, cur_stg)
+        v_out = self._calculate(v_pos, v_neg, v_stg, v_mod, cur_cfg, cur_stg,
+                                modality_scale=self.video_modality_scale)
 
         if is_av:
             a_out = self._calculate(a_pos, a_neg, a_stg, a_mod,
-                                    self.audio_cfg, self.stg_scale)
-            packed, _ = comfy.utils.pack_latents([v_out, a_out])
-            return packed
-        return v_out
+                                    self.audio_cfg, self.audio_stg_scale,
+                                    rescale=self.audio_rescale,
+                                    modality_scale=self.audio_modality_scale)
+            result, _ = comfy.utils.pack_latents([v_out, a_out])
+        else:
+            result = v_out
+
+        # Replicate sampler_post_cfg_function hooks (matching official
+        # MultimodalGuider — normally called inside cfg_function, but we
+        # bypass it for multi-pass guidance)
+        for fn in model_options.get("sampler_post_cfg_function", []):
+            args = {
+                "denoised": result,
+                "cond": positive,
+                "uncond": negative,
+                "model": model,
+                "uncond_denoised": noise_pred_neg if need_cfg else 0,
+                "cond_denoised": noise_pred_pos,
+                "sigma": timestep,
+                "model_options": model_options,
+                "input": x,
+                "perturbed_cond": positive,
+                "perturbed_cond_denoised": noise_pred_perturbed if need_stg else 0,
+            }
+            result = fn(args)
+
+        # Track last denoised per modality (matching official — needed for
+        # skip_step support and ensures hooks see consistent state)
+        if is_av:
+            self.last_denoised_v, self.last_denoised_a = comfy.utils.unpack_latents(
+                result, self._latent_shapes
+            )
+        else:
+            self.last_denoised_v = result
+
+        return result
 
     def _predict_noise_fast(self, x, timestep, model_options, seed,
                             cur_cfg=None):
@@ -358,30 +637,62 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
             v_out = self._calculate(v_pos, v_neg, v_pos, v_pos, cur_cfg, 0)
             a_out = self._calculate(a_pos, a_neg, a_pos, a_pos,
                                     self.audio_cfg, 0)
-            packed, _ = comfy.utils.pack_latents([v_out, a_out])
-            return packed
+            result, _ = comfy.utils.pack_latents([v_out, a_out])
         else:
-            return self._calculate(
+            result = self._calculate(
                 pos_out, neg_out, pos_out, pos_out, cur_cfg, 0
             )
+
+        # Replicate sampler_post_cfg_function hooks
+        for fn in model_options.get("sampler_post_cfg_function", []):
+            args = {
+                "denoised": result,
+                "cond": positive,
+                "uncond": negative,
+                "model": model,
+                "uncond_denoised": neg_out if need_cfg else 0,
+                "cond_denoised": pos_out,
+                "sigma": timestep,
+                "model_options": model_options,
+                "input": x,
+            }
+            result = fn(args)
+
+        # Track last denoised per modality
+        if is_av:
+            self.last_denoised_v, self.last_denoised_a = comfy.utils.unpack_latents(
+                result, self._latent_shapes
+            )
+        else:
+            self.last_denoised_v = result
+
+        return result
 
     # ------------------------------------------------------------------
     # Guidance math — matches official GuiderParameters.calculate
     # ------------------------------------------------------------------
 
-    def _calculate(self, pos, neg, perturbed, modality, cfg, stg_scale):
-        """Apply the full guidance formula:
+    def _calculate(self, pos, neg, perturbed, modality, cfg, stg_scale,
+                    rescale=None, modality_scale=None):
+        """Apply the full guidance formula (matching official GuiderParameters.calculate):
         pos + (cfg-1)*(pos-neg) + stg*(pos-perturbed) + (mod-1)*(pos-modality)
+
+        When neg/perturbed/modality is 0 (scalar), the corresponding term
+        reduces to just pos*(factor) which the formula handles naturally.
         """
+        if rescale is None:
+            rescale = self.rescale
+        if modality_scale is None:
+            modality_scale = self.modality_scale
         noise_pred = (
             pos
             + (cfg - 1) * (pos - neg)
             + stg_scale * (pos - perturbed)
-            + (self.modality_scale - 1) * (pos - modality)
+            + (modality_scale - 1) * (pos - modality)
         )
-        if self.rescale != 0:
+        if rescale != 0:
             factor = pos.std() / noise_pred.std()
-            factor = self.rescale * factor + (1 - self.rescale)
+            factor = rescale * factor + (1 - rescale)
             noise_pred = noise_pred * factor
         return noise_pred
 
@@ -414,6 +725,7 @@ class ICLoRAGuider(MultimodalGuider):
         negative,
         control_pixels,
         vae,
+        downscale_factor,
         guide_strength,
         guide_frame_idx,
         max_shift,
@@ -423,12 +735,14 @@ class ICLoRAGuider(MultimodalGuider):
         super().__init__(model, positive, negative, **kwargs)
         self._control_pixels = control_pixels
         self._vae = vae
+        self._downscale_factor = downscale_factor
         self._guide_strength = guide_strength
         self._guide_frame_idx = guide_frame_idx
         self._max_shift = max_shift
         self._base_shift = base_shift
         # Set after encoding in sample()
         self._guide_latent = None
+        self._guide_mask = None   # sparse dilation mask (None if dsf=1)
         self._num_guide_frames = 0
 
     # ------------------------------------------------------------------
@@ -471,8 +785,12 @@ class ICLoRAGuider(MultimodalGuider):
         """Encode control pixels and inject guide keyframe into conditioning.
 
         Called at the start of sample() when the actual video latent
-        dimensions are known. Uses LTXVAddGuide.encode() which resizes
-        the control image to match the target latent spatial dims.
+        dimensions are known.
+
+        For IC-LoRA with downscale_factor > 1: encodes at half resolution,
+        then sparse-dilates to full latent dims with a guide_mask (-1.0 at
+        empty positions, 1.0 at valid data). This triggers the model's
+        grid_mask filtering in _process_input for correct sparse attention.
         """
         from comfy_extras.nodes_lt import LTXVAddGuide, get_noise_mask
         import node_helpers
@@ -485,16 +803,51 @@ class ICLoRAGuider(MultimodalGuider):
         _, _, latent_t, latent_h, latent_w = video_latent.shape
 
         scale_factors = self._vae.downscale_index_formula
+        dsf = self._downscale_factor
 
-        # Encode control pixels at the video latent's spatial dims
-        # LTXVAddGuide.encode() resizes pixels to match latent_w * width_sf x latent_h * height_sf
+        # Encode at (possibly reduced) resolution
+        enc_w = latent_w // dsf if dsf > 1 else latent_w
+        enc_h = latent_h // dsf if dsf > 1 else latent_h
         _, guide_latent = LTXVAddGuide.encode(
-            self._vae, latent_w, latent_h, self._control_pixels, scale_factors
+            self._vae, enc_w, enc_h, self._control_pixels, scale_factors
         )
+        print(f"[RSICLoRAGuider] Encoded guide latent: {list(guide_latent.shape)}")
+
+        # Sparse dilation for downscale_factor > 1
+        # First dilate at enc*dsf (guaranteed to fit), then pad to actual
+        # video latent dims (which may be larger when not evenly divisible)
+        guide_mask = None
+        if dsf > 1:
+            enc_h_actual = guide_latent.shape[3]
+            enc_w_actual = guide_latent.shape[4]
+            dil_h = enc_h_actual * dsf
+            dil_w = enc_w_actual * dsf
+
+            dilated = torch.zeros(
+                guide_latent.shape[:3] + (dil_h, dil_w),
+                device=guide_latent.device, dtype=guide_latent.dtype,
+            )
+            dilated[..., ::dsf, ::dsf] = guide_latent
+
+            guide_mask = torch.full(
+                (dilated.shape[0], 1, dilated.shape[2], dil_h, dil_w),
+                -1.0, device=guide_latent.device, dtype=guide_latent.dtype,
+            )
+            guide_mask[..., ::dsf, ::dsf] = 1.0
+
+            # Pad to actual video latent dims if needed
+            pad_h = latent_h - dil_h
+            pad_w = latent_w - dil_w
+            if pad_h > 0 or pad_w > 0:
+                dilated = torch.nn.functional.pad(dilated, (0, pad_w, 0, pad_h))
+                guide_mask = torch.nn.functional.pad(guide_mask, (0, pad_w, 0, pad_h), value=-1.0)
+
+            guide_latent = dilated
+            print(f"[RSICLoRAGuider] Dilated to: {list(guide_latent.shape)}")
+
         self._guide_latent = guide_latent
+        self._guide_mask = guide_mask
         self._num_guide_frames = guide_latent.shape[2]
-        print(f"[RSICLoRAGuider] Encoded guide latent: {list(guide_latent.shape)} "
-              f"({self._num_guide_frames} frame(s))")
 
         # Compute the latent index for the guide frame
         frame_idx_actual, _ = LTXVAddGuide.get_latent_index(
@@ -515,14 +868,17 @@ class ICLoRAGuider(MultimodalGuider):
         positive = self._get_positive()
         negative = self._get_negative()
 
-        # Append keyframe to conditioning (sets keyframe_idxs metadata)
+        # Append keyframe to conditioning (sets keyframe_idxs with correct
+        # RoPE offsets for dilated tokens)
         positive, negative, _, _ = LTXVAddGuide.append_keyframe(
             positive, negative, frame_idx_actual,
             dummy_latent, noise_mask,
             guide_latent, self._guide_strength, scale_factors,
+            guide_mask=guide_mask,
+            latent_downscale_factor=dsf,
         )
-        print(f"[RSICLoRAGuider] Guide keyframe added at frame_idx={frame_idx_actual}, "
-              f"strength={self._guide_strength}")
+        print(f"[RSICLoRAGuider] Guide keyframe at frame_idx={frame_idx_actual}, "
+              f"strength={self._guide_strength}, dsf={dsf}")
 
         # Update the guider's conditioning
         self.inner_set_conds({"positive": positive, "negative": negative})
@@ -558,77 +914,97 @@ class ICLoRAGuider(MultimodalGuider):
     # Guide frame lifecycle
     # ------------------------------------------------------------------
 
+    def _build_ctrl_mask(self, device, dtype):
+        """Build the denoise mask for guide frames.
+
+        With sparse dilation (guide_mask has -1.0/1.0 pattern):
+          mask = guide_mask - strength  →  -2.0 at empty, 0.0 at valid
+          Negative values trigger grid_mask filtering in the model.
+
+        Without dilation (guide_mask is None):
+          mask = 1.0 - strength  →  0.0 for strength=1.0 (preserve)
+        """
+        if self._guide_mask is not None:
+            return (self._guide_mask - self._guide_strength).to(device=device, dtype=dtype)
+        return torch.full(
+            (1, 1, self._num_guide_frames, 1, 1),
+            1.0 - self._guide_strength, device=device, dtype=dtype,
+        )
+
     def _append_guide(self, latent_image, denoise_mask):
         """Append IC-LoRA guide latent frames to the video latent.
 
         For NestedTensor (AV mode), only the video portion is extended.
-        The denoise mask is updated with ~ 0 for guide positions so they
-        are preserved during denoising.
+        The denoise mask is updated to preserve guide frames during denoising.
         """
-        guide = self._guide_latent.to(latent_image.device if not latent_image.is_nested
-                                      else latent_image.unbind()[0].device)
-
         if latent_image.is_nested:
             parts = latent_image.unbind()
             video = parts[0]
             audio = parts[1] if len(parts) > 1 else None
+        else:
+            video = latent_image
+            audio = None
 
-            # Pad guide channels if video has more (e.g. AV channel padding)
-            if video.shape[1] > guide.shape[1]:
-                pad_len = video.shape[1] - guide.shape[1]
-                guide = torch.nn.functional.pad(
-                    guide, (0, 0, 0, 0, 0, 0, 0, pad_len), value=0
-                )
+        guide = self._guide_latent.to(device=video.device, dtype=video.dtype)
 
-            video = torch.cat([video, guide], dim=2)
+        # Pad guide channels if video has more (AV channel concat)
+        if video.shape[1] > guide.shape[1]:
+            pad_len = video.shape[1] - guide.shape[1]
+            guide = torch.nn.functional.pad(
+                guide, (0, 0, 0, 0, 0, 0, 0, pad_len), value=0
+            )
 
-            # Update denoise mask
-            if denoise_mask is not None and denoise_mask.is_nested:
+        video = torch.cat([video, guide], dim=2)
+
+        # Build control mask for guide frames
+        ctrl_mask = self._build_ctrl_mask(video.device, video.dtype)
+
+        # Update or create denoise mask
+        if denoise_mask is not None:
+            if denoise_mask.is_nested:
                 dm_parts = denoise_mask.unbind()
                 video_dm = dm_parts[0]
                 audio_dm = dm_parts[1] if len(dm_parts) > 1 else None
-                # Guide mask ~ 0 -> preserve guide frames
-                guide_mask = torch.full(
-                    (video_dm.shape[0], 1, self._num_guide_frames,
-                     video_dm.shape[3], video_dm.shape[4]),
-                    1.0 - self._guide_strength,
-                    dtype=video_dm.dtype, device=video_dm.device,
-                )
-                video_dm = torch.cat([video_dm, guide_mask], dim=2)
-                if audio_dm is not None:
-                    denoise_mask = comfy.nested_tensor.NestedTensor((video_dm, audio_dm))
-                else:
-                    denoise_mask = comfy.nested_tensor.NestedTensor((video_dm,))
-            elif denoise_mask is not None:
-                guide_mask = torch.full(
-                    (denoise_mask.shape[0], 1, self._num_guide_frames, 1, 1),
-                    1.0 - self._guide_strength,
-                    dtype=denoise_mask.dtype, device=denoise_mask.device,
-                )
-                denoise_mask = torch.cat([denoise_mask, guide_mask], dim=2)
-
-            if audio is not None:
-                latent_image = comfy.nested_tensor.NestedTensor((video, audio))
             else:
-                latent_image = comfy.nested_tensor.NestedTensor((video,))
+                video_dm = denoise_mask
+                audio_dm = None
+
+            # Expand spatial dims to match if needed
+            target_h = max(video_dm.shape[3], ctrl_mask.shape[3])
+            target_w = max(video_dm.shape[4], ctrl_mask.shape[4])
+            if video_dm.shape[3] == 1 or video_dm.shape[4] == 1:
+                video_dm = video_dm.expand(-1, -1, -1, target_h, target_w)
+            if ctrl_mask.shape[3] == 1 or ctrl_mask.shape[4] == 1:
+                ctrl_mask = ctrl_mask.expand(-1, -1, -1, target_h, target_w)
+
+            video_dm = torch.cat([video_dm, ctrl_mask], dim=2)
         else:
-            # Plain tensor (video only)
-            if latent_image.shape[1] > guide.shape[1]:
-                pad_len = latent_image.shape[1] - guide.shape[1]
-                guide = torch.nn.functional.pad(
-                    guide, (0, 0, 0, 0, 0, 0, 0, pad_len), value=0
+            # No existing mask — create one
+            content_frames = video.shape[2] - self._num_guide_frames
+            content_mask = torch.ones(
+                (1, 1, content_frames, 1, 1),
+                device=video.device, dtype=video.dtype,
+            )
+            # Expand content mask to match ctrl_mask spatial dims
+            if ctrl_mask.shape[3] > 1 or ctrl_mask.shape[4] > 1:
+                content_mask = content_mask.expand(
+                    -1, -1, -1, ctrl_mask.shape[3], ctrl_mask.shape[4]
                 )
+            video_dm = torch.cat([content_mask, ctrl_mask], dim=2)
+            audio_dm = None
 
-            latent_image = torch.cat([latent_image, guide], dim=2)
-
-            if denoise_mask is not None:
-                guide_mask = torch.full(
-                    (denoise_mask.shape[0], 1, self._num_guide_frames,
-                     denoise_mask.shape[3], denoise_mask.shape[4]),
-                    1.0 - self._guide_strength,
-                    dtype=denoise_mask.dtype, device=denoise_mask.device,
-                )
-                denoise_mask = torch.cat([denoise_mask, guide_mask], dim=2)
+        # Reassemble
+        if latent_image.is_nested:
+            latent_image = comfy.nested_tensor.NestedTensor((video, audio)) if audio is not None \
+                else comfy.nested_tensor.NestedTensor((video,))
+            if audio_dm is not None:
+                denoise_mask = comfy.nested_tensor.NestedTensor((video_dm, audio_dm))
+            else:
+                denoise_mask = comfy.nested_tensor.NestedTensor((video_dm,)) if latent_image.is_nested \
+                    else video_dm
+        else:
+            latent_image = video
+            denoise_mask = video_dm
 
         return latent_image, denoise_mask
 

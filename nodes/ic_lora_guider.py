@@ -60,6 +60,8 @@ class RSICLoRAGuider:
                 # Scheduler
                 "max_shift":       ("FLOAT",  {"default": 2.05, "min": 0.0,  "max": 100.0, "step": 0.01}),
                 "base_shift":      ("FLOAT",  {"default": 0.95, "min": 0.0,  "max": 100.0, "step": 0.01}),
+                # Efficiency
+                "video_attn_scale": ("FLOAT", {"default": 1.0,  "min": 0.0,  "max": 10.0,  "step": 0.01, "tooltip": "Video attention scale (1.03 recommended). Also enables VRAM-efficient block forward."}),
             },
         }
 
@@ -93,6 +95,7 @@ class RSICLoRAGuider:
         stg_end=-1.0,
         max_shift=2.05,
         base_shift=0.95,
+        video_attn_scale=1.0,
     ):
         # 1. Load IC-LoRA and read metadata
         lora_path = folder_paths.get_full_path_or_raise("loras", ic_lora)
@@ -109,32 +112,12 @@ class RSICLoRAGuider:
         )
         print(f"[RSICLoRAGuider] Applied IC-LoRA (strength={lora_strength})")
 
-        # 3. Preprocess control image
-        #    Encoding is DEFERRED to the guider's sample() method where the
-        #    target video latent dimensions are known. Here we only do pixel-
-        #    level preprocessing: downscale/upscale for half-res content and
-        #    CRF compression.
+        # 3. Preprocess control image (CRF compression)
+        #    VAE encoding is DEFERRED to the guider's sample() method where
+        #    the target video latent dimensions are known.
         from comfy_extras.nodes_lt import preprocess as ltxv_preprocess
 
         img = control_image
-        src_h, src_w = img.shape[1], img.shape[2]
-
-        # Downscale then upscale to preserve half-res content characteristics
-        # that the Union IC-LoRA was trained on
-        if downscale_factor > 1:
-            small_h = src_h // downscale_factor
-            small_w = src_w // downscale_factor
-            img = comfy.utils.common_upscale(
-                img.movedim(-1, 1), small_w, small_h, "bilinear", "center"
-            )
-            img = comfy.utils.common_upscale(
-                img, src_w, src_h, "bilinear", "center"
-            ).movedim(1, -1)
-            print(f"[RSICLoRAGuider] Control image: {src_w}x{src_h} -> "
-                  f"downscaled to {small_w}x{small_h} -> "
-                  f"upscaled back to {src_w}x{src_h}")
-
-        # CRF preprocess each frame
         processed_frames = []
         for i in range(img.shape[0]):
             processed_frames.append(ltxv_preprocess(img[i], crf))
@@ -155,6 +138,7 @@ class RSICLoRAGuider:
             # IC-LoRA guide params (encoding deferred to sample())
             control_pixels=processed,
             vae=vae,
+            downscale_factor=downscale_factor,
             guide_strength=guide_strength,
             guide_frame_idx=guide_frame_idx,
             # Model sampling
@@ -169,6 +153,7 @@ class RSICLoRAGuider:
             modality_scale=modality_scale,
             video_cfg_end=cfg_end if cfg_end >= 0 else None,
             stg_scale_end=stg_end if stg_end >= 0 else None,
+            video_attn_scale=video_attn_scale,
         )
 
         print(f"[RSICLoRAGuider] Guider created (video_cfg={video_cfg}, "

@@ -6,6 +6,7 @@ from .nodes.free_vram import RSFreeVRAM
 from .nodes.ltxv_generate import RSLTXVGenerate
 from .nodes.ltxv_extend import RSLTXVExtend
 from .nodes.ic_lora_guider import RSICLoRAGuider
+from .nodes.canny_preprocessor import RSCannyPreprocessor
 
 WEB_DIRECTORY = "./web"
 
@@ -18,6 +19,7 @@ NODE_CLASS_MAPPINGS = {
     "RSLTXVGenerate": RSLTXVGenerate,
     "RSLTXVExtend": RSLTXVExtend,
     "RSICLoRAGuider": RSICLoRAGuider,
+    "RSCannyPreprocessor": RSCannyPreprocessor,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -29,6 +31,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSLTXVGenerate": "RS LTXV Generate",
     "RSLTXVExtend": "RS LTXV Extend",
     "RSICLoRAGuider": "RS IC-LoRA Guider",
+    "RSCannyPreprocessor": "RS Canny Preprocessor",
 }
 
 # MOSS-TTS batch node — only available if comfyui-moss-tts is installed

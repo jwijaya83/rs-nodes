@@ -54,14 +54,17 @@ class RSLTXVGenerate:
                 # Multimodal guidance (used when audio_vae is connected)
                 "audio_cfg":         ("FLOAT", {"default": 7.0,  "min": 0.0, "max": 100.0, "step": 0.1}),
                 "stg_scale":         ("FLOAT", {"default": 0.0,  "min": 0.0, "max": 10.0,  "step": 0.1}),
+                "audio_stg_scale":   ("FLOAT", {"default": -1.0, "min": -1.0, "max": 10.0, "step": 0.1, "tooltip": "Audio STG scale (-1 = use video stg_scale)"}),
                 "cfg_end":           ("FLOAT", {"default": -1.0, "min": -1.0, "max": 100.0, "step": 0.1}),
                 "stg_end":           ("FLOAT", {"default": -1.0, "min": -1.0, "max": 10.0,  "step": 0.1}),
                 "stg_blocks":        ("STRING", {"default": "29"}),
                 "rescale":           ("FLOAT", {"default": 0.7,  "min": 0.0, "max": 1.0,   "step": 0.01}),
-                "modality_scale":    ("FLOAT", {"default": 1.0,  "min": 0.0, "max": 100.0, "step": 0.1}),
+                "video_modality_scale": ("FLOAT", {"default": 0.0,  "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Video modality isolation (0 = match official default)"}),
+                "audio_modality_scale": ("FLOAT", {"default": 3.0,  "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Audio modality isolation (3 = match official default)"}),
                 # Efficiency
                 "attention_mode":    (["auto", "default", "sage"],),
                 "ffn_chunks":        ("INT",   {"default": 0, "min": 0, "max": 16, "step": 1}),
+                "video_attn_scale":  ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Video attention scale (1.03 recommended). Also enables VRAM-efficient block forward for longer generation."}),
                 # Upscale
                 "upscale":           ("BOOLEAN", {"default": False}),
                 "upscale_model":     ("LATENT_UPSCALE_MODEL",),
@@ -73,6 +76,7 @@ class RSLTXVGenerate:
                 "upscale_fallback":  ("BOOLEAN", {"default": False}),
                 # Output
                 "decode":            ("BOOLEAN", {"default": True}),
+                "tile_t":            ("INT",     {"default": 0, "min": 0, "max": 256, "step": 1, "tooltip": "Temporal tile size for VAE decode (0 = auto). Lower values reduce VRAM but may cause seams."}),
                 # Overrides
                 "guider":            ("GUIDER",),
                 "sampler":           ("SAMPLER",),
@@ -83,8 +87,8 @@ class RSLTXVGenerate:
             },
         }
 
-    RETURN_TYPES  = ("LATENT", "IMAGE", "AUDIO")
-    RETURN_NAMES  = ("latent", "images", "audio_output")
+    RETURN_TYPES  = ("LATENT", "LATENT", "IMAGE", "AUDIO")
+    RETURN_NAMES  = ("latent", "audio_latent", "images", "audio_output")
     OUTPUT_NODE   = True
     FUNCTION      = "generate"
     CATEGORY      = "rs-nodes"
@@ -130,14 +134,17 @@ class RSLTXVGenerate:
         # Multimodal guidance
         audio_cfg=7.0,
         stg_scale=0.0,
+        audio_stg_scale=-1.0,
         cfg_end=-1.0,
         stg_end=-1.0,
         stg_blocks="29",
         rescale=0.7,
-        modality_scale=1.0,
+        video_modality_scale=0.0,
+        audio_modality_scale=3.0,
         # Efficiency
         attention_mode="auto",
         ffn_chunks=0,
+        video_attn_scale=1.0,
         # Upscale
         upscale=False,
         upscale_model=None,
@@ -149,6 +156,7 @@ class RSLTXVGenerate:
         upscale_fallback=False,
         # Output
         decode=False,
+        tile_t=0,
         # Overrides
         guider=None,
         sampler=None,
@@ -178,16 +186,20 @@ class RSLTXVGenerate:
                 last_strength=last_strength, crf=crf,
                 audio=audio, audio_vae=audio_vae,
                 audio_cfg=audio_cfg, stg_scale=stg_scale,
+                audio_stg_scale=audio_stg_scale,
                 cfg_end=cfg_end, stg_end=stg_end,
                 stg_blocks=stg_blocks,
-                rescale=rescale, modality_scale=modality_scale,
+                rescale=rescale,
+                video_modality_scale=video_modality_scale,
+                audio_modality_scale=audio_modality_scale,
                 attention_mode=attention_mode, ffn_chunks=ffn_chunks,
+                video_attn_scale=video_attn_scale,
                 upscale=upscale, upscale_model=upscale_model,
                 upscale_lora=upscale_lora, upscale_lora_strength=upscale_lora_strength,
                 upscale_steps=upscale_steps, upscale_cfg=upscale_cfg,
                 upscale_denoise=upscale_denoise,
                 upscale_fallback=upscale_fallback,
-                decode=decode,
+                decode=decode, tile_t=tile_t,
                 guider=guider, sampler=sampler, sigmas=sigmas,
                 max_shift=max_shift, base_shift=base_shift,
             )
@@ -206,12 +218,12 @@ class RSLTXVGenerate:
         first_image, middle_image, last_image,
         first_strength, middle_strength, last_strength, crf,
         audio, audio_vae,
-        audio_cfg, stg_scale, cfg_end, stg_end,
-        stg_blocks, rescale, modality_scale,
-        attention_mode, ffn_chunks,
+        audio_cfg, stg_scale, audio_stg_scale, cfg_end, stg_end,
+        stg_blocks, rescale, video_modality_scale, audio_modality_scale,
+        attention_mode, ffn_chunks, video_attn_scale,
         upscale, upscale_model, upscale_lora, upscale_lora_strength,
         upscale_steps, upscale_cfg, upscale_denoise, upscale_fallback,
-        decode,
+        decode, tile_t,
         guider, sampler, sigmas,
         max_shift, base_shift,
     ):
@@ -344,6 +356,7 @@ class RSLTXVGenerate:
         # ----------------------------------------------------------------
 
         has_audio = audio_vae is not None
+        audio_is_input = has_audio and audio is not None  # True = user provided audio, pass through
         if has_audio:
             if audio is not None:
                 # Encode provided audio into latent space
@@ -429,9 +442,13 @@ class RSLTXVGenerate:
                 video_cfg=cfg, audio_cfg=audio_cfg,
                 stg_scale=stg_scale,
                 stg_blocks=[int(s.strip()) for s in stg_blocks.split(",")],
-                rescale=rescale, modality_scale=modality_scale,
+                rescale=rescale,
                 video_cfg_end=cfg_end if cfg_end >= 0 else None,
                 stg_scale_end=stg_end if stg_end >= 0 else None,
+                audio_stg_scale=audio_stg_scale if audio_stg_scale >= 0 else None,
+                video_modality_scale=video_modality_scale,
+                audio_modality_scale=audio_modality_scale,
+                video_attn_scale=video_attn_scale,
             )
             print("[RSLTXVGenerate] Using MultimodalGuider")
 
@@ -670,16 +687,20 @@ class RSLTXVGenerate:
             tile_size = 512 // compression
             overlap = 64 // compression
             temporal_compression = vae.temporal_compression_decode()
-            if temporal_compression is not None:
-                tile_t = max(2, 64 // temporal_compression)
-                overlap_t = max(2, tile_t // 4)
+            if tile_t > 0:
+                # User override
+                decode_tile_t = tile_t
+                overlap_t = max(2, decode_tile_t // 4)
+            elif temporal_compression is not None:
+                decode_tile_t = max(2, 64 // temporal_compression)
+                overlap_t = max(2, decode_tile_t // 4)
             else:
-                tile_t = None
+                decode_tile_t = None
                 overlap_t = None
             images = vae.decode_tiled(
                 output_latent["samples"],
                 tile_x=tile_size, tile_y=tile_size, overlap=overlap,
-                tile_t=tile_t, overlap_t=overlap_t,
+                tile_t=decode_tile_t, overlap_t=overlap_t,
             )
             # Video VAE returns 5D [B, T, H, W, C] — flatten to standard 4D IMAGE [B*T, H, W, C]
             if len(images.shape) == 5:
@@ -694,15 +715,26 @@ class RSLTXVGenerate:
 
         audio_output = None
         if has_audio and audio_latent_out is not None and audio_vae is not None:
-            print("[RSLTXVGenerate] Decoding audio latents")
-            decoded_audio = audio_vae.decode(audio_latent_out).to(audio_latent_out.device)
-            audio_output = {
-                "waveform": decoded_audio,
-                "sample_rate": int(audio_vae.output_sample_rate),
-            }
+            if audio_is_input:
+                # Pass through original audio — skip VAE decode roundtrip to
+                # ensure 1:1 fidelity with the source audio
+                print("[RSLTXVGenerate] Audio passthrough (input audio preserved)")
+                audio_output = audio
+            else:
+                print("[RSLTXVGenerate] Decoding generated audio latents")
+                decoded_audio = audio_vae.decode(audio_latent_out).to(audio_latent_out.device)
+                audio_output = {
+                    "waveform": decoded_audio,
+                    "sample_rate": int(audio_vae.output_sample_rate),
+                }
+
+        # Build audio latent output
+        audio_latent_dict = None
+        if audio_latent_out is not None:
+            audio_latent_dict = {"samples": audio_latent_out}
 
         print("[RSLTXVGenerate] Done")
-        return (output_latent, images, audio_output)
+        return (output_latent, audio_latent_dict, images, audio_output)
 
     # ------------------------------------------------------------------
     # Helper methods
