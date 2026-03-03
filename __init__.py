@@ -7,6 +7,8 @@ from .nodes.ltxv_generate import RSLTXVGenerate
 from .nodes.ltxv_extend import RSLTXVExtend
 from .nodes.ic_lora_guider import RSICLoRAGuider
 from .nodes.canny_preprocessor import RSCannyPreprocessor
+from .nodes.video_trim import RSVideoTrim
+from .nodes.film_grain import RSFilmGrain
 
 WEB_DIRECTORY = "./web"
 
@@ -20,6 +22,8 @@ NODE_CLASS_MAPPINGS = {
     "RSLTXVExtend": RSLTXVExtend,
     "RSICLoRAGuider": RSICLoRAGuider,
     "RSCannyPreprocessor": RSCannyPreprocessor,
+    "RSVideoTrim": RSVideoTrim,
+    "RSFilmGrain": RSFilmGrain,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -32,6 +36,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSLTXVExtend": "RS LTXV Extend",
     "RSICLoRAGuider": "RS IC-LoRA Guider",
     "RSCannyPreprocessor": "RS Canny Preprocessor",
+    "RSVideoTrim": "RS Video Trim",
+    "RSFilmGrain": "RS Film Grain",
 }
 
 # MOSS-TTS batch node — only available if comfyui-moss-tts is installed
