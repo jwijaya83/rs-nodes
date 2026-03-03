@@ -630,10 +630,9 @@ class RSMossTTSSave:
 
         for j, wav in enumerate(waveforms):
             parts.append(wav)
-            if j < len(waveforms) - 1:
-                pause_samples = int(pauses[j] * sample_rate)
-                if pause_samples > 0:
-                    parts.append(torch.zeros(1, pause_samples))
+            pause_samples = int(pauses[j] * sample_rate)
+            if pause_samples > 0:
+                parts.append(torch.zeros(1, pause_samples))
 
         combined = torch.cat(parts, dim=1).unsqueeze(0)  # [1, 1, total_samples]
         return {"waveform": combined, "sample_rate": sample_rate}
@@ -792,6 +791,10 @@ class RSMossTTSSave:
                 # Parse labels from dialogue_list if available and not already set
                 if not clip_labels and dialogue_list:
                     clip_labels = _parse_dialogue_list(dialogue_list)
+                    # Cap to dialogue lines so stale clips from a longer script are excluded
+                    if len(clip_labels) < concat_count:
+                        print(f"[RSMossTTSSave] Dialogue has {len(clip_labels)} lines but {concat_count} clips on disk — using dialogue count")
+                        concat_count = len(clip_labels)
 
                 # Build ui_audio from numbered clips
                 for i in range(1, concat_count + 1):
@@ -811,6 +814,10 @@ class RSMossTTSSave:
 
                 if dialogue_list:
                     clip_labels = _parse_dialogue_list(dialogue_list)
+                    # Cap to dialogue lines so stale clips from a longer script are excluded
+                    if len(clip_labels) < concat_count:
+                        print(f"[RSMossTTSSave] Dialogue has {len(clip_labels)} lines but {concat_count} clips on disk — using dialogue count")
+                        concat_count = len(clip_labels)
 
                 # Build ui_audio entries for preview (split subfolder like _save_one)
                 for i in range(1, concat_count + 1):
