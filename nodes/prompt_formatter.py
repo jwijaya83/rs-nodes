@@ -148,13 +148,14 @@ class RSPromptFormatter:
         return cleaned
 
     def _resolve_cache_path(self, output_dir, cache_file):
+        import folder_paths
+        base = folder_paths.get_output_directory()
         if output_dir.strip():
-            d = output_dir.strip()
+            d = os.path.join(base, output_dir.strip())
         else:
-            import folder_paths
-            d = folder_paths.get_output_directory()
+            d = base
         os.makedirs(d, exist_ok=True)
-        return os.path.join(d, cache_file)
+        return os.path.join(d, cache_file.strip())
 
     def format_prompt(self, prompt: str, system_prompt: str, model: str, ollama_url: str,
                       reference_image=None, lock=False, cache_file="formatted_prompt.txt", output_dir=""):

@@ -51,15 +51,16 @@ pip install -r rs_nodes/requirements.txt
 |---|---|---|
 | `openai-whisper` | Yes | Word-level alignment for TTS segmentation |
 | `transformers` | Optional | MOSS-TTS model loading |
-| `huggingface_hub` | Optional | MOSS-TTS model downloading |
 | PyTorch + CUDA | Provided by ComfyUI | GPU computation |
 | OpenCV (`cv2`) | Provided by ComfyUI | Canny edge detection |
 
 To enable the optional MOSS-TTS nodes:
 
 ```bash
-pip install transformers huggingface_hub
+pip install transformers
 ```
+
+Models are downloaded from HuggingFace on first use, then run fully offline.
 
 ### External Dependencies
 
@@ -431,7 +432,7 @@ Export audio to disk with format selection.
 
 #### RS MOSS TTS Loader
 
-*(Optional — requires `transformers` and `huggingface_hub`)*
+*(Optional — requires `transformers`)*
 
 Load MOSS-TTS model variants for text-to-speech generation.
 
@@ -458,7 +459,7 @@ Load MOSS-TTS model variants for text-to-speech generation.
 
 #### RS MOSS TTS Batch Save
 
-*(Optional — requires `transformers` and `huggingface_hub`)*
+*(Optional — requires `transformers`)*
 
 Generate TTS audio from a dialogue list with automatic segmentation, per-clip trimming, and batch export.
 

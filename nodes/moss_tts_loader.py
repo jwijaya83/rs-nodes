@@ -3,7 +3,6 @@ import importlib.metadata
 import importlib.util
 import os
 import torch
-from huggingface_hub import snapshot_download
 from transformers import AutoModel, AutoProcessor
 
 import comfy.model_management as mm
@@ -35,6 +34,10 @@ def _resolve_local_dir(repo_id_or_path):
         return repo_id_or_path
     safe_name = repo_id_or_path.replace("/", "--")
     local_dir = os.path.join(MOSS_MODELS_DIR, safe_name)
+    if os.path.isdir(local_dir) and os.listdir(local_dir):
+        return local_dir
+    # First use — download once, then fully offline
+    from huggingface_hub import snapshot_download
     return snapshot_download(repo_id_or_path, local_dir=local_dir)
 
 
