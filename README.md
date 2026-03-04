@@ -354,8 +354,7 @@ AI-powered prompt enhancement using a local Ollama model, with optional referenc
 | `model` | STRING | "gemma3:12b" | Ollama model name |
 | `ollama_url` | STRING | "http://localhost:11434" | Ollama server URL |
 | `reference_image` | IMAGE | — | *(optional)* Image for visual context |
-| `lock` | BOOLEAN | False | When True, reads from cache instead of calling Ollama |
-| `cache_file` | STRING | "formatted_prompt.txt" | Cache filename |
+| `cache_file` | STRING | "formatted_prompt.json" | JSON cache file (stores prompt + output) |
 | `output_dir` | STRING | "" | Cache directory (empty = ComfyUI output) |
 
 **Outputs:**
@@ -368,7 +367,7 @@ AI-powered prompt enhancement using a local Ollama model, with optional referenc
 - Streams responses from Ollama with live token printing to console
 - Auto-pulls missing models from the Ollama registry
 - Strips `<think>` reasoning blocks from the response
-- Set `lock=True` to reuse a cached result without re-generating
+- Caches prompt + output as JSON — automatically skips Ollama when the input prompt hasn't changed
 - Falls back gracefully on Ollama connection errors
 
 **Requires:** [Ollama](https://ollama.com/) running locally.
@@ -670,7 +669,7 @@ Passthrough utility node that forces VRAM cleanup between pipeline stages.
 ### Prompt Workflow
 
 - Write scripts with `[s]`, `[a]`, `[d]` tags and feed into RS Prompt Parser.
-- Use RS Prompt Formatter with `lock=True` to cache and reuse a refined prompt without re-calling Ollama.
+- RS Prompt Formatter automatically caches to JSON — if the input prompt hasn't changed, Ollama is skipped entirely.
 - The `dialogue_index` on RS Prompt Parser auto-increments, making it easy to iterate through dialogue lines in batch workflows.
 
 ### Audio

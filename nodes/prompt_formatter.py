@@ -62,9 +62,8 @@ class RSPromptFormatter:
             },
             "optional": {
                 "reference_image": ("IMAGE",),
-                "lock": ("BOOLEAN", {"default": False, "tooltip": "When enabled, reads cached output from file instead of calling Ollama."}),
-                "cache_file": ("STRING", {"default": "formatted_prompt.txt", "tooltip": "Filename for cached output (saved in output_dir)."}),
-                "output_dir": ("STRING", {"default": "", "tooltip": "Directory to save cached prompt. Empty = ComfyUI output folder."}),
+                "cache_file": ("STRING", {"default": "formatted_prompt.json", "tooltip": "JSON cache file. Re-runs Ollama only when the input prompt changes."}),
+                "output_dir": ("STRING", {"default": "", "tooltip": "Directory for cache file. Empty = ComfyUI output folder."}),
             },
         }
 
@@ -158,17 +157,19 @@ class RSPromptFormatter:
         return os.path.join(d, cache_file.strip())
 
     def format_prompt(self, prompt: str, system_prompt: str, model: str, ollama_url: str,
-                      reference_image=None, lock=False, cache_file="formatted_prompt.txt", output_dir=""):
+                      reference_image=None, cache_file="formatted_prompt.json", output_dir=""):
         cache_path = self._resolve_cache_path(output_dir, cache_file)
 
-        # Lock mode: read from cache file
-        if lock:
-            if not os.path.exists(cache_path):
-                raise RuntimeError(f"Lock enabled but cache file not found: {cache_path}")
-            with open(cache_path, "r", encoding="utf-8") as f:
-                cached = f.read().strip()
-            print(f"[RS Prompt Formatter] Locked — using cached output from {cache_path}")
-            return (cached,)
+        # Check JSON cache — skip Ollama if prompt hasn't changed
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+                if cache.get("prompt") == prompt and cache.get("system_prompt") == system_prompt:
+                    print(f"[RS Prompt Formatter] Prompt unchanged — using cached output")
+                    return (cache["output"],)
+            except (json.JSONDecodeError, KeyError):
+                pass  # corrupt or old format, re-run
 
         base = ollama_url.rstrip("/")
 
@@ -219,9 +220,9 @@ class RSPromptFormatter:
 
         formatted = formatted.strip()
 
-        # Save to cache file
+        # Save prompt + output to JSON cache
         with open(cache_path, "w", encoding="utf-8") as f:
-            f.write(formatted)
+            json.dump({"prompt": prompt, "system_prompt": system_prompt, "output": formatted}, f, indent=2)
         print(f"[RS Prompt Formatter] Saved output to {cache_path}")
 
         return (formatted,)
