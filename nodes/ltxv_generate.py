@@ -70,6 +70,7 @@ class RSLTXVGenerate:
                 # Upscale
                 "upscale":           ("BOOLEAN", {"default": False}),
                 "upscale_model":     ("LATENT_UPSCALE_MODEL",),
+                "temporal_upscale_model": ("LATENT_UPSCALE_MODEL",),
                 "upscale_lora":      (["none"] + folder_paths.get_filename_list("loras"),),
                 "upscale_lora_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
                 "upscale_steps":     ("INT",   {"default": 4,   "min": 1,   "max": 10000}),
@@ -154,6 +155,7 @@ class RSLTXVGenerate:
         # Upscale
         upscale=False,
         upscale_model=None,
+        temporal_upscale_model=None,
         upscale_lora="none",
         upscale_lora_strength=1.0,
         upscale_steps=4,
@@ -204,6 +206,7 @@ class RSLTXVGenerate:
                 attention_mode=attention_mode, ffn_chunks=ffn_chunks,
                 video_attn_scale=video_attn_scale,
                 upscale=upscale, upscale_model=upscale_model,
+                temporal_upscale_model=temporal_upscale_model,
                 upscale_lora=upscale_lora, upscale_lora_strength=upscale_lora_strength,
                 upscale_steps=upscale_steps, upscale_cfg=upscale_cfg,
                 upscale_denoise=upscale_denoise,
@@ -233,7 +236,7 @@ class RSLTXVGenerate:
         stg_blocks, rescale, video_modality_scale, audio_modality_scale,
         cfg_star_rescale, skip_sigma,
         attention_mode, ffn_chunks, video_attn_scale,
-        upscale, upscale_model, upscale_lora, upscale_lora_strength,
+        upscale, upscale_model, temporal_upscale_model, upscale_lora, upscale_lora_strength,
         upscale_steps, upscale_cfg, upscale_denoise, upscale_fallback,
         upscale_tiling, upscale_tile_t,
         decode, tile_t,
@@ -288,15 +291,26 @@ class RSLTXVGenerate:
             gen_height = height // 2
             print(f"[RSLTXVGenerate] Upscale enabled: generating at {gen_width}x{gen_height}, target {width}x{height}")
 
+        # Temporal upscale: generate at half frame count, then 2x temporal upscale
+        do_temporal_upscale = do_upscale and temporal_upscale_model is not None
+        gen_num_frames = num_frames
+        if do_temporal_upscale:
+            target_latent_T = ((num_frames - 1) // 8) + 1
+            half_latent_T = target_latent_T // 2 + 1
+            gen_num_frames = (half_latent_T - 1) * 8 + 1
+            print(f"[RSLTXVGenerate] Temporal upscale enabled: generating {gen_num_frames} frames at {frame_rate / 2:.1f}fps (target {num_frames} frames at {frame_rate}fps)")
+
         # Create empty latent: [B, C, T, H, W] — LTXV latent space
         latent = torch.zeros(
-            [1, 128, ((num_frames - 1) // 8) + 1, gen_height // 32, gen_width // 32],
+            [1, 128, ((gen_num_frames - 1) // 8) + 1, gen_height // 32, gen_width // 32],
             device=mm.intermediate_device(),
         )
 
-        # Stamp frame rate onto conditioning
-        positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
-        negative = node_helpers.conditioning_set_values(negative, {"frame_rate": frame_rate})
+        # Stamp frame rate onto conditioning — halved for temporal upscale so the
+        # model generates motion at the correct speed for the full target duration
+        gen_frame_rate = frame_rate / 2 if do_temporal_upscale else frame_rate
+        positive = node_helpers.conditioning_set_values(positive, {"frame_rate": gen_frame_rate})
+        negative = node_helpers.conditioning_set_values(negative, {"frame_rate": gen_frame_rate})
 
         # ----------------------------------------------------------------
         # 2. FRAME INJECTION
@@ -333,9 +347,9 @@ class RSLTXVGenerate:
         # 2b. Middle/last images — guide conditioning via LTXVAddGuide
         guides = []
         if middle_image is not None:
-            mid_idx = (num_frames - 1) // 2
+            mid_idx = (gen_num_frames - 1) // 2
             mid_idx = max(0, (mid_idx // 8) * 8)
-            if mid_idx == 0 and num_frames > 8:
+            if mid_idx == 0 and gen_num_frames > 8:
                 mid_idx = 8
             guides.append((middle_image, mid_idx, middle_strength))
         if last_image is not None:
@@ -539,7 +553,8 @@ class RSLTXVGenerate:
                 pre_upscale_latent = {"samples": output_latent["samples"].detach().cpu().clone()}
             try:
                 # Spatial upscale is video-only (AV already separated in section 6)
-                print("[RSLTXVGenerate] Upscaling video latents (2x spatial)")
+                upscale_label = "2x spatial + 2x temporal" if do_temporal_upscale else "2x spatial"
+                print(f"[RSLTXVGenerate] Upscaling video latents ({upscale_label})")
                 self._free_vram()
 
                 device = mm.get_torch_device()
@@ -590,6 +605,32 @@ class RSLTXVGenerate:
                 upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
                 upsampled = upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
                 output_latent = {"samples": upsampled}
+
+                # Temporal upscale (2x frame count)
+                if do_temporal_upscale:
+                    print("[RSLTXVGenerate] Upscaling video latents (2x temporal)")
+                    self._free_vram()
+
+                    temporal_dtype = next(temporal_upscale_model.parameters()).dtype
+                    temporal_upscale_model.to(device)
+                    try:
+                        t_latents = upsampled.to(dtype=temporal_dtype, device=device)
+                        t_latents = vae.first_stage_model.per_channel_statistics.un_normalize(t_latents)
+                        upsampled = temporal_upscale_model(t_latents)
+                    finally:
+                        temporal_upscale_model.cpu()
+
+                    upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
+                    upsampled = upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
+
+                    # Trim to target latent T if temporal upscale produced extra frames
+                    target_latent_T = ((num_frames - 1) // 8) + 1
+                    if upsampled.shape[2] > target_latent_T:
+                        upsampled = upsampled[:, :, :target_latent_T]
+                        print(f"[RSLTXVGenerate] Trimmed temporal output to {target_latent_T} latent frames")
+
+                    output_latent = {"samples": upsampled}
+                    print(f"[RSLTXVGenerate] After temporal upscale: latent shape {list(upsampled.shape)}")
 
                 # Re-inject guide images at full resolution into upscaled latent
                 up_denoise_mask = None
@@ -687,6 +728,11 @@ class RSLTXVGenerate:
                     # Trim to denoise strength
                     start_step = int((1.0 - upscale_denoise) * upscale_steps)
                     up_sig = up_sig[start_step:]
+
+                    # Restore full frame rate for re-diffusion (was halved for temporal upscale generation)
+                    if do_temporal_upscale:
+                        positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
+                        negative = node_helpers.conditioning_set_values(negative, {"frame_rate": frame_rate})
 
                     up_guider = comfy.samplers.CFGGuider(up_model)
                     up_guider.set_conds(positive, negative)
