@@ -674,8 +674,15 @@ class RSLTXVGenerate:
                     output_latent = {"samples": upsampled}
 
                 # Re-diffusion at upscaled resolution
-                if upscale_denoise > 0 and upscale_steps > 0:
-                    print(f"[RSLTXVGenerate] Re-diffusing at upscaled resolution ({upscale_steps} steps, cfg={upscale_cfg})")
+                has_image_guides = len(up_guides) > 0
+                do_rediffusion = has_image_guides and upscale_denoise > 0 and upscale_steps > 0
+                if has_image_guides:
+                    rediffusion_label = f"{upscale_steps} steps, cfg={upscale_cfg}"
+                else:
+                    rediffusion_label = f"3 steps (manual sigmas), cfg={upscale_cfg}"
+                    do_rediffusion = True  # T2V always re-diffuses with manual sigmas
+                if do_rediffusion:
+                    print(f"[RSLTXVGenerate] Re-diffusing at upscaled resolution ({rediffusion_label})")
                     self._free_vram()
 
                     # Recombine video + audio for the AV model
@@ -700,34 +707,47 @@ class RSLTXVGenerate:
                         up_model, _ = comfy.sd.load_lora_for_models(up_model, None, lora, upscale_lora_strength, 0)
                         print(f"[RSLTXVGenerate] Applied upscale LoRA: {upscale_lora} (strength={upscale_lora_strength})")
 
-                    up_tokens = math.prod(upsampled.shape[2:])
-                    up_shift = up_tokens * mm_shift + b
-                    print(f"[RSLTXVGenerate] Upscale shift: tokens={up_tokens}, shift={up_shift:.3f}")
+                    if has_image_guides:
+                        # I2V: compute shift from upscaled latent tokens
+                        up_tokens = math.prod(upsampled.shape[2:])
+                        up_shift = up_tokens * mm_shift + b
+                        print(f"[RSLTXVGenerate] Upscale shift: tokens={up_tokens}, shift={up_shift:.3f}")
 
-                    up_model_sampling = ModelSamplingAdvanced(up_model.model.model_config)
-                    up_model_sampling.set_parameters(shift=up_shift)
-                    up_model.add_object_patch("model_sampling", up_model_sampling)
+                        up_model_sampling = ModelSamplingAdvanced(up_model.model.model_config)
+                        up_model_sampling.set_parameters(shift=up_shift)
+                        up_model.add_object_patch("model_sampling", up_model_sampling)
 
-                    # Build sigma schedule with numerically stable computation.
-                    # sig = exp(s) / (exp(s) + (1/t - 1)) and 1-sig = (1/t - 1) / (exp(s) + (1/t - 1))
-                    # Computing 1-sig directly avoids catastrophic cancellation when sig ≈ 1.0
-                    # (at high shift, sig is so close to 1.0 that 1.0-sig rounds to 0 in float64)
-                    exp_shift = math.exp(up_shift)
-                    t = torch.linspace(1.0, 0.0, upscale_steps + 1, dtype=torch.float64)
-                    non_zero = t != 0
-                    inv_t_m1 = torch.where(non_zero, 1.0 / t - 1.0, torch.zeros_like(t))
-                    # omz = 1 - sigma, computed directly
-                    omz = torch.where(non_zero, inv_t_m1 / (exp_shift + inv_t_m1), torch.ones_like(t))
-                    # Stretch so terminal sigma = 0.1 (i.e., terminal omz = 0.9)
-                    nz_omz = omz[non_zero]
-                    sf = nz_omz[-1] / (1.0 - 0.1)
-                    omz[non_zero] = nz_omz / sf
-                    # sigma = 1 - omz; t=0 maps to sigma=0
-                    up_sig = torch.where(non_zero, 1.0 - omz, torch.zeros_like(omz)).float()
+                        # Build sigma schedule with numerically stable computation.
+                        # sig = exp(s) / (exp(s) + (1/t - 1)) and 1-sig = (1/t - 1) / (exp(s) + (1/t - 1))
+                        # Computing 1-sig directly avoids catastrophic cancellation when sig ≈ 1.0
+                        # (at high shift, sig is so close to 1.0 that 1.0-sig rounds to 0 in float64)
+                        exp_shift = math.exp(up_shift)
+                        t = torch.linspace(1.0, 0.0, upscale_steps + 1, dtype=torch.float64)
+                        non_zero = t != 0
+                        inv_t_m1 = torch.where(non_zero, 1.0 / t - 1.0, torch.zeros_like(t))
+                        # omz = 1 - sigma, computed directly
+                        omz = torch.where(non_zero, inv_t_m1 / (exp_shift + inv_t_m1), torch.ones_like(t))
+                        # Stretch so terminal sigma = 0.1 (i.e., terminal omz = 0.9)
+                        nz_omz = omz[non_zero]
+                        sf = nz_omz[-1] / (1.0 - 0.1)
+                        omz[non_zero] = nz_omz / sf
+                        # sigma = 1 - omz; t=0 maps to sigma=0
+                        up_sig = torch.where(non_zero, 1.0 - omz, torch.zeros_like(omz)).float()
 
-                    # Trim to denoise strength
-                    start_step = int((1.0 - upscale_denoise) * upscale_steps)
-                    up_sig = up_sig[start_step:]
+                        # Trim to denoise strength
+                        start_step = int((1.0 - upscale_denoise) * upscale_steps)
+                        up_sig = up_sig[start_step:]
+                    else:
+                        # T2V: use manual sigmas from the official LTX 2.3 upscale workflow.
+                        # No image anchors, so computed schedules produce artifacts (blobs).
+                        # These hand-tuned values with default shift give clean results.
+                        up_sig = torch.tensor([0.909375, 0.725, 0.421875, 0.0])
+                        print(f"[RSLTXVGenerate] T2V upscale: manual sigmas {up_sig.tolist()}")
+
+                        up_shift = 4096 * mm_shift + b  # default shift (tokens=4096)
+                        up_model_sampling = ModelSamplingAdvanced(up_model.model.model_config)
+                        up_model_sampling.set_parameters(shift=up_shift)
+                        up_model.add_object_patch("model_sampling", up_model_sampling)
 
                     # Restore full frame rate for re-diffusion (was halved for temporal upscale generation)
                     if do_temporal_upscale:
