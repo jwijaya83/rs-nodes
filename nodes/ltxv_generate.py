@@ -549,6 +549,8 @@ class RSLTXVGenerate:
         # ----------------------------------------------------------------
 
         if do_upscale:
+            # Preserve original audio from first pass — re-diffusion degrades it
+            original_audio_latent = audio_latent_out
             if upscale_fallback:
                 pre_upscale_latent = {"samples": output_latent["samples"].detach().cpu().clone()}
             try:
@@ -979,6 +981,9 @@ class RSLTXVGenerate:
                     else:
                         output_latent = {"samples": p2_out}
                     print("[RSLTXVGenerate] T2V pass 2 complete")
+
+                # Restore original audio — re-diffusion passes degrade audio quality
+                audio_latent_out = original_audio_latent
 
                 if upscale_fallback:
                     del pre_upscale_latent  # free system RAM backup
