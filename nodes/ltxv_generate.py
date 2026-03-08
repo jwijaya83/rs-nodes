@@ -552,15 +552,45 @@ class RSLTXVGenerate:
             if upscale_fallback:
                 pre_upscale_latent = {"samples": output_latent["samples"].detach().cpu().clone()}
             try:
-                # Spatial upscale is video-only (AV already separated in section 6)
-                upscale_label = "2x spatial + 2x temporal" if do_temporal_upscale else "2x spatial"
+                device = mm.get_torch_device()
+                input_dtype = output_latent["samples"].dtype
+
+                # Temporal upscale first (2x frame count at half resolution = cheap)
+                if do_temporal_upscale:
+                    print("[RSLTXVGenerate] Upscaling video latents (2x temporal at half res)")
+                    self._free_vram()
+
+                    temporal_dtype = next(temporal_upscale_model.parameters()).dtype
+                    temporal_upscale_model.to(device)
+                    try:
+                        t_latents = output_latent["samples"].to(dtype=temporal_dtype, device=device)
+                        t_latents = vae.first_stage_model.per_channel_statistics.un_normalize(t_latents)
+                        t_upsampled = temporal_upscale_model(t_latents)
+                    finally:
+                        temporal_upscale_model.cpu()
+
+                    t_upsampled = vae.first_stage_model.per_channel_statistics.normalize(t_upsampled)
+                    t_upsampled = t_upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
+
+                    target_latent_T = ((num_frames - 1) // 8) + 1
+                    if t_upsampled.shape[2] > target_latent_T:
+                        t_upsampled = t_upsampled[:, :, :target_latent_T]
+                        print(f"[RSLTXVGenerate] Trimmed temporal output to {target_latent_T} latent frames")
+
+                    output_latent = {"samples": t_upsampled}
+                    print(f"[RSLTXVGenerate] After temporal upscale: latent shape {list(t_upsampled.shape)}")
+
+                    # Restore full frame rate (was halved for temporal upscale generation)
+                    positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
+                    negative = node_helpers.conditioning_set_values(negative, {"frame_rate": frame_rate})
+
+                # Spatial upscale (2x resolution)
+                upscale_label = "2x temporal + 2x spatial" if do_temporal_upscale else "2x spatial"
                 print(f"[RSLTXVGenerate] Upscaling video latents ({upscale_label})")
                 self._free_vram()
 
-                device = mm.get_torch_device()
                 model_dtype = next(upscale_model.parameters()).dtype
                 up_latents = output_latent["samples"]
-                input_dtype = up_latents.dtype
 
                 memory_required = mm.module_size(upscale_model)
                 memory_required += math.prod(up_latents.shape) * 3000.0
@@ -605,32 +635,6 @@ class RSLTXVGenerate:
                 upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
                 upsampled = upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
                 output_latent = {"samples": upsampled}
-
-                # Temporal upscale (2x frame count)
-                if do_temporal_upscale:
-                    print("[RSLTXVGenerate] Upscaling video latents (2x temporal)")
-                    self._free_vram()
-
-                    temporal_dtype = next(temporal_upscale_model.parameters()).dtype
-                    temporal_upscale_model.to(device)
-                    try:
-                        t_latents = upsampled.to(dtype=temporal_dtype, device=device)
-                        t_latents = vae.first_stage_model.per_channel_statistics.un_normalize(t_latents)
-                        upsampled = temporal_upscale_model(t_latents)
-                    finally:
-                        temporal_upscale_model.cpu()
-
-                    upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
-                    upsampled = upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
-
-                    # Trim to target latent T if temporal upscale produced extra frames
-                    target_latent_T = ((num_frames - 1) // 8) + 1
-                    if upsampled.shape[2] > target_latent_T:
-                        upsampled = upsampled[:, :, :target_latent_T]
-                        print(f"[RSLTXVGenerate] Trimmed temporal output to {target_latent_T} latent frames")
-
-                    output_latent = {"samples": upsampled}
-                    print(f"[RSLTXVGenerate] After temporal upscale: latent shape {list(upsampled.shape)}")
 
                 # Re-inject guide images at full resolution into upscaled latent
                 up_denoise_mask = None
@@ -686,10 +690,11 @@ class RSLTXVGenerate:
                     self._free_vram()
 
                     # Recombine video + audio for the AV model
+                    # Audio mask=0 preserves audio for lip sync / timing guidance
                     if has_audio and audio_latent_out is not None:
                         up_combined = comfy.nested_tensor.NestedTensor((upsampled, audio_latent_out))
                         if up_denoise_mask is not None:
-                            audio_mask = torch.ones_like(audio_latent_out[:, :1])
+                            audio_mask = torch.zeros_like(audio_latent_out[:, :1])
                             up_denoise_mask = comfy.nested_tensor.NestedTensor((up_denoise_mask, audio_mask))
                     else:
                         up_combined = upsampled
@@ -748,11 +753,6 @@ class RSLTXVGenerate:
                         up_model_sampling = ModelSamplingAdvanced(up_model.model.model_config)
                         up_model_sampling.set_parameters(shift=up_shift)
                         up_model.add_object_patch("model_sampling", up_model_sampling)
-
-                    # Restore full frame rate for re-diffusion (was halved for temporal upscale generation)
-                    if do_temporal_upscale:
-                        positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
-                        negative = node_helpers.conditioning_set_values(negative, {"frame_rate": frame_rate})
 
                     up_guider = comfy.samplers.CFGGuider(up_model)
                     up_guider.set_conds(positive, negative)
@@ -880,8 +880,8 @@ class RSLTXVGenerate:
                         output_latent = {"samples": up_samples}
 
                 # T2V pass 2: decode first frame from pass 1, sharpen, use as
-                # I2V-style guidance for a second re-diffusion.  This gives T2V
-                # the same anchor-based quality as the I2V upscale path.
+                # I2V-style guidance for a second re-diffusion with audio context.
+                # Runs after temporal upscale to fix any artifacts and improve lip sync.
                 if not has_image_guides and do_rediffusion and upscale_denoise > 0 and upscale_steps > 0:
                     print("[RSLTXVGenerate] T2V pass 2: decoding first frame for I2V guidance")
                     self._free_vram()
@@ -918,10 +918,10 @@ class RSLTXVGenerate:
                     )
                     p2_denoise_mask[:, :, :first_encoded.shape[2]] = 0.0
 
-                    # Recombine with audio if needed
+                    # Recombine with audio for lip sync guidance (mask=0 preserves audio)
                     if has_audio and audio_latent_out is not None:
                         p2_combined = comfy.nested_tensor.NestedTensor((video_latent, audio_latent_out))
-                        audio_mask = torch.ones_like(audio_latent_out[:, :1])
+                        audio_mask = torch.zeros_like(audio_latent_out[:, :1])
                         p2_denoise_mask = comfy.nested_tensor.NestedTensor((p2_denoise_mask, audio_mask))
                     else:
                         p2_combined = video_latent
