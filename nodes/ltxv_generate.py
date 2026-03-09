@@ -44,9 +44,9 @@ class RSLTXVGenerate:
                 "first_image":       ("IMAGE",),
                 "middle_image":      ("IMAGE",),
                 "last_image":        ("IMAGE",),
-                "first_strength":    ("FLOAT", {"default": 1.0,  "min": 0.0, "max": 1.0, "step": 0.01}),
-                "middle_strength":   ("FLOAT", {"default": 1.0,  "min": 0.0, "max": 1.0, "step": 0.01}),
-                "last_strength":     ("FLOAT", {"default": 1.0,  "min": 0.0, "max": 1.0, "step": 0.01}),
+                "first_strength":    ("FLOAT", {"default": 0.7,  "min": 0.0, "max": 1.0, "step": 0.01}),
+                "middle_strength":   ("FLOAT", {"default": 0.7,  "min": 0.0, "max": 1.0, "step": 0.01}),
+                "last_strength":     ("FLOAT", {"default": 0.7,  "min": 0.0, "max": 1.0, "step": 0.01}),
                 "crf":               ("INT",   {"default": 35,   "min": 0,   "max": 100}),
                 # Audio
                 "audio":             ("AUDIO",),
@@ -401,63 +401,39 @@ class RSLTXVGenerate:
         negative = node_helpers.conditioning_set_values(negative, {"frame_rate": gen_frame_rate})
 
         # ----------------------------------------------------------------
-        # 2. FRAME INJECTION
+        # 2. FRAME INJECTION (all guides use LTXVAddGuide append + keyframe_idxs)
         # ----------------------------------------------------------------
 
-        from comfy_extras.nodes_lt import preprocess as ltxv_preprocess, LTXVAddGuide, get_noise_mask
+        from comfy_extras.nodes_lt import LTXVAddGuide, get_noise_mask
 
         latent_dict = {"samples": latent}
         noise_mask = get_noise_mask(latent_dict)
 
-        # 2a. First image — inplace injection (matches LTXVImgToVideoInplace).
-        #     Encodes raw pixels (no CRF), places at position 0, noise_mask
-        #     controls preservation: strength=1.0 → mask=0.0 → pixel-perfect.
-        if first_image is not None:
-            _, height_sf, width_sf = vae.downscale_index_formula
-            _, _, _, lh, lw = latent_dict["samples"].shape
-            target_w, target_h = lw * width_sf, lh * height_sf
-
-            src_h, src_w = first_image.shape[1], first_image.shape[2]
-            print(f"[RSLTXVGenerate] First image: {src_w}x{src_h} → encode at {target_w}x{target_h} (latent {lw}x{lh})")
-
-            if src_h != target_h or src_w != target_w:
-                pixels = comfy.utils.common_upscale(
-                    first_image.movedim(-1, 1), target_w, target_h, "bilinear", "center"
-                ).movedim(1, -1)
-            else:
-                pixels = first_image
-            t = vae.encode(pixels[:, :, :, :3])
-
-            latent_dict["samples"][:, :, :t.shape[2]] = t
-            noise_mask[:, :, :t.shape[2]] = 1.0 - first_strength
-            latent_dict["noise_mask"] = noise_mask
-
-        # 2b. Middle/last images — guide conditioning via LTXVAddGuide
         guides = []
+        if first_image is not None:
+            guides.append((first_image, 0, first_strength, "first"))
         if middle_image is not None:
             mid_idx = (gen_num_frames - 1) // 2
             mid_idx = max(0, (mid_idx // 8) * 8)
             if mid_idx == 0 and gen_num_frames > 8:
                 mid_idx = 8
-            guides.append((middle_image, mid_idx, middle_strength))
+            guides.append((middle_image, mid_idx, middle_strength, "middle"))
         if last_image is not None:
-            guides.append((last_image, -1, last_strength))
+            guides.append((last_image, -1, last_strength, "last"))
 
         if guides:
             scale_factors = vae.downscale_index_formula
-            for img, frame_idx, strength_val in guides:
+            for img, frame_idx, strength_val, label in guides:
                 _, _, latent_length, latent_height, latent_width = latent_dict["samples"].shape
 
-                processed_frames = []
-                for i in range(img.shape[0]):
-                    processed_frames.append(ltxv_preprocess(img[i], crf))
-                processed = torch.stack(processed_frames)
-
-                _, t = LTXVAddGuide.encode(vae, latent_width, latent_height, processed, scale_factors)
+                # Use LTXVAddGuide.encode directly (resize + VAE encode, no CRF)
+                _, t = LTXVAddGuide.encode(vae, latent_width, latent_height, img, scale_factors)
 
                 frame_idx_actual, latent_idx = LTXVAddGuide.get_latent_index(
-                    positive, latent_length, len(processed), frame_idx, scale_factors
+                    positive, latent_length, len(img), frame_idx, scale_factors
                 )
+
+                print(f"[RSLTXVGenerate] Guide {label}: frame_idx={frame_idx_actual}, latent_idx={latent_idx}, strength={strength_val}")
 
                 positive, negative, latent_samples, noise_mask = LTXVAddGuide.append_keyframe(
                     positive, negative, frame_idx_actual,

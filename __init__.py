@@ -10,6 +10,8 @@ from .nodes.canny_preprocessor import RSCannyPreprocessor
 from .nodes.video_trim import RSVideoTrim
 from .nodes.film_grain import RSFilmGrain
 from .nodes.ltxv_upscale import RSLTXVUpscale
+from .nodes.flux2_generate import RSFlux2Generate
+from .nodes.prompt_formatter_local import RSPromptFormatterLocal
 
 WEB_DIRECTORY = "./web"
 
@@ -26,6 +28,8 @@ NODE_CLASS_MAPPINGS = {
     "RSVideoTrim": RSVideoTrim,
     "RSFilmGrain": RSFilmGrain,
     "RSLTXVUpscale": RSLTXVUpscale,
+    "RSFlux2Generate": RSFlux2Generate,
+    "RSPromptFormatterLocal": RSPromptFormatterLocal,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -41,6 +45,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSVideoTrim": "RS Video Trim",
     "RSFilmGrain": "RS Film Grain",
     "RSLTXVUpscale": "RS LTXV Upscale",
+    "RSFlux2Generate": "RS Flux2 Generate",
+    "RSPromptFormatterLocal": "RS Prompt Formatter Local",
 }
 
 # MOSS-TTS nodes — only available if dependencies (transformers, huggingface_hub) are installed
