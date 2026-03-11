@@ -61,7 +61,9 @@ class RSPromptFormatter:
                 "ollama_url": ("STRING", {"default": "http://localhost:11434"}),
             },
             "optional": {
-                "reference_image": ("IMAGE",),
+                "first_image": ("IMAGE", {"tooltip": "First frame / opening image for the scene."}),
+                "middle_image": ("IMAGE", {"tooltip": "Middle frame / key moment of the scene."}),
+                "last_image": ("IMAGE", {"tooltip": "Last frame / ending image for the scene."}),
                 "cache_file": ("STRING", {"default": "formatted_prompt.json", "tooltip": "JSON cache file. Re-runs Ollama only when the input prompt changes."}),
                 "output_dir": ("STRING", {"default": "", "tooltip": "Directory for cache file. Empty = ComfyUI output folder."}),
             },
@@ -156,16 +158,40 @@ class RSPromptFormatter:
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, cache_file.strip())
 
+    def _encode_image(self, image_tensor):
+        """Convert an IMAGE tensor to base64 PNG string for Ollama."""
+        frame = image_tensor[0]  # first frame [H, W, C]
+        img_array = (frame.cpu().numpy() * 255).astype(np.uint8)
+        img = Image.fromarray(img_array)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+
     def format_prompt(self, prompt: str, system_prompt: str, model: str, ollama_url: str,
-                      reference_image=None, cache_file="formatted_prompt.json", output_dir=""):
+                      first_image=None, middle_image=None, last_image=None,
+                      cache_file="formatted_prompt.json", output_dir=""):
         cache_path = self._resolve_cache_path(output_dir, cache_file)
 
-        # Check JSON cache — skip Ollama if prompt hasn't changed
+        # Build labeled image list from connected inputs
+        images = []
+        if first_image is not None:
+            images.append(("First frame", first_image))
+        if middle_image is not None:
+            images.append(("Middle frame", middle_image))
+        if last_image is not None:
+            images.append(("Last frame", last_image))
+
+        # Build a key describing which image slots are connected
+        image_key = ",".join(label for label, _ in images) if images else ""
+
+        # Check JSON cache — skip Ollama if prompt and image configuration haven't changed
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     cache = json.load(f)
-                if cache.get("prompt") == prompt and cache.get("system_prompt") == system_prompt:
+                if (cache.get("prompt") == prompt
+                        and cache.get("system_prompt") == system_prompt
+                        and cache.get("image_key", "") == image_key):
                     print(f"[RS Prompt Formatter] Prompt unchanged — using cached output")
                     return (cache["output"],)
             except (json.JSONDecodeError, KeyError):
@@ -173,18 +199,20 @@ class RSPromptFormatter:
 
         base = ollama_url.rstrip("/")
 
-        images = None
-        if reference_image is not None:
-            frame = reference_image[0]  # first frame [H, W, C]
-            img_array = (frame.cpu().numpy() * 255).astype(np.uint8)
-            img = Image.fromarray(img_array)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            images = [base64.b64encode(buf.getvalue()).decode("utf-8")]
-
-        user_message = {"role": "user", "content": prompt}
+        # Encode images and build prompt with labels
+        encoded_images = []
         if images:
-            user_message["images"] = images
+            label_text = "Reference images:\n"
+            for label, img_tensor in images:
+                encoded_images.append(self._encode_image(img_tensor))
+                label_text += f"- {label}\n"
+            content = f"{label_text}\n{prompt}"
+        else:
+            content = prompt
+
+        user_message = {"role": "user", "content": content}
+        if encoded_images:
+            user_message["images"] = encoded_images
 
         payload = {
             "model": model,
@@ -222,7 +250,7 @@ class RSPromptFormatter:
 
         # Save prompt + output to JSON cache
         with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump({"prompt": prompt, "system_prompt": system_prompt, "output": formatted}, f, indent=2)
+            json.dump({"prompt": prompt, "system_prompt": system_prompt, "image_key": image_key, "output": formatted}, f, indent=2)
         print(f"[RS Prompt Formatter] Saved output to {cache_path}")
 
         return (formatted,)

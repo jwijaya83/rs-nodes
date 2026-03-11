@@ -11,7 +11,7 @@ import folder_paths
 
 from .prompt_formatter import DEFAULT_SYSTEM_PROMPT
 
-# Class-level cache: {weight_path: (patcher, model, sp)}
+# Class-level cache: {weight_path: (patcher, model, sp, has_vision)}
 _model_cache = {}
 
 # Gemma3 image placeholder token ID
@@ -74,8 +74,8 @@ def _load_gemma3(weight_path):
     parameters = comfy.utils.calculate_parameters(sd)
     print(f"[RS Prompt Formatter Local] Loaded Gemma3 ({parameters / 1e9:.1f}B params, {dtype})", flush=True)
 
-    _model_cache[weight_path] = (patcher, model, sp)
-    return patcher, model, sp
+    _model_cache[weight_path] = (patcher, model, sp, has_vision)
+    return patcher, model, sp, has_vision
 
 
 class RSPromptFormatterLocal:
@@ -88,7 +88,9 @@ class RSPromptFormatterLocal:
                 "system_prompt": ("STRING", {"default": DEFAULT_SYSTEM_PROMPT, "multiline": True}),
             },
             "optional": {
-                "reference_image": ("IMAGE",),
+                "first_image": ("IMAGE", {"tooltip": "First frame / opening image for the scene."}),
+                "middle_image": ("IMAGE", {"tooltip": "Middle frame / key moment of the scene."}),
+                "last_image": ("IMAGE", {"tooltip": "Last frame / ending image for the scene."}),
                 "max_tokens": ("INT", {"default": 1024, "min": 64, "max": 4096}),
                 "temperature": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "top_k": ("INT", {"default": 40, "min": 1, "max": 200}),
@@ -129,7 +131,7 @@ class RSPromptFormatterLocal:
         image_embeds = model.multi_modal_projector(vision_out)
         return image_embeds  # [1, 256, hidden_size]
 
-    def _build_embeds_with_image(self, model, input_ids, image_embeds, device):
+    def _build_embeds_with_image(self, model, input_ids, image_embeds_list, device):
         """Build embedding tensor, replacing image placeholder tokens with vision embeddings."""
         tokens_tensor = torch.LongTensor([input_ids]).to(device)
         text_embeds = model.model.embed_tokens(tokens_tensor)  # [1, seq_len, hidden_size]
@@ -137,44 +139,57 @@ class RSPromptFormatterLocal:
         # Find image placeholder positions
         placeholder_positions = [i for i, tid in enumerate(input_ids) if tid == IMAGE_TOKEN_ID]
 
-        if not placeholder_positions or image_embeds is None:
+        if not placeholder_positions or not image_embeds_list:
             return text_embeds
 
-        # Replace placeholder token with image embeddings (256 tokens per image)
-        num_image_tokens = image_embeds.shape[1]
-        pos = placeholder_positions[0]
-
-        # Build: [text before placeholder] + [image embeds] + [text after placeholder]
         # The projector weights were trained against HuggingFace's flow where text
         # embeddings are pre-scaled by sqrt(hidden_size). ComfyUI's Llama2_.forward()
         # applies that scaling later to the entire embeds tensor. To prevent double-
-        # scaling the image tokens, divide them by the scale factor here so that the
-        # uniform scaling in forward() brings everything to the correct magnitude.
+        # scaling the image tokens, divide them by the scale factor here.
         scale = model.model.config.hidden_size ** 0.5
-        before = text_embeds[:, :pos, :]
-        after = text_embeds[:, pos + 1:, :]
-        img = image_embeds.to(device=text_embeds.device, dtype=text_embeds.dtype) / scale
-        combined = torch.cat([before, img, after], dim=1)
-        return combined
+
+        # Replace each placeholder with its corresponding image embeddings.
+        # Process in reverse order so earlier positions don't shift.
+        for pos, img_embeds in reversed(list(zip(placeholder_positions, image_embeds_list))):
+            before = text_embeds[:, :pos, :]
+            after = text_embeds[:, pos + 1:, :]
+            img = img_embeds.to(device=text_embeds.device, dtype=text_embeds.dtype) / scale
+            text_embeds = torch.cat([before, img, after], dim=1)
+
+        return text_embeds
 
     def _generate(self, patcher, model, sp, prompt_text, system_prompt,
                   max_tokens, temperature, top_k, repeat_penalty, repeat_window,
-                  reference_image=None):
+                  images=None, has_vision=False):
         """Run autoregressive generation using the Gemma3 model."""
         mm.load_models_gpu([patcher])
         device = mm.get_torch_device()
 
-        # Process reference image if provided
-        image_embeds = None
-        has_image = reference_image is not None and hasattr(model, 'vision_model')
-        if has_image:
-            print("[RS Prompt Formatter Local] Processing reference image...", flush=True)
-            with torch.no_grad():
-                image_embeds = self._process_image(model, reference_image, device)
-            # Build token list with explicit image placeholder insertion
-            before_image = f"<start_of_turn>user\n{system_prompt}\n\nReference image: "
-            after_image = f"\n\n{prompt_text}<end_of_turn>\n<start_of_turn>model\n"
-            input_ids = sp.encode(before_image) + [IMAGE_TOKEN_ID] + sp.encode(after_image)
+        # images is a list of (label, tensor) pairs
+        image_embeds_list = []
+
+        if images and has_vision:
+            print(f"[RS Prompt Formatter Local] Processing {len(images)} reference image(s)...", flush=True)
+            # Build chat template with labeled image placeholders
+            parts = [f"<start_of_turn>user\n{system_prompt}\n\nReference images:\n"]
+            token_parts = [sp.encode(parts[0])]
+
+            for label, img_tensor in images:
+                with torch.no_grad():
+                    img_embeds = self._process_image(model, img_tensor, device)
+                image_embeds_list.append(img_embeds)
+                # Add label text, then placeholder, then newline
+                label_text = f"{label}: "
+                token_parts.append(sp.encode(label_text))
+                token_parts.append([IMAGE_TOKEN_ID])
+                token_parts.append(sp.encode("\n"))
+
+            after_text = f"\n{prompt_text}<end_of_turn>\n<start_of_turn>model\n"
+            token_parts.append(sp.encode(after_text))
+
+            input_ids = []
+            for part in token_parts:
+                input_ids.extend(part)
         else:
             chat = (
                 f"<start_of_turn>user\n{system_prompt}\n\n{prompt_text}<end_of_turn>\n"
@@ -186,8 +201,8 @@ class RSPromptFormatterLocal:
 
         # Build initial embeddings
         with torch.no_grad():
-            if has_image:
-                embeds = self._build_embeds_with_image(model, input_ids, image_embeds, device)
+            if image_embeds_list:
+                embeds = self._build_embeds_with_image(model, input_ids, image_embeds_list, device)
             else:
                 tokens_tensor = torch.LongTensor([input_ids]).to(device)
                 embeds = model.model.embed_tokens(tokens_tensor)
@@ -222,13 +237,23 @@ class RSPromptFormatterLocal:
         return result
 
     def format_prompt(self, text_encoder, prompt, system_prompt,
-                      reference_image=None, max_tokens=1024, temperature=0.8, top_k=40,
+                      first_image=None, middle_image=None, last_image=None,
+                      max_tokens=1024, temperature=0.8, top_k=40,
                       repeat_penalty=1.1, repeat_window=64,
                       cache_file="formatted_prompt.json", output_dir=""):
         cache_path = self._resolve_cache_path(output_dir, cache_file)
 
-        # Check JSON cache — skip generation if prompt hasn't changed
-        if os.path.exists(cache_path):
+        # Build labeled image list from connected inputs
+        images = []
+        if first_image is not None:
+            images.append(("First frame", first_image))
+        if middle_image is not None:
+            images.append(("Middle frame", middle_image))
+        if last_image is not None:
+            images.append(("Last frame", last_image))
+
+        # Check JSON cache — skip generation if prompt hasn't changed and no images
+        if not images and os.path.exists(cache_path):
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     cache = json.load(f)
@@ -239,12 +264,17 @@ class RSPromptFormatterLocal:
                 pass
 
         weight_path = folder_paths.get_full_path_or_raise("text_encoders", text_encoder)
-        patcher, model, sp = _load_gemma3(weight_path)
+        patcher, model, sp, has_vision = _load_gemma3(weight_path)
+
+        if images and not has_vision:
+            print("[RS Prompt Formatter Local] Warning: images provided but model has no vision weights — ignoring images")
+            images = []
 
         formatted = self._generate(patcher, model, sp, prompt, system_prompt,
                                    max_tokens, temperature, top_k,
                                    repeat_penalty, repeat_window,
-                                   reference_image=reference_image)
+                                   images=images or None,
+                                   has_vision=has_vision)
 
         if not formatted:
             raise RuntimeError("[RS Prompt Formatter Local] Model returned empty output")
