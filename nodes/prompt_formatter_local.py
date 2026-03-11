@@ -11,18 +11,21 @@ import folder_paths
 
 from .prompt_formatter import DEFAULT_SYSTEM_PROMPT
 
-# Class-level cache: {weight_path: (patcher, llm, tokenizer)}
+# Class-level cache: {weight_path: (patcher, model, sp)}
 _model_cache = {}
+
+# Gemma3 image placeholder token ID
+IMAGE_TOKEN_ID = 262144
 
 
 def _load_gemma3(weight_path):
-    """Load a Gemma3 model from a text_encoder safetensors file. Returns (patcher, llm, sp)."""
+    """Load a Gemma3 model (with vision) from a text_encoder safetensors file."""
     if weight_path in _model_cache:
         return _model_cache[weight_path]
 
     print(f"[RS Prompt Formatter Local] Loading {os.path.basename(weight_path)}...", flush=True)
 
-    from comfy.text_encoders.llama import Llama2_, Gemma3_12B_Config
+    from comfy.text_encoders.llama import Gemma3_12B, Gemma3_12B_Config
     import sentencepiece
 
     sd, metadata = comfy.utils.load_torch_file(weight_path, safe_load=True, return_metadata=True)
@@ -47,32 +50,32 @@ def _load_gemma3(weight_path):
     else:
         ops = comfy.ops.manual_cast
 
-    # Build LLM (Llama2_ only — skip vision model / projector)
-    config = Gemma3_12B_Config()
-    llm = Llama2_(config, device="cpu", dtype=dtype, ops=ops)
+    # Build full Gemma3_12B (LLM + vision model + projector)
+    model = Gemma3_12B({}, dtype=dtype, device="cpu", operations=ops)
 
-    # Strip "model." prefix so keys match Llama2_ structure
-    llm_sd = {}
-    for k, v in sd.items():
-        if k.startswith("model."):
-            llm_sd[k[len("model."):]] = v
-    missing, unexpected = llm.load_state_dict(llm_sd, strict=False)
+    # Load all weights — model.*, vision_model.*, multi_modal_projector.*
+    missing, unexpected = model.load_state_dict(sd, strict=False)
     if missing:
-        # Filter out expected missing keys (lm_head if present)
         real_missing = [k for k in missing if "lm_head" not in k]
         if real_missing:
             print(f"[RS Prompt Formatter Local] Warning: missing keys: {real_missing[:5]}")
 
+    has_vision = not any("vision_model" in k for k in missing)
+    if has_vision:
+        print("[RS Prompt Formatter Local] Vision model loaded — image input supported")
+    else:
+        print("[RS Prompt Formatter Local] No vision weights — image input will be ignored")
+
     # Wrap in ModelPatcher for GPU management
     load_device = mm.text_encoder_device()
     offload_device = mm.text_encoder_offload_device()
-    patcher = comfy.model_patcher.ModelPatcher(llm, load_device=load_device, offload_device=offload_device)
+    patcher = comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=offload_device)
 
-    parameters = comfy.utils.calculate_parameters(llm_sd)
+    parameters = comfy.utils.calculate_parameters(sd)
     print(f"[RS Prompt Formatter Local] Loaded Gemma3 ({parameters / 1e9:.1f}B params, {dtype})", flush=True)
 
-    _model_cache[weight_path] = (patcher, llm, sp)
-    return patcher, llm, sp
+    _model_cache[weight_path] = (patcher, model, sp)
+    return patcher, model, sp
 
 
 class RSPromptFormatterLocal:
@@ -114,83 +117,109 @@ class RSPromptFormatterLocal:
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, cache_file.strip())
 
-    def _generate(self, patcher, llm, sp, prompt_text, system_prompt,
-                  max_tokens, temperature, top_k, repeat_penalty, repeat_window):
+    def _process_image(self, model, image, device):
+        """Process a reference image through Gemma3's vision pipeline. Returns image embeddings."""
+        import comfy.clip_model
+        preprocessed = comfy.clip_model.clip_preprocess(
+            image, size=model.image_size,
+            mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], crop=True,
+        )
+        pixel_values = preprocessed.to(device, dtype=torch.float32)
+        vision_out = model.vision_model(pixel_values)[0]
+        image_embeds = model.multi_modal_projector(vision_out)
+        return image_embeds  # [1, 256, hidden_size]
+
+    def _build_embeds_with_image(self, model, input_ids, image_embeds, device):
+        """Build embedding tensor, replacing image placeholder tokens with vision embeddings."""
+        tokens_tensor = torch.LongTensor([input_ids]).to(device)
+        text_embeds = model.model.embed_tokens(tokens_tensor)  # [1, seq_len, hidden_size]
+
+        # Find image placeholder positions
+        placeholder_positions = [i for i, tid in enumerate(input_ids) if tid == IMAGE_TOKEN_ID]
+
+        if not placeholder_positions or image_embeds is None:
+            return text_embeds
+
+        # Replace placeholder token with image embeddings (256 tokens per image)
+        num_image_tokens = image_embeds.shape[1]
+        pos = placeholder_positions[0]
+
+        # Build: [text before placeholder] + [image embeds] + [text after placeholder]
+        # The projector weights were trained against HuggingFace's flow where text
+        # embeddings are pre-scaled by sqrt(hidden_size). ComfyUI's Llama2_.forward()
+        # applies that scaling later to the entire embeds tensor. To prevent double-
+        # scaling the image tokens, divide them by the scale factor here so that the
+        # uniform scaling in forward() brings everything to the correct magnitude.
+        scale = model.model.config.hidden_size ** 0.5
+        before = text_embeds[:, :pos, :]
+        after = text_embeds[:, pos + 1:, :]
+        img = image_embeds.to(device=text_embeds.device, dtype=text_embeds.dtype) / scale
+        combined = torch.cat([before, img, after], dim=1)
+        return combined
+
+    def _generate(self, patcher, model, sp, prompt_text, system_prompt,
+                  max_tokens, temperature, top_k, repeat_penalty, repeat_window,
+                  reference_image=None):
         """Run autoregressive generation using the Gemma3 model."""
         mm.load_models_gpu([patcher])
         device = mm.get_torch_device()
 
-        # Gemma3 chat template
-        chat = (
-            f"<start_of_turn>user\n{system_prompt}\n\n{prompt_text}<end_of_turn>\n"
-            f"<start_of_turn>model\n"
-        )
-        input_ids = sp.encode(chat)
+        # Process reference image if provided
+        image_embeds = None
+        has_image = reference_image is not None and hasattr(model, 'vision_model')
+        if has_image:
+            print("[RS Prompt Formatter Local] Processing reference image...", flush=True)
+            with torch.no_grad():
+                image_embeds = self._process_image(model, reference_image, device)
+            # Build token list with explicit image placeholder insertion
+            before_image = f"<start_of_turn>user\n{system_prompt}\n\nReference image: "
+            after_image = f"\n\n{prompt_text}<end_of_turn>\n<start_of_turn>model\n"
+            input_ids = sp.encode(before_image) + [IMAGE_TOKEN_ID] + sp.encode(after_image)
+        else:
+            chat = (
+                f"<start_of_turn>user\n{system_prompt}\n\n{prompt_text}<end_of_turn>\n"
+                f"<start_of_turn>model\n"
+            )
+            input_ids = sp.encode(chat)
 
-        # Special token IDs
-        eos_id = sp.eos_id()
-        eot_id = sp.piece_to_id("<end_of_turn>")
-
-        prompt_len = len(input_ids)
         print("[RS Prompt Formatter Local] Generating:", flush=True)
 
-        for _ in range(max_tokens):
-            tokens = torch.LongTensor([input_ids]).to(device)
-
-            with torch.no_grad():
-                hidden, _ = llm(tokens)
-
-            last_hidden = hidden[0, -1, :]  # [hidden_size]
-
-            # Weight-tied lm_head: logits = hidden @ embed_weight^T
-            embed_weight = llm.embed_tokens.weight
-            logits = (last_hidden @ embed_weight.T).float()  # [vocab_size]
-
-            # Repeat penalty — penalize tokens already generated
-            if repeat_penalty > 1.0:
-                generated = input_ids[prompt_len:]
-                if repeat_window > 0:
-                    generated = generated[-repeat_window:]
-                if generated:
-                    penalty_ids = torch.LongTensor(generated).to(logits.device)
-                    penalty_logits = logits[penalty_ids]
-                    # Divide positive logits, multiply negative logits
-                    logits[penalty_ids] = torch.where(
-                        penalty_logits > 0,
-                        penalty_logits / repeat_penalty,
-                        penalty_logits * repeat_penalty,
-                    )
-
-            # Temperature + top-k sampling
-            if temperature > 0:
-                logits = logits / temperature
-                top_k_logits, top_k_ids = torch.topk(logits, min(top_k, logits.shape[0]))
-                probs = torch.softmax(top_k_logits, dim=-1)
-                next_id = top_k_ids[torch.multinomial(probs, 1)].item()
+        # Build initial embeddings
+        with torch.no_grad():
+            if has_image:
+                embeds = self._build_embeds_with_image(model, input_ids, image_embeds, device)
             else:
-                next_id = logits.argmax().item()
+                tokens_tensor = torch.LongTensor([input_ids]).to(device)
+                embeds = model.model.embed_tokens(tokens_tensor)
 
-            input_ids.append(next_id)
+            # Use the built-in generate method (has KV cache, proper logits, dtype handling)
+            eos_id = sp.eos_id()
+            eot_id = sp.piece_to_id("<end_of_turn>")
+            stop_tokens = [eos_id]
+            if eot_id is not None:
+                stop_tokens.append(eot_id)
 
-            token_text = sp.decode([next_id])
-            print(token_text, end="", flush=True)
+            generated_ids = model.generate(
+                embeds=embeds,
+                do_sample=temperature > 0,
+                max_length=max_tokens,
+                temperature=max(temperature, 1e-6),
+                top_k=top_k,
+                repetition_penalty=repeat_penalty,
+                stop_tokens=stop_tokens,
+                initial_tokens=input_ids,
+            )
 
-            if next_id == eos_id:
-                break
-            if eot_id is not None and next_id == eot_id:
-                break
-
-        print(flush=True)
-
-        # Decode generated portion only
-        output = sp.decode(input_ids[prompt_len:])
+        output = sp.decode(generated_ids)
 
         # Strip <think>...</think> blocks (including partial/unclosed)
         output = re.sub(r"<think>.*?</think>", "", output, flags=re.DOTALL)
         output = re.sub(r"<think>.*", "", output, flags=re.DOTALL)
         output = output.replace("<end_of_turn>", "")
 
-        return output.strip()
+        result = output.strip()
+        print(f"\n[RS Prompt Formatter Local] Output ({len(generated_ids)} tokens):\n{result}", flush=True)
+        return result
 
     def format_prompt(self, text_encoder, prompt, system_prompt,
                       reference_image=None, max_tokens=1024, temperature=0.8, top_k=40,
@@ -210,11 +239,12 @@ class RSPromptFormatterLocal:
                 pass
 
         weight_path = folder_paths.get_full_path_or_raise("text_encoders", text_encoder)
-        patcher, llm, sp = _load_gemma3(weight_path)
+        patcher, model, sp = _load_gemma3(weight_path)
 
-        formatted = self._generate(patcher, llm, sp, prompt, system_prompt,
+        formatted = self._generate(patcher, model, sp, prompt, system_prompt,
                                    max_tokens, temperature, top_k,
-                                   repeat_penalty, repeat_window)
+                                   repeat_penalty, repeat_window,
+                                   reference_image=reference_image)
 
         if not formatted:
             raise RuntimeError("[RS Prompt Formatter Local] Model returned empty output")
