@@ -702,10 +702,10 @@ class RSLTXVGenerate:
                 output_latent = {"samples": upsampled}
 
                 # Re-inject guide images at full resolution into upscaled latent
-                up_denoise_mask = None
-                time_sf, up_height_sf, up_width_sf = vae.downscale_index_formula
-                _, _, up_latent_t, up_lh, up_lw = upsampled.shape
-                up_target_w, up_target_h = up_lw * up_width_sf, up_lh * up_height_sf
+                # using LTXVAddGuide crop guides (same as inference stage)
+                from comfy_extras.nodes_lt import LTXVAddGuide as UpGuide, get_noise_mask as up_get_noise_mask, get_keyframe_idxs as up_get_keyframe_idxs
+
+                up_scale_factors = vae.downscale_index_formula
 
                 # Only use a single guide for re-diffusion to avoid snapping.
                 # Priority: first > last > middle
@@ -713,35 +713,39 @@ class RSLTXVGenerate:
                 if first_image is not None:
                     up_guides.append((first_image, 0, first_strength, "first"))
                 elif last_image is not None:
-                    up_guides.append((last_image, up_latent_t - 1, last_strength, "last"))
+                    up_guides.append((last_image, -1, last_strength, "last"))
                 elif middle_image is not None:
                     mid_idx = (num_frames - 1) // 2
                     mid_idx = max(0, (mid_idx // 8) * 8)
                     if mid_idx == 0 and num_frames > 8:
                         mid_idx = 8
-                    mid_latent_idx = (mid_idx + time_sf - 1) // time_sf
-                    up_guides.append((middle_image, mid_latent_idx, middle_strength, "middle"))
+                    up_guides.append((middle_image, mid_idx, middle_strength, "middle"))
+
+                up_noise_mask = None
 
                 if up_guides:
-                    up_denoise_mask = torch.ones(
-                        (upsampled.shape[0], 1, up_latent_t, 1, 1),
-                        dtype=upsampled.dtype, device=upsampled.device,
-                    )
-                    for img, latent_idx, strength_val, label in up_guides:
-                        src_h, src_w = img.shape[1], img.shape[2]
-                        if src_h != up_target_h or src_w != up_target_w:
-                            up_pixels = comfy.utils.common_upscale(
-                                img.movedim(-1, 1), up_target_w, up_target_h, "bilinear", "center"
-                            ).movedim(1, -1)
-                        else:
-                            up_pixels = img
-                        up_t = vae.encode(up_pixels[:, :, :, :3])
+                    up_latent_dict = {"samples": upsampled}
+                    up_noise_mask = up_get_noise_mask(up_latent_dict)
 
-                        end_idx = min(latent_idx + up_t.shape[2], up_latent_t)
-                        upsampled[:, :, latent_idx:end_idx] = up_t[:, :, :end_idx - latent_idx]
-                        up_denoise_mask[:, :, latent_idx:end_idx] = 1.0 - strength_val
-                        print(f"[RSLTXVGenerate] Upscale re-inject {label} frame at full res ({up_target_w}x{up_target_h}), latent_idx={latent_idx}")
+                    for img, frame_idx, strength_val, label in up_guides:
+                        _, _, latent_length, latent_height, latent_width = up_latent_dict["samples"].shape
 
+                        _, up_t = UpGuide.encode(vae, latent_width, latent_height, img, up_scale_factors)
+
+                        frame_idx_actual, latent_idx = UpGuide.get_latent_index(
+                            positive, latent_length, len(img), frame_idx, up_scale_factors
+                        )
+
+                        print(f"[RSLTXVGenerate] Upscale re-inject {label}: frame_idx={frame_idx_actual}, latent_idx={latent_idx}, strength={strength_val}")
+
+                        positive, negative, up_latent_samples, up_noise_mask = UpGuide.append_keyframe(
+                            positive, negative, frame_idx_actual,
+                            up_latent_dict["samples"], up_noise_mask,
+                            up_t, strength_val, up_scale_factors,
+                        )
+                        up_latent_dict = {"samples": up_latent_samples, "noise_mask": up_noise_mask}
+
+                    upsampled = up_latent_dict["samples"]
                     output_latent = {"samples": upsampled}
 
                 # Re-diffusion at upscaled resolution
@@ -761,9 +765,9 @@ class RSLTXVGenerate:
                     if has_audio and audio_latent_out is not None:
                         up_combined = comfy.nested_tensor.NestedTensor((upsampled, audio_latent_out))
                         audio_mask_val = 0.0 if audio_is_input else 1.0
-                        if up_denoise_mask is not None:
+                        if up_noise_mask is not None:
                             audio_mask = torch.full_like(audio_latent_out[:, :1], audio_mask_val)
-                            up_denoise_mask = comfy.nested_tensor.NestedTensor((up_denoise_mask, audio_mask))
+                            up_noise_mask = comfy.nested_tensor.NestedTensor((up_noise_mask, audio_mask))
                     else:
                         up_combined = upsampled
 
@@ -852,7 +856,7 @@ class RSLTXVGenerate:
                         up_callback = latent_preview.prepare_callback(up_guider.model_patcher, up_sig.shape[-1] - 1)
                         up_samples = up_guider.sample(
                             up_noise, up_latent_image, up_sampler, up_sig,
-                            denoise_mask=up_denoise_mask,
+                            denoise_mask=up_noise_mask,
                             callback=up_callback,
                             disable_pbar=disable_pbar,
                             seed=seed + 1,
@@ -868,12 +872,12 @@ class RSLTXVGenerate:
                         if is_av:
                             vid_latent, aud_latent = up_latent_image.unbind()
                             vid_noise, aud_noise = up_noise.unbind()
-                            vid_mask = up_denoise_mask.unbind()[0] if up_denoise_mask is not None and up_denoise_mask.is_nested else None
-                            aud_mask = up_denoise_mask.unbind()[1] if up_denoise_mask is not None and up_denoise_mask.is_nested else None
+                            vid_mask = up_noise_mask.unbind()[0] if up_noise_mask is not None and up_noise_mask.is_nested else None
+                            aud_mask = up_noise_mask.unbind()[1] if up_noise_mask is not None and up_noise_mask.is_nested else None
                         else:
                             vid_latent = up_latent_image
                             vid_noise = up_noise
-                            vid_mask = up_denoise_mask
+                            vid_mask = up_noise_mask
 
                         chunks_out = []
                         chunk_idx = 0
@@ -946,6 +950,13 @@ class RSLTXVGenerate:
                         audio_latent_out = up_parts[1] if len(up_parts) > 1 else audio_latent_out
                     else:
                         output_latent = {"samples": up_samples}
+
+                    # Crop guide keyframes out of the re-diffusion output
+                    _, up_num_keyframes = up_get_keyframe_idxs(positive)
+                    if up_num_keyframes > 0:
+                        output_latent["samples"] = output_latent["samples"][:, :, :-up_num_keyframes]
+                        positive = node_helpers.conditioning_set_values(positive, {"keyframe_idxs": None})
+                        negative = node_helpers.conditioning_set_values(negative, {"keyframe_idxs": None})
 
                 # T2V pass 2: decode first frame from pass 1, sharpen, use as
                 # I2V-style guidance for a second re-diffusion with audio context.
