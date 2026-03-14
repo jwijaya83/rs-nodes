@@ -6,6 +6,7 @@ from .nodes.free_vram import RSFreeVRAM
 from .nodes.ltxv_generate import RSLTXVGenerate
 from .nodes.ltxv_extend import RSLTXVExtend
 from .nodes.ic_lora_guider import RSICLoRAGuider
+from .nodes.ltxv_iclora_guider import RSLTXVICLoRAGuider
 from .nodes.canny_preprocessor import RSCannyPreprocessor
 from .nodes.video_trim import RSVideoTrim
 from .nodes.film_grain import RSFilmGrain
@@ -25,6 +26,7 @@ NODE_CLASS_MAPPINGS = {
     "RSLTXVGenerate": RSLTXVGenerate,
     "RSLTXVExtend": RSLTXVExtend,
     "RSICLoRAGuider": RSICLoRAGuider,
+    "RSLTXVICLoRAGuider": RSLTXVICLoRAGuider,
     "RSCannyPreprocessor": RSCannyPreprocessor,
     "RSVideoTrim": RSVideoTrim,
     "RSFilmGrain": RSFilmGrain,
@@ -43,6 +45,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSLTXVGenerate": "RS LTXV Generate",
     "RSLTXVExtend": "RS LTXV Extend",
     "RSICLoRAGuider": "RS IC-LoRA Guider",
+    "RSLTXVICLoRAGuider": "RS LTXV IC-LoRA Guider",
     "RSCannyPreprocessor": "RS Canny Preprocessor",
     "RSVideoTrim": "RS Video Trim",
     "RSFilmGrain": "RS Film Grain",

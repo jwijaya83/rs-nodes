@@ -1,11 +1,14 @@
 import base64
 import io
 import json
+import logging
 import os
 import re
 import sys
 import urllib.request
 import urllib.error
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 from PIL import Image
@@ -96,7 +99,7 @@ class RSPromptFormatter:
                         raise RuntimeError(f"Ollama pull failed: {msg['error']}")
                     status = msg.get("status", "")
                     if status != last_status:
-                        print(f"[RS Prompt Formatter] Pull: {status}")
+                        logger.info(f"Pull: {status}")
                         last_status = status
         except urllib.error.URLError as e:
             raise RuntimeError(f"Failed to pull model '{model_name}': {e}")
@@ -123,7 +126,7 @@ class RSPromptFormatter:
                 pass
             raise OllamaHTTPError(e.code, e.reason, body) from e
 
-        print("[RS Prompt Formatter] Generating:", flush=True)
+        logger.info("Generating:")
         full_text = []
         in_think = False
         try:
@@ -134,13 +137,12 @@ class RSPromptFormatter:
                     continue
                 token = chunk.get("message", {}).get("content", "")
                 if token:
-                    print(token, end="", flush=True)
+                    logger.info(token)
                     full_text.append(token)
                 if chunk.get("done"):
                     break
         finally:
             resp.close()
-            print(flush=True)
 
         raw = "".join(full_text)
         # Strip <think>...</think> blocks (including partial/unclosed)
@@ -192,7 +194,7 @@ class RSPromptFormatter:
                 if (cache.get("prompt") == prompt
                         and cache.get("system_prompt") == system_prompt
                         and cache.get("image_key", "") == image_key):
-                    print(f"[RS Prompt Formatter] Prompt unchanged — using cached output")
+                    logger.info("Prompt unchanged — using cached output")
                     return (cache["output"],)
             except (json.JSONDecodeError, KeyError):
                 pass  # corrupt or old format, re-run
@@ -234,9 +236,9 @@ class RSPromptFormatter:
                 detail = e.body[:200] if e.body else ""
 
             if "not found" in detail.lower():
-                print(f"[RS Prompt Formatter] Model '{model}' not found — pulling from Ollama...")
+                logger.info(f"Model '{model}' not found — pulling from Ollama...")
                 self._pull_model(base, model)
-                print(f"[RS Prompt Formatter] Model '{model}' ready.")
+                logger.info(f"Model '{model}' ready.")
                 formatted = self._stream_chat(base, payload)
             else:
                 raise RuntimeError(f"Ollama error ({e.code}): {detail or e.reason}")
@@ -251,6 +253,6 @@ class RSPromptFormatter:
         # Save prompt + output to JSON cache
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump({"prompt": prompt, "system_prompt": system_prompt, "image_key": image_key, "output": formatted}, f, indent=2)
-        print(f"[RS Prompt Formatter] Saved output to {cache_path}")
+        logger.info(f"Saved output to {cache_path}")
 
         return (formatted,)

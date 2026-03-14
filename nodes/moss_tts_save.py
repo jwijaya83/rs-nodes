@@ -1,9 +1,12 @@
 import difflib
 import gc
 import hashlib
+import logging
 import os
 import re
 import torch
+
+logger = logging.getLogger(__name__)
 import torchaudio
 import folder_paths
 import comfy.model_management as mm
@@ -211,7 +214,7 @@ class RSMossTTSSave:
         try:
             import whisper
         except ImportError:
-            print("[RSMossTTSSave] openai-whisper not installed — skipping Whisper alignment")
+            logger.info("openai-whisper not installed — skipping Whisper alignment")
             return None
 
         import numpy as np
@@ -231,11 +234,11 @@ class RSMossTTSSave:
             cache_dir = None
 
         try:
-            print("[RSMossTTSSave] Loading Whisper base model...")
+            logger.info("Loading Whisper base model...")
             model = whisper.load_model("base", download_root=cache_dir)
             result = model.transcribe(audio_np, word_timestamps=True)
         except Exception as e:
-            print(f"[RSMossTTSSave] Whisper transcription failed: {e}")
+            logger.info(f"Whisper transcription failed: {e}")
             return None
         finally:
             try:
@@ -253,11 +256,11 @@ class RSMossTTSSave:
                     words.append((text, w["start"], w["end"]))
 
         if not words:
-            print("[RSMossTTSSave] Whisper returned no words")
+            logger.info("Whisper returned no words")
             return None
 
         transcript = " ".join(w[0] for w in words)
-        print(f"[RSMossTTSSave] Whisper ({len(words)} words): {transcript[:120]}...")
+        logger.info(f"Whisper ({len(words)} words): {transcript[:120]}...")
         return words
 
     def _align_words_to_lines(self, words, lines, sample_rate):
@@ -317,9 +320,9 @@ class RSMossTTSSave:
 
         total = max(len(w_norms), len(script_words))
         ratio = matched_count / total if total else 0
-        print(f"[RSMossTTSSave] Alignment: {matched_count}/{total} words matched ({ratio:.0%})")
+        logger.info(f"Alignment: {matched_count}/{total} words matched ({ratio:.0%})")
         if ratio < 0.4:
-            print("[RSMossTTSSave] Alignment too poor, skipping Whisper boundaries")
+            logger.info("Alignment too poor, skipping Whisper boundaries")
             return None
 
         # Place boundaries between adjacent lines
@@ -342,11 +345,11 @@ class RSMossTTSSave:
             elif first_next_wi >= 0:
                 boundary_sec = words[first_next_wi][1]
             else:
-                print(f"[RSMossTTSSave] No words for line boundary {li+1}, alignment failed")
+                logger.info(f"No words for line boundary {li+1}, alignment failed")
                 return None
 
             boundaries.append(int(boundary_sec * sample_rate))
-            print(f"[RSMossTTSSave] Boundary {li+1}: {boundary_sec:.3f}s (sample {boundaries[-1]})")
+            logger.info(f"Boundary {li+1}: {boundary_sec:.3f}s (sample {boundaries[-1]})")
 
         return boundaries
 
@@ -414,7 +417,7 @@ class RSMossTTSSave:
                     silence_centers.append((start_frame + length // 2) * hop_size)
 
         K = len(silence_centers)
-        print(f"[RSMossTTSSave] Silence fallback: {K} regions, {needed} cuts needed")
+        logger.info(f"Silence fallback: {K} regions, {needed} cuts needed")
 
         if K < needed:
             return [int(total_samples * t) for t in cum_targets]
@@ -465,11 +468,11 @@ class RSMossTTSSave:
         if whisper_words is not None:
             boundaries = self._align_words_to_lines(whisper_words, lines, sample_rate)
             if boundaries is not None:
-                print("[RSMossTTSSave] Using Whisper word-aligned boundaries")
+                logger.info("Using Whisper word-aligned boundaries")
 
         # --- Fallback: silence DP ---
         if boundaries is None:
-            print("[RSMossTTSSave] Falling back to silence-based segmentation")
+            logger.info("Falling back to silence-based segmentation")
             boundaries = self._silence_dp_boundaries(wav_1d, lines, sample_rate, processor)
 
         segments = []
@@ -499,10 +502,10 @@ class RSMossTTSSave:
                 fallback_path = os.path.join(
                     folder_paths.get_input_directory(), saved_filename
                 )
-                print(f"[RSMossTTSSave] Fallback to wav -> {saved_filename}")
+                logger.info(f"Fallback to wav -> {saved_filename}")
                 torchaudio.save(fallback_path, wav_2d, sample_rate, format="wav")
 
-        print(f"[RSMossTTSSave] Saved: {saved_filename}")
+        logger.info(f"Saved: {saved_filename}")
 
         subfolder = ""
         view_filename = saved_filename
@@ -531,10 +534,10 @@ class RSMossTTSSave:
                 fallback_path = os.path.join(
                     folder_paths.get_input_directory(), saved_filename
                 )
-                print(f"[RSMossTTSSave] Fallback to wav -> {saved_filename}")
+                logger.info(f"Fallback to wav -> {saved_filename}")
                 torchaudio.save(fallback_path, wav_2d, sample_rate, format="wav")
 
-        print(f"[RSMossTTSSave] Saved one-shot: {saved_filename}")
+        logger.info(f"Saved one-shot: {saved_filename}")
 
         subfolder = ""
         view_filename = saved_filename
@@ -576,10 +579,10 @@ class RSMossTTSSave:
                 fallback_path = os.path.join(
                     folder_paths.get_input_directory(), saved_filename
                 )
-                print(f"[RSMossTTSSave] Fallback to wav -> {saved_filename}")
+                logger.info(f"Fallback to wav -> {saved_filename}")
                 torchaudio.save(fallback_path, wav, sr, format="wav")
 
-        print(f"[RSMossTTSSave] Saved full clip: {saved_filename}")
+        logger.info(f"Saved full clip: {saved_filename}")
         return self._split_filename(saved_filename)
 
     def _concat_clips(self, clip_count, filename_prefix, fmt, **kwargs):
@@ -590,7 +593,7 @@ class RSMossTTSSave:
         for i in range(1, clip_count + 1):
             filepath = os.path.join(input_dir, f"{filename_prefix}_{i:03d}.{fmt}")
             if not os.path.isfile(filepath):
-                print(f"[RSMossTTSSave] Warning: clip file not found, skipping: {filepath}")
+                logger.warning(f"clip file not found, skipping: {filepath}")
                 continue
             wav, sr = torchaudio.load(filepath)
             if wav.shape[0] > 1:
@@ -695,7 +698,7 @@ class RSMossTTSSave:
             if mode == "one_shot":
                 # Concat all dialogue lines into a single text, generate once
                 combined_text = " ".join(lines)
-                print(f"[RSMossTTSSave] One-shot generating all {total} lines: {combined_text[:80]}...")
+                logger.info(f"One-shot generating all {total} lines: {combined_text[:80]}...")
 
                 wav_1d = self._generate_one(
                     model, processor, sample_rate, device, model_id,
@@ -723,7 +726,7 @@ class RSMossTTSSave:
                 for i in indices:
                     text = lines[i]
                     clip_num = i + 1
-                    print(f"[RSMossTTSSave] Generating clip {clip_num}/{total}: {text[:60]}...")
+                    logger.info(f"Generating clip {clip_num}/{total}: {text[:60]}...")
 
                     wav_1d = self._generate_one(
                         model, processor, sample_rate, device, model_id,
@@ -732,7 +735,7 @@ class RSMossTTSSave:
                     )
 
                     if wav_1d is None:
-                        print(f"[RSMossTTSSave] Warning: generation failed for clip {clip_num}, skipping")
+                        logger.warning(f"generation failed for clip {clip_num}, skipping")
                         continue
 
                     self._save_one(wav_1d, sample_rate, filename_prefix, clip_num, format)
@@ -793,7 +796,7 @@ class RSMossTTSSave:
                     clip_labels = _parse_dialogue_list(dialogue_list)
                     # Cap to dialogue lines so stale clips from a longer script are excluded
                     if len(clip_labels) < concat_count:
-                        print(f"[RSMossTTSSave] Dialogue has {len(clip_labels)} lines but {concat_count} clips on disk — using dialogue count")
+                        logger.info(f"Dialogue has {len(clip_labels)} lines but {concat_count} clips on disk — using dialogue count")
                         concat_count = len(clip_labels)
 
                 # Build ui_audio from numbered clips
@@ -816,7 +819,7 @@ class RSMossTTSSave:
                     clip_labels = _parse_dialogue_list(dialogue_list)
                     # Cap to dialogue lines so stale clips from a longer script are excluded
                     if len(clip_labels) < concat_count:
-                        print(f"[RSMossTTSSave] Dialogue has {len(clip_labels)} lines but {concat_count} clips on disk — using dialogue count")
+                        logger.info(f"Dialogue has {len(clip_labels)} lines but {concat_count} clips on disk — using dialogue count")
                         concat_count = len(clip_labels)
 
                 # Build ui_audio entries for preview (split subfolder like _save_one)

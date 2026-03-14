@@ -1,8 +1,11 @@
 import json
+import logging
 import os
 import re
 
 import torch
+
+logger = logging.getLogger(__name__)
 import comfy.model_management as mm
 import comfy.model_patcher
 import comfy.ops
@@ -23,7 +26,7 @@ def _load_gemma3(weight_path):
     if weight_path in _model_cache:
         return _model_cache[weight_path]
 
-    print(f"[RS Prompt Formatter Local] Loading {os.path.basename(weight_path)}...", flush=True)
+    logger.info(f"Loading {os.path.basename(weight_path)}...")
 
     from comfy.text_encoders.llama import Gemma3_12B, Gemma3_12B_Config
     import sentencepiece
@@ -58,13 +61,13 @@ def _load_gemma3(weight_path):
     if missing:
         real_missing = [k for k in missing if "lm_head" not in k]
         if real_missing:
-            print(f"[RS Prompt Formatter Local] Warning: missing keys: {real_missing[:5]}")
+            logger.info(f"Warning: missing keys: {real_missing[:5]}")
 
     has_vision = not any("vision_model" in k for k in missing)
     if has_vision:
-        print("[RS Prompt Formatter Local] Vision model loaded — image input supported")
+        logger.info("Vision model loaded — image input supported")
     else:
-        print("[RS Prompt Formatter Local] No vision weights — image input will be ignored")
+        logger.info("No vision weights — image input will be ignored")
 
     # Wrap in ModelPatcher for GPU management
     load_device = mm.text_encoder_device()
@@ -72,7 +75,7 @@ def _load_gemma3(weight_path):
     patcher = comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=offload_device)
 
     parameters = comfy.utils.calculate_parameters(sd)
-    print(f"[RS Prompt Formatter Local] Loaded Gemma3 ({parameters / 1e9:.1f}B params, {dtype})", flush=True)
+    logger.info(f"Loaded Gemma3 ({parameters / 1e9:.1f}B params, {dtype})")
 
     _model_cache[weight_path] = (patcher, model, sp, has_vision)
     return patcher, model, sp, has_vision
@@ -169,7 +172,7 @@ class RSPromptFormatterLocal:
         image_embeds_list = []
 
         if images and has_vision:
-            print(f"[RS Prompt Formatter Local] Processing {len(images)} reference image(s)...", flush=True)
+            logger.info(f"Processing {len(images)} reference image(s)...")
             # Build chat template with labeled image placeholders
             parts = [f"<start_of_turn>user\n{system_prompt}\n\nReference images:\n"]
             token_parts = [sp.encode(parts[0])]
@@ -197,7 +200,7 @@ class RSPromptFormatterLocal:
             )
             input_ids = sp.encode(chat)
 
-        print("[RS Prompt Formatter Local] Generating:", flush=True)
+        logger.info("Generating:")
 
         # Build initial embeddings
         with torch.no_grad():
@@ -233,7 +236,7 @@ class RSPromptFormatterLocal:
         output = output.replace("<end_of_turn>", "")
 
         result = output.strip()
-        print(f"\n[RS Prompt Formatter Local] Output ({len(generated_ids)} tokens):\n{result}", flush=True)
+        logger.info(f"Output ({len(generated_ids)} tokens):\n{result}")
         return result
 
     def format_prompt(self, text_encoder, prompt, system_prompt,
@@ -258,7 +261,7 @@ class RSPromptFormatterLocal:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     cache = json.load(f)
                 if cache.get("prompt") == prompt and cache.get("system_prompt") == system_prompt:
-                    print("[RS Prompt Formatter Local] Prompt unchanged — using cached output")
+                    logger.info("Prompt unchanged — using cached output")
                     return (cache["output"],)
             except (json.JSONDecodeError, KeyError):
                 pass
@@ -267,7 +270,7 @@ class RSPromptFormatterLocal:
         patcher, model, sp, has_vision = _load_gemma3(weight_path)
 
         if images and not has_vision:
-            print("[RS Prompt Formatter Local] Warning: images provided but model has no vision weights — ignoring images")
+            logger.info("Warning: images provided but model has no vision weights — ignoring images")
             images = []
 
         formatted = self._generate(patcher, model, sp, prompt, system_prompt,
@@ -277,11 +280,19 @@ class RSPromptFormatterLocal:
                                    has_vision=has_vision)
 
         if not formatted:
+            logger.info("Empty output — retrying with modified prompt...")
+            formatted = self._generate(patcher, model, sp, prompt + " ", system_prompt,
+                                       max_tokens, temperature, top_k,
+                                       repeat_penalty, repeat_window,
+                                       images=images or None,
+                                       has_vision=has_vision)
+
+        if not formatted:
             raise RuntimeError("[RS Prompt Formatter Local] Model returned empty output")
 
         # Save to cache
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump({"prompt": prompt, "system_prompt": system_prompt, "output": formatted}, f, indent=2)
-        print(f"[RS Prompt Formatter Local] Saved output to {cache_path}")
+        logger.info(f"Saved output to {cache_path}")
 
         return (formatted,)

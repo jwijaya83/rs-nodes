@@ -1,4 +1,5 @@
 import gc
+import logging
 import math
 import random
 import uuid
@@ -14,6 +15,8 @@ import comfy.nested_tensor
 import folder_paths
 import node_helpers
 import latent_preview
+
+logger = logging.getLogger(__name__)
 
 
 class RSLTXVGenerate:
@@ -186,7 +189,7 @@ class RSLTXVGenerate:
         elif seed_mode == "decrement" and self._last_seed is not None:
             seed = (self._last_seed - 1) % (0xffffffffffffffff + 1)
         self._last_seed = seed
-        print(f"[RSLTXVGenerate] Starting generation (seed={seed}, mode={seed_mode})")
+        logger.info(f"Starting generation (seed={seed}, mode={seed_mode})")
         try:
             result = self._generate_impl(
                 model, positive, negative, vae,
@@ -221,7 +224,7 @@ class RSLTXVGenerate:
             # Write resolved seed back to the widget so the user can see/reuse it
             return {"ui": {"noise_seed": [seed]}, "result": result}
         except Exception:
-            print("[RSLTXVGenerate] Error during generation, cleaning up VRAM")
+            logger.info("Error during generation, cleaning up VRAM")
             raise
         finally:
             self._free_vram()
@@ -277,7 +280,7 @@ class RSLTXVGenerate:
             # Round up to nearest multiple of 8 + 1 (LTXV temporal stride)
             audio_num_frames = ((audio_num_frames - 1 + 7) // 8) * 8 + 1
             if audio_num_frames != num_frames:
-                print(f"[RSLTXVGenerate] Audio duration {audio_duration:.2f}s → overriding num_frames: {num_frames} → {audio_num_frames}")
+                logger.info(f"Audio duration {audio_duration:.2f}s → overriding num_frames: {num_frames} → {audio_num_frames}")
                 num_frames = audio_num_frames
 
         # When upscaling, generate at half resolution — the 2x latent upscaler
@@ -286,17 +289,18 @@ class RSLTXVGenerate:
         gen_height = height
         do_upscale = upscale and upscale_model is not None
         if upscale and upscale_model is None:
-            print("[RSLTXVGenerate] WARNING: upscale=True but no upscale_model connected — generating at full resolution")
+            logger.info("WARNING: upscale=True but no upscale_model connected — generating at full resolution")
         if do_upscale:
             gen_width = width // 2
             gen_height = height // 2
-            print(f"[RSLTXVGenerate] Upscale enabled: generating at {gen_width}x{gen_height}, target {width}x{height}")
+            logger.info(f"Upscale enabled: generating at {gen_width}x{gen_height}, target {width}x{height}")
 
         # T2V first-frame bootstrap: generate a short clip at full resolution,
         # decode the first frame, and use it as I2V guidance for the main generation.
         # This converts T2V→I2V so the upscale path only needs one re-diffusion pass.
-        if do_upscale and first_image is None and last_image is None and middle_image is None:
-            print(f"[RSLTXVGenerate] T2V bootstrap: generating 9 frames at {width}x{height} for first frame")
+        # DISABLED: testing natural first pass generation
+        if False and do_upscale and first_image is None and last_image is None and middle_image is None:
+            logger.info(f"T2V bootstrap: generating 9 frames at {width}x{height} for first frame")
             bootstrap_frames = 9
             bootstrap_latent = torch.zeros(
                 [1, 128, ((bootstrap_frames - 1) // 8) + 1, height // 32, width // 32],
@@ -321,7 +325,8 @@ class RSLTXVGenerate:
             boot_ms.set_parameters(shift=boot_shift)
             boot_model.add_object_patch("model_sampling", boot_ms)
 
-            boot_sig = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float64)
+            boot_steps = 30  # Fixed step count for sharp bootstrap frame
+            boot_sig = torch.linspace(1.0, 0.0, boot_steps + 1, dtype=torch.float64)
             boot_sig = torch.where(
                 boot_sig != 0,
                 math.exp(boot_shift) / (math.exp(boot_shift) + (1.0 / boot_sig - 1.0) ** 1),
@@ -359,7 +364,7 @@ class RSLTXVGenerate:
             boot_cb = latent_preview.prepare_callback(boot_guider.model_patcher, boot_sig.shape[-1] - 1)
             disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
-            print("[RSLTXVGenerate] T2V bootstrap: sampling first frame...")
+            logger.info("T2V bootstrap: sampling first frame...")
             boot_out = boot_guider.sample(
                 boot_noise, boot_latent, boot_sampler, boot_sig,
                 denoise_mask=None, callback=boot_cb,
@@ -375,7 +380,7 @@ class RSLTXVGenerate:
                 )
             first_image = first_pixels
             first_strength = 1.0
-            print(f"[RSLTXVGenerate] T2V bootstrap: first frame {first_image.shape[2]}x{first_image.shape[1]} ready")
+            logger.info(f"T2V bootstrap: first frame {first_image.shape[2]}x{first_image.shape[1]} ready")
 
             del boot_out, boot_model, boot_guider
             self._free_vram()
@@ -387,7 +392,7 @@ class RSLTXVGenerate:
             target_latent_T = ((num_frames - 1) // 8) + 1
             half_latent_T = target_latent_T // 2 + 1
             gen_num_frames = (half_latent_T - 1) * 8 + 1
-            print(f"[RSLTXVGenerate] Temporal upscale enabled: generating {gen_num_frames} frames at {frame_rate / 2:.1f}fps (target {num_frames} frames at {frame_rate}fps)")
+            logger.info(f"Temporal upscale enabled: generating {gen_num_frames} frames at {frame_rate / 2:.1f}fps (target {num_frames} frames at {frame_rate}fps)")
 
         # Create empty latent: [B, C, T, H, W] — LTXV latent space
         latent = torch.zeros(
@@ -434,7 +439,7 @@ class RSLTXVGenerate:
                     positive, latent_length, len(img), frame_idx, scale_factors
                 )
 
-                print(f"[RSLTXVGenerate] Guide {label}: frame_idx={frame_idx_actual}, latent_idx={latent_idx}, strength={strength_val}")
+                logger.info(f"Guide {label}: frame_idx={frame_idx_actual}, latent_idx={latent_idx}, strength={strength_val}")
 
                 positive, negative, latent_samples, noise_mask = LTXVAddGuide.append_keyframe(
                     positive, negative, frame_idx_actual,
@@ -452,11 +457,11 @@ class RSLTXVGenerate:
         if has_audio:
             if audio is not None:
                 # Encode provided audio into latent space
-                print("[RSLTXVGenerate] Encoding input audio latents")
+                logger.info("Encoding input audio latents")
                 audio_samples = audio_vae.encode(audio)
             else:
                 # Create empty audio latents — the AV model generates audio from scratch
-                print("[RSLTXVGenerate] Creating empty audio latents for generation")
+                logger.info("Creating empty audio latents for generation")
                 audio_samples = torch.zeros(
                     (1, audio_vae.latent_channels,
                      audio_vae.num_of_latents_from_frames(num_frames, frame_rate),
@@ -469,12 +474,21 @@ class RSLTXVGenerate:
 
             video_noise_mask = latent_dict.get("noise_mask", None)
             if video_noise_mask is None:
-                video_noise_mask = torch.ones_like(video_samples)
+                video_noise_mask = torch.ones(
+                    video_samples.shape[0], 1, video_samples.shape[2], 1, 1,
+                    device=video_samples.device, dtype=video_samples.dtype,
+                )
             # Audio mask: 0 = preserve input audio, 1 = generate from scratch
             if audio is not None:
-                audio_noise_mask = torch.zeros_like(audio_samples)
+                audio_noise_mask = torch.zeros(
+                    audio_samples.shape[0], 1, *audio_samples.shape[2:],
+                    device=audio_samples.device, dtype=audio_samples.dtype,
+                )
             else:
-                audio_noise_mask = torch.ones_like(audio_samples)
+                audio_noise_mask = torch.ones(
+                    audio_samples.shape[0], 1, *audio_samples.shape[2:],
+                    device=audio_samples.device, dtype=audio_samples.dtype,
+                )
             combined_noise_mask = comfy.nested_tensor.NestedTensor((video_noise_mask, audio_noise_mask))
 
             latent_dict = {"samples": combined_samples, "noise_mask": combined_noise_mask}
@@ -546,7 +560,7 @@ class RSLTXVGenerate:
                 skip_sigma_threshold=skip_sigma,
                 video_attn_scale=video_attn_scale,
             )
-            print("[RSLTXVGenerate] Using MultimodalGuider")
+            logger.info("Using MultimodalGuider")
 
         # ----------------------------------------------------------------
         # 5. SAMPLE
@@ -563,7 +577,7 @@ class RSLTXVGenerate:
         callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1)
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
-        print("[RSLTXVGenerate] Sampling...")
+        logger.info("Sampling...")
         samples = guider.sample(
             noise, latent_image, sampler, sigmas,
             denoise_mask=noise_mask_for_sampling,
@@ -622,7 +636,7 @@ class RSLTXVGenerate:
 
                 # Temporal upscale first (2x frame count at half resolution = cheap)
                 if do_temporal_upscale:
-                    print("[RSLTXVGenerate] Upscaling video latents (2x temporal at half res)")
+                    logger.info("Upscaling video latents (2x temporal at half res)")
                     self._free_vram()
 
                     temporal_dtype = next(temporal_upscale_model.parameters()).dtype
@@ -640,10 +654,10 @@ class RSLTXVGenerate:
                     target_latent_T = ((num_frames - 1) // 8) + 1
                     if t_upsampled.shape[2] > target_latent_T:
                         t_upsampled = t_upsampled[:, :, :target_latent_T]
-                        print(f"[RSLTXVGenerate] Trimmed temporal output to {target_latent_T} latent frames")
+                        logger.info(f"Trimmed temporal output to {target_latent_T} latent frames")
 
                     output_latent = {"samples": t_upsampled}
-                    print(f"[RSLTXVGenerate] After temporal upscale: latent shape {list(t_upsampled.shape)}")
+                    logger.info(f"After temporal upscale: latent shape {list(t_upsampled.shape)}")
 
                     # Restore full frame rate (was halved for temporal upscale generation)
                     positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
@@ -651,7 +665,7 @@ class RSLTXVGenerate:
 
                 # Spatial upscale (2x resolution)
                 upscale_label = "2x temporal + 2x spatial" if do_temporal_upscale else "2x spatial"
-                print(f"[RSLTXVGenerate] Upscaling video latents ({upscale_label})")
+                logger.info(f"Upscaling video latents ({upscale_label})")
                 self._free_vram()
 
                 model_dtype = next(upscale_model.parameters()).dtype
@@ -669,7 +683,7 @@ class RSLTXVGenerate:
                         us_chunk_t = upscale_tile_t if upscale_tile_t > 0 else latent_t
                         us_overlap = min(2, us_chunk_t // 2) if us_chunk_t < latent_t else 0
                         if us_chunk_t < latent_t:
-                            print(f"[RSLTXVGenerate] Upscale model: chunking {latent_t} latent frames, chunk_t={us_chunk_t}, overlap={us_overlap}")
+                            logger.info(f"Upscale model: chunking {latent_t} latent frames, chunk_t={us_chunk_t}, overlap={us_overlap}")
                         chunks_out = []
                         t_pos = 0
                         while t_pos < latent_t:
@@ -736,7 +750,7 @@ class RSLTXVGenerate:
                             positive, latent_length, len(img), frame_idx, up_scale_factors
                         )
 
-                        print(f"[RSLTXVGenerate] Upscale re-inject {label}: frame_idx={frame_idx_actual}, latent_idx={latent_idx}, strength={strength_val}")
+                        logger.info(f"Upscale re-inject {label}: frame_idx={frame_idx_actual}, latent_idx={latent_idx}, strength={strength_val}")
 
                         positive, negative, up_latent_samples, up_noise_mask = UpGuide.append_keyframe(
                             positive, negative, frame_idx_actual,
@@ -757,7 +771,7 @@ class RSLTXVGenerate:
                     rediffusion_label = f"3 steps (manual sigmas), cfg={upscale_cfg}"
                     do_rediffusion = True  # T2V always re-diffuses with manual sigmas
                 if do_rediffusion:
-                    print(f"[RSLTXVGenerate] Re-diffusing at upscaled resolution ({rediffusion_label})")
+                    logger.info(f"Re-diffusing at upscaled resolution ({rediffusion_label})")
                     self._free_vram()
 
                     # Recombine video + audio for the AV model
@@ -782,13 +796,13 @@ class RSLTXVGenerate:
                             lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
                             self.loaded_lora = (lora_path, lora)
                         up_model, _ = comfy.sd.load_lora_for_models(up_model, None, lora, upscale_lora_strength, 0)
-                        print(f"[RSLTXVGenerate] Applied upscale LoRA: {upscale_lora} (strength={upscale_lora_strength})")
+                        logger.info(f"Applied upscale LoRA: {upscale_lora} (strength={upscale_lora_strength})")
 
                     if has_image_guides:
                         # I2V: compute shift from upscaled latent tokens
                         up_tokens = math.prod(upsampled.shape[2:])
                         up_shift = up_tokens * mm_shift + b
-                        print(f"[RSLTXVGenerate] Upscale shift: tokens={up_tokens}, shift={up_shift:.3f}")
+                        logger.info(f"Upscale shift: tokens={up_tokens}, shift={up_shift:.3f}")
 
                         up_model_sampling = ModelSamplingAdvanced(up_model.model.model_config)
                         up_model_sampling.set_parameters(shift=up_shift)
@@ -815,20 +829,43 @@ class RSLTXVGenerate:
                         start_step = int((1.0 - upscale_denoise) * upscale_steps)
                         up_sig = up_sig[start_step:]
                     else:
-                        # T2V: use manual sigmas from the official LTX 2.3 upscale workflow.
-                        # No image anchors, so computed schedules produce artifacts (blobs).
-                        # These hand-tuned values with default shift give clean results.
-                        up_sig = torch.tensor([0.909375, 0.725, 0.421875, 0.0])
-                        print(f"[RSLTXVGenerate] T2V upscale: manual sigmas {up_sig.tolist()}")
+                        # T2V: same computed sigma schedule as I2V, with correct
+                        # shift from actual token count.
+                        up_tokens = math.prod(upsampled.shape[2:])
+                        up_shift = up_tokens * mm_shift + b
+                        logger.info(f"T2V upscale: tokens={up_tokens}, shift={up_shift:.3f}")
 
-                        up_shift = 4096 * mm_shift + b  # default shift (tokens=4096)
                         up_model_sampling = ModelSamplingAdvanced(up_model.model.model_config)
                         up_model_sampling.set_parameters(shift=up_shift)
                         up_model.add_object_patch("model_sampling", up_model_sampling)
 
-                    up_guider = comfy.samplers.CFGGuider(up_model)
-                    up_guider.set_conds(positive, negative)
-                    up_guider.set_cfg(upscale_cfg)
+                        exp_shift = math.exp(up_shift)
+                        t = torch.linspace(1.0, 0.0, upscale_steps + 1, dtype=torch.float64)
+                        non_zero = t != 0
+                        inv_t_m1 = torch.where(non_zero, 1.0 / t - 1.0, torch.zeros_like(t))
+                        omz = torch.where(non_zero, inv_t_m1 / (exp_shift + inv_t_m1), torch.ones_like(t))
+                        nz_omz = omz[non_zero]
+                        sf = nz_omz[-1] / (1.0 - 0.1)
+                        omz[non_zero] = nz_omz / sf
+                        up_sig = torch.where(non_zero, 1.0 - omz, torch.zeros_like(omz)).float()
+
+                        # Trim to denoise strength
+                        start_step = int((1.0 - upscale_denoise) * upscale_steps)
+                        up_sig = up_sig[start_step:]
+
+                    # Use IC-LoRA guider if original guider had control_info
+                    _iclora_info = getattr(guider, 'control_info', None)
+                    if _iclora_info and _iclora_info.get("controls"):
+                        _, _, up_lt, up_lh, up_lw = upsampled.shape
+                        up_guider = self._rebuild_iclora_guider(
+                            up_model, positive, negative, vae,
+                            _iclora_info, upscale_cfg,
+                            latent_h=up_lh, latent_w=up_lw, latent_t=up_lt,
+                        )
+                    else:
+                        up_guider = comfy.samplers.CFGGuider(up_model)
+                        up_guider.set_conds(positive, negative)
+                        up_guider.set_cfg(upscale_cfg)
 
                     up_latent_image = comfy.sample.fix_empty_latent_channels(up_guider.model_patcher, up_combined)
                     up_noise = comfy.sample.prepare_noise(up_latent_image, seed + 1)
@@ -865,7 +902,7 @@ class RSLTXVGenerate:
                     else:
                         # Temporal tiling: process with overlap context, trim to core
                         rd_overlap = min(2, rd_chunk_t // 2)
-                        print(f"[RSLTXVGenerate] Re-diffusion tiling: {video_t} latent frames, chunk_t={rd_chunk_t}, overlap={rd_overlap}")
+                        logger.info(f"Re-diffusion tiling: {video_t} latent frames, chunk_t={rd_chunk_t}, overlap={rd_overlap}")
 
                         # Decompose AV for video-only tiling
                         is_av = up_latent_image.is_nested
@@ -904,7 +941,7 @@ class RSLTXVGenerate:
                                 chunk_n = chunk_noise
                                 chunk_dm = chunk_mask
 
-                            print(f"[RSLTXVGenerate]   Chunk {chunk_idx}: ctx=[{ctx_start}:{ctx_end}], core=[{t_pos}:{min(t_pos + rd_chunk_t, video_t)}]")
+                            logger.info(f"  Chunk {chunk_idx}: ctx=[{ctx_start}:{ctx_end}], core=[{t_pos}:{min(t_pos + rd_chunk_t, video_t)}]")
                             up_callback = latent_preview.prepare_callback(up_guider.model_patcher, up_sig.shape[-1] - 1)
                             chunk_out = up_guider.sample(
                                 chunk_n, chunk_input, up_sampler, up_sig,
@@ -922,7 +959,7 @@ class RSLTXVGenerate:
                             else:
                                 chunk_vid_out = chunk_out
 
-                            print(f"[RSLTXVGenerate]   Chunk {chunk_idx} output: shape={chunk_vid_out.shape}, min={chunk_vid_out.min():.4f}, max={chunk_vid_out.max():.4f}, mean={chunk_vid_out.mean():.4f}")
+                            logger.info(f"  Chunk {chunk_idx} output: shape={chunk_vid_out.shape}, min={chunk_vid_out.min():.4f}, max={chunk_vid_out.max():.4f}, mean={chunk_vid_out.mean():.4f}")
 
                             # Trim overlap — keep only the core frames
                             trim_start = t_pos - ctx_start
@@ -936,7 +973,7 @@ class RSLTXVGenerate:
                             self._free_vram()
 
                         up_samples = torch.cat(chunks_out, dim=2)
-                        print(f"[RSLTXVGenerate] Re-diffusion result: shape={up_samples.shape}, min={up_samples.min():.4f}, max={up_samples.max():.4f}, mean={up_samples.mean():.4f}")
+                        logger.info(f"Re-diffusion result: shape={up_samples.shape}, min={up_samples.min():.4f}, max={up_samples.max():.4f}, mean={up_samples.mean():.4f}")
                         del chunks_out
 
                         # Re-wrap as nested if AV
@@ -958,11 +995,8 @@ class RSLTXVGenerate:
                         positive = node_helpers.conditioning_set_values(positive, {"keyframe_idxs": None})
                         negative = node_helpers.conditioning_set_values(negative, {"keyframe_idxs": None})
 
-                # T2V pass 2: decode first frame from pass 1, sharpen, use as
-                # I2V-style guidance for a second re-diffusion with audio context.
-                # Runs after temporal upscale to fix any artifacts and improve lip sync.
-                if not has_image_guides and do_rediffusion and upscale_denoise > 0 and upscale_steps > 0:
-                    print("[RSLTXVGenerate] T2V pass 2: decoding first frame for I2V guidance")
+                if False:  # T2V pass 2 removed — single rediffusion with MultimodalGuider is sufficient
+                    logger.info("T2V pass 2: decoding first frame for I2V guidance")
                     self._free_vram()
 
                     video_latent = output_latent["samples"]
@@ -975,9 +1009,7 @@ class RSLTXVGenerate:
                         )
 
                     # Sharpen + grain to enhance detail before using as anchor
-                    first_pixels = self._sharpen_and_grain(first_pixels)
-
-                    # Encode sharpened frame and inject at position 0
+                    # Encode first frame and inject at position 0
                     _, height_sf, width_sf = vae.downscale_index_formula
                     _, _, _, p2_lh, p2_lw = video_latent.shape
                     p2_tw, p2_th = p2_lw * width_sf, p2_lh * height_sf
@@ -1032,11 +1064,34 @@ class RSLTXVGenerate:
                     p2_sig = torch.where(nz, 1.0 - omz, torch.zeros_like(omz)).float()
                     p2_sig = p2_sig[int((1.0 - upscale_denoise) * upscale_steps):]
 
-                    print(f"[RSLTXVGenerate] T2V pass 2: {upscale_steps} steps, denoise={upscale_denoise}, shift={p2_shift:.3f}")
+                    logger.info(f"T2V pass 2: {upscale_steps} steps, denoise={upscale_denoise}, shift={p2_shift:.3f}")
 
-                    p2_guider = comfy.samplers.CFGGuider(p2_model)
-                    p2_guider.set_conds(positive, negative)
-                    p2_guider.set_cfg(upscale_cfg)
+                    # Use IC-LoRA guider if original guider had control_info
+                    _iclora_info = getattr(guider, 'control_info', None)
+                    if _iclora_info and _iclora_info.get("controls"):
+                        _, _, p2_lt, p2_lh2, p2_lw2 = video_latent.shape
+                        p2_guider = self._rebuild_iclora_guider(
+                            p2_model, positive, negative, vae,
+                            _iclora_info, upscale_cfg,
+                            latent_h=p2_lh2, latent_w=p2_lw2, latent_t=p2_lt,
+                        )
+                    else:
+                        from ..utils.multimodal_guider import MultimodalGuider
+                        p2_guider = MultimodalGuider(
+                            p2_model, positive, negative,
+                            video_cfg=upscale_cfg, audio_cfg=audio_cfg,
+                            stg_scale=stg_scale,
+                            stg_blocks=[int(s.strip()) for s in stg_blocks.split(",")],
+                            rescale=rescale,
+                            video_cfg_end=cfg_end if cfg_end >= 0 else None,
+                            stg_scale_end=stg_end if stg_end >= 0 else None,
+                            audio_stg_scale=audio_stg_scale if audio_stg_scale >= 0 else None,
+                            video_modality_scale=video_modality_scale,
+                            audio_modality_scale=audio_modality_scale,
+                            cfg_star_rescale=cfg_star_rescale,
+                            skip_sigma_threshold=skip_sigma,
+                            video_attn_scale=video_attn_scale,
+                        )
 
                     p2_latent = comfy.sample.fix_empty_latent_channels(p2_guider.model_patcher, p2_combined)
                     p2_noise = comfy.sample.prepare_noise(p2_latent, seed + 2)
@@ -1058,7 +1113,7 @@ class RSLTXVGenerate:
                         audio_latent_out = p2_parts[1] if len(p2_parts) > 1 else audio_latent_out
                     else:
                         output_latent = {"samples": p2_out}
-                    print("[RSLTXVGenerate] T2V pass 2 complete")
+                    logger.info("T2V pass 2 complete")
 
                 if upscale_fallback:
                     del pre_upscale_latent  # free system RAM backup
@@ -1066,8 +1121,8 @@ class RSLTXVGenerate:
             except Exception as e:
                 if not upscale_fallback:
                     raise
-                print(f"[RSLTXVGenerate] WARNING: Upscale failed ({type(e).__name__}: {e})")
-                print("[RSLTXVGenerate] Falling back to half-resolution decode")
+                logger.info(f"WARNING: Upscale failed ({type(e).__name__}: {e})")
+                logger.info("Falling back to half-resolution decode")
                 self._free_vram()
                 output_latent = pre_upscale_latent
                 decode = True
@@ -1081,7 +1136,7 @@ class RSLTXVGenerate:
         # ----------------------------------------------------------------
 
         if decode:
-            print("[RSLTXVGenerate] Decoding latents to images (tiled)")
+            logger.info("Decoding latents to images (tiled)")
             compression = vae.spacial_compression_decode()
             tile_size = 512 // compression
             overlap = 128 // compression  # larger overlap to reduce tile seams
@@ -1122,10 +1177,10 @@ class RSLTXVGenerate:
             if audio_is_input:
                 # Pass through original audio — skip VAE decode roundtrip to
                 # ensure 1:1 fidelity with the source audio
-                print("[RSLTXVGenerate] Audio passthrough (input audio preserved)")
+                logger.info("Audio passthrough (input audio preserved)")
                 audio_output = audio
             else:
-                print("[RSLTXVGenerate] Decoding generated audio latents")
+                logger.info("Decoding generated audio latents")
                 decoded_audio = audio_vae.decode(audio_latent_out).to(audio_latent_out.device)
                 audio_output = {
                     "waveform": decoded_audio,
@@ -1137,12 +1192,158 @@ class RSLTXVGenerate:
         if audio_latent_out is not None:
             audio_latent_dict = {"samples": audio_latent_out}
 
-        print("[RSLTXVGenerate] Done")
+        logger.info("Done")
         return (output_latent, audio_latent_dict, images, audio_output)
 
     # ------------------------------------------------------------------
     # Helper methods
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _rebuild_iclora_guider(up_model, positive, negative, vae,
+                               control_info, upscale_cfg, latent_h, latent_w,
+                               latent_t):
+        """Rebuild an ICLoRAMultimodalGuider at upscaled resolution.
+
+        Re-encodes original control images at the new latent dimensions and
+        reconstructs the full IC-LoRA guider so structural control is preserved
+        during upscale rediffusion.
+
+        Args:
+            latent_h, latent_w: upscaled latent spatial dims
+            latent_t: upscaled latent temporal length (for keyframe indexing)
+        """
+        from comfy_extras.nodes_lt import LTXVAddGuide
+        from .ltxv_iclora_guider import ICLoRAMultimodalGuider
+
+        ci = control_info
+        lora_path = folder_paths.get_full_path_or_raise("loras", ci["lora_name"])
+        lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        if ci["lora_strength"] != 0:
+            up_model, _ = comfy.sd.load_lora_for_models(
+                up_model, None, lora, ci["lora_strength"], 0
+            )
+            logger.info(f"IC-LoRA re-applied: {ci['lora_name']} (strength={ci['lora_strength']})")
+        del lora
+
+        # Attention override
+        attn_func = None
+        attn_mode = ci["attention_mode"]
+        if attn_mode != "default":
+            if attn_mode == "sage":
+                from comfy.ldm.modules.attention import attention_sage
+                attn_func = attention_sage
+            elif attn_mode == "auto":
+                from comfy.ldm.modules.attention import SAGE_ATTENTION_IS_AVAILABLE, attention_sage
+                if SAGE_ATTENTION_IS_AVAILABLE:
+                    attn_func = attention_sage
+        if attn_func is not None:
+            up_model.model_options.setdefault("transformer_options", {})["optimized_attention_override"] = (
+                lambda func, *args, **kwargs: attn_func(*args, **kwargs)
+            )
+
+        scale_factors = vae.downscale_index_formula
+        time_sf, height_sf, width_sf = scale_factors
+        dsf = int(ci["latent_downscale_factor"])
+
+        control_latents = []
+        control_masks = []
+        num_control_frames = 0
+        virtual_latent_length = latent_t
+
+        for img, frame_idx, label in ci["controls"]:
+            # Crop to valid frame count
+            num_keep = ((img.shape[0] - 1) // time_sf) * time_sf + 1
+            img_cropped = img[:num_keep]
+
+            # Encode at reduced resolution if downscale_factor > 1
+            enc_w = latent_w // dsf if dsf > 1 else latent_w
+            enc_h = latent_h // dsf if dsf > 1 else latent_h
+
+            _, guide_latent = LTXVAddGuide.encode(
+                vae, enc_w, enc_h, img_cropped, scale_factors
+            )
+            logger.info(f"IC-LoRA re-encoded {label}: enc {enc_w}x{enc_h} → latent {list(guide_latent.shape)}")
+
+            # Dilate if downscale factor > 1
+            guide_mask = None
+            if dsf > 1:
+                enc_h_actual = guide_latent.shape[3]
+                enc_w_actual = guide_latent.shape[4]
+                dil_h = enc_h_actual * dsf
+                dil_w = enc_w_actual * dsf
+
+                dilated = torch.zeros(
+                    guide_latent.shape[:3] + (dil_h, dil_w),
+                    device=guide_latent.device, dtype=guide_latent.dtype,
+                )
+                dilated[..., ::dsf, ::dsf] = guide_latent
+                guide_mask = torch.full(
+                    (dilated.shape[0], 1, dilated.shape[2], dil_h, dil_w),
+                    -1.0, device=guide_latent.device, dtype=guide_latent.dtype,
+                )
+                guide_mask[..., ::dsf, ::dsf] = 1.0
+
+                # Pad to actual latent dims if needed
+                pad_h = latent_h - dil_h
+                pad_w = latent_w - dil_w
+                if pad_h > 0 or pad_w > 0:
+                    dilated = torch.nn.functional.pad(dilated, (0, pad_w, 0, pad_h))
+                    guide_mask = torch.nn.functional.pad(guide_mask, (0, pad_w, 0, pad_h), value=-1.0)
+
+                guide_latent = dilated
+
+            # Stamp keyframe indices on conditioning (for positional encoding)
+            frame_idx_actual, latent_idx = LTXVAddGuide.get_latent_index(
+                positive, virtual_latent_length,
+                len(img_cropped), frame_idx, scale_factors,
+            )
+            positive = LTXVAddGuide.add_keyframe_index(
+                positive, frame_idx_actual, guide_latent, scale_factors,
+            )
+            negative = LTXVAddGuide.add_keyframe_index(
+                negative, frame_idx_actual, guide_latent, scale_factors,
+            )
+
+            # Pre-compute control noise mask
+            if guide_mask is not None:
+                ctrl_mask = guide_mask - ci["control_strength"]
+            else:
+                ctrl_mask = torch.full(
+                    (1, 1, guide_latent.shape[2], 1, 1),
+                    1.0 - ci["control_strength"],
+                    dtype=guide_latent.dtype,
+                )
+
+            control_latents.append(guide_latent.cpu())
+            control_masks.append(ctrl_mask.cpu())
+            num_control_frames += guide_latent.shape[2]
+            virtual_latent_length += guide_latent.shape[2]
+
+        # Stamp frame rate
+        positive = node_helpers.conditioning_set_values(positive, {"frame_rate": ci["frame_rate"]})
+        negative = node_helpers.conditioning_set_values(negative, {"frame_rate": ci["frame_rate"]})
+
+        # Build guider
+        stg_blocks_str = ci["stg_blocks"]
+        up_iclora_guider = ICLoRAMultimodalGuider(
+            up_model, positive, negative,
+            control_latents=control_latents,
+            control_masks=control_masks,
+            num_control_frames=num_control_frames,
+            max_shift=ci.get("max_shift", 2.2),
+            base_shift=ci.get("base_shift", 0.95),
+            video_cfg=upscale_cfg,
+            audio_cfg=ci["audio_cfg"],
+            stg_scale=ci["stg_scale"],
+            stg_blocks=[int(s.strip()) for s in stg_blocks_str.split(",")],
+            rescale=ci["rescale"],
+            modality_scale=ci["modality_scale"],
+            video_cfg_end=ci["cfg_end"] if ci["cfg_end"] >= 0 else None,
+            stg_scale_end=ci["stg_end"] if ci["stg_end"] >= 0 else None,
+        )
+        logger.info(f"IC-LoRA guider rebuilt for upscale ({num_control_frames} control frames)")
+        return up_iclora_guider
 
     def _free_vram(self):
         """Unload models and flush all VRAM/RAM caches."""
@@ -1151,53 +1352,6 @@ class RSLTXVGenerate:
         torch.cuda.empty_cache()
         mm.soft_empty_cache()
 
-    @staticmethod
-    def _sharpen_and_grain(image, sharpen_amount=0.15,
-                           grain_intensity=0.05, grain_size=1.2,
-                           grain_color_amount=0.30, grain_highlight_protection=0.50):
-        """Subtle sharpen + film grain for T2V upscale guidance frame.
-        image: [B, H, W, C] float 0-1."""
-        device = image.device
-
-        # Unsharp mask
-        x = image.movedim(-1, 1)  # BCHW
-        blurred = torch.nn.functional.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
-        x = (x + sharpen_amount * (x - blurred)).clamp(0, 1)
-        image = x.movedim(1, -1)  # BHWC
-        del x, blurred
-
-        # Film grain (from RSFilmGrain, single-frame fast path)
-        if grain_intensity > 0:
-            B, H, W, C = image.shape
-            noise_h = max(1, round(H / grain_size))
-            noise_w = max(1, round(W / grain_size))
-            need_upscale = noise_h != H or noise_w != W
-
-            lum_weights = torch.tensor([0.2126, 0.7152, 0.0722], device=device)
-            luminance = (image * lum_weights).sum(dim=-1)
-            midtone_mask = 4.0 * luminance * (1.0 - luminance)
-            mask = (1.0 - grain_highlight_protection + grain_highlight_protection * midtone_mask).unsqueeze(-1)
-
-            for i in range(B):
-                if need_upscale:
-                    small_mono = torch.randn(1, 1, noise_h, noise_w, device=device)
-                    mono = torch.nn.functional.interpolate(
-                        small_mono, size=(H, W), mode="bilinear", align_corners=False
-                    ).permute(0, 2, 3, 1).squeeze(0)
-                    small_color = torch.randn(1, C, noise_h, noise_w, device=device)
-                    color = torch.nn.functional.interpolate(
-                        small_color, size=(H, W), mode="bilinear", align_corners=False
-                    ).permute(0, 2, 3, 1).squeeze(0)
-                else:
-                    mono = torch.randn(H, W, 1, device=device)
-                    color = torch.randn(H, W, C, device=device)
-
-                noise = mono.lerp(color, grain_color_amount)
-                image[i].add_(noise.mul_(grain_intensity).mul_(mask[i]))
-
-            image = image.clamp(0, 1)
-
-        return image
 
     @staticmethod
     def _apply_ffn_chunking(model_clone, num_chunks):
@@ -1205,7 +1359,7 @@ class RSLTXVGenerate:
         try:
             blocks = model_clone.model.diffusion_model.transformer_blocks
         except AttributeError:
-            print("[RSLTXVGenerate] Warning: Could not find transformer_blocks for FFN chunking")
+            logger.info("Warning: Could not find transformer_blocks for FFN chunking")
             return
 
         def make_chunked_forward(ff_module, chunks):

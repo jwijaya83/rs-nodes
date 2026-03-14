@@ -11,11 +11,15 @@ guider's sample() method, where the target video latent dimensions are
 known.
 """
 
+import logging
+
 import torch
 import comfy.sd
 import comfy.utils
 import folder_paths
 import node_helpers
+
+logger = logging.getLogger(__name__)
 
 
 class RSICLoRAGuider:
@@ -108,8 +112,8 @@ class RSICLoRAGuider:
         # 1. Load IC-LoRA and read metadata
         lora_path = folder_paths.get_full_path_or_raise("loras", ic_lora)
         downscale_factor = self._read_downscale_factor(lora_path)
-        print(f"[RSICLoRAGuider] Loading IC-LoRA: {ic_lora}")
-        print(f"[RSICLoRAGuider] Reference downscale factor: {downscale_factor}")
+        logger.info(f"Loading IC-LoRA: {ic_lora}")
+        logger.info(f"Reference downscale factor: {downscale_factor}")
 
         lora_data = comfy.utils.load_torch_file(lora_path, safe_load=True)
 
@@ -118,7 +122,7 @@ class RSICLoRAGuider:
         m, _ = comfy.sd.load_lora_for_models(
             m, None, lora_data, lora_strength, 0
         )
-        print(f"[RSICLoRAGuider] Applied IC-LoRA (strength={lora_strength})")
+        logger.info(f"Applied IC-LoRA (strength={lora_strength})")
 
         # 3. Preprocess control image (CRF compression)
         #    VAE encoding is DEFERRED to the guider's sample() method where
@@ -130,7 +134,7 @@ class RSICLoRAGuider:
         for i in range(img.shape[0]):
             processed_frames.append(ltxv_preprocess(img[i], crf))
         processed = torch.stack(processed_frames)
-        print(f"[RSICLoRAGuider] Preprocessed {processed.shape[0]} control frame(s) (crf={crf})")
+        logger.info(f"Preprocessed {processed.shape[0]} control frame(s) (crf={crf})")
 
         # 4. Stamp frame rate onto conditioning
         positive = node_helpers.conditioning_set_values(positive, {"frame_rate": 25.0})
@@ -168,8 +172,8 @@ class RSICLoRAGuider:
             video_attn_scale=video_attn_scale,
         )
 
-        print(f"[RSICLoRAGuider] Guider created (video_cfg={video_cfg}, "
-              f"stg_scale={stg_scale}, rescale={rescale})")
+        logger.info(f"Guider created (video_cfg={video_cfg}, "
+                    f"stg_scale={stg_scale}, rescale={rescale})")
 
         return (guider,)
 
@@ -187,6 +191,6 @@ class RSICLoRAGuider:
                 factor = int(metadata.get("reference_downscale_factor", 1))
                 return factor
         except Exception as e:
-            print(f"[RSICLoRAGuider] Warning: could not read LoRA metadata ({e}), "
-                  f"defaulting downscale_factor=1")
+            logger.warning(f"could not read LoRA metadata ({e}), "
+                           f"defaulting downscale_factor=1")
             return 1

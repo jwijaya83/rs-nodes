@@ -1,7 +1,10 @@
+import logging
 import os
 import torch
 import torchaudio
 import folder_paths
+
+logger = logging.getLogger(__name__)
 
 
 _NATIVE_FORMATS = {"wav", "flac"}
@@ -50,13 +53,13 @@ class RSAudioSave:
                 fallback_path = os.path.join(
                     folder_paths.get_input_directory(), saved_filename
                 )
-                print(
-                    f"[RSAudioSave] Warning: could not encode as {format}. "
+                logger.warning(
+                    f"could not encode as {format}. "
                     f"Falling back to wav -> {saved_filename}"
                 )
                 torchaudio.save(fallback_path, wav, sample_rate, format="wav")
 
-        print(f"[RSAudioSave] Saved: {saved_filename}")
+        logger.info(f"Saved: {saved_filename}")
 
         subfolder = ""
         view_filename = saved_filename

@@ -12,6 +12,7 @@ model sampling shift, and guide frame lifecycle management.
 """
 
 import contextlib
+import logging
 import math
 import types
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ import comfy.patcher_extension
 import comfy.sample
 import comfy.samplers
 import comfy.utils
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -399,8 +402,8 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
             model.add_object_patch(
                 f"diffusion_model.transformer_blocks.{idx}.forward", patched,
             )
-        print(f"[MultimodalGuider] Attention tuner: {len(blocks)} blocks "
-              f"(video_scale={video_scale})")
+        logger.info(f"Attention tuner: {len(blocks)} blocks "
+                    f"(video_scale={video_scale})")
 
     @staticmethod
     def _calc_stg_indexes(run_vx, run_ax):
@@ -810,7 +813,7 @@ class ICLoRAGuider(MultimodalGuider):
         sampling_obj = ModelSamplingAdvanced(self.model_patcher.model.model_config)
         sampling_obj.set_parameters(shift=shift)
         self.model_patcher.add_object_patch("model_sampling", sampling_obj)
-        print(f"[RSICLoRAGuider] Applied model sampling shift={shift:.4f} (tokens={tokens})")
+        logger.info(f"Applied model sampling shift={shift:.4f} (tokens={tokens})")
 
     # ------------------------------------------------------------------
     # Deferred encoding — called once at the start of sample()
@@ -846,7 +849,7 @@ class ICLoRAGuider(MultimodalGuider):
         _, guide_latent = LTXVAddGuide.encode(
             self._vae, enc_w, enc_h, self._control_pixels, scale_factors
         )
-        print(f"[RSICLoRAGuider] Encoded guide latent: {list(guide_latent.shape)}")
+        logger.info(f"Encoded guide latent: {list(guide_latent.shape)}")
 
         # Sparse dilation for downscale_factor > 1
         # First dilate at enc*dsf (guaranteed to fit), then pad to actual
@@ -878,7 +881,7 @@ class ICLoRAGuider(MultimodalGuider):
                 guide_mask = torch.nn.functional.pad(guide_mask, (0, pad_w, 0, pad_h), value=-1.0)
 
             guide_latent = dilated
-            print(f"[RSICLoRAGuider] Dilated to: {list(guide_latent.shape)}")
+            logger.info(f"Dilated to: {list(guide_latent.shape)}")
 
         self._guide_latent = guide_latent
         self._guide_mask = guide_mask
@@ -912,8 +915,8 @@ class ICLoRAGuider(MultimodalGuider):
             guide_mask=guide_mask,
             latent_downscale_factor=dsf,
         )
-        print(f"[RSICLoRAGuider] Guide keyframe at frame_idx={frame_idx_actual}, "
-              f"strength={self._guide_strength}, dsf={dsf}")
+        logger.info(f"Guide keyframe at frame_idx={frame_idx_actual}, "
+                    f"strength={self._guide_strength}, dsf={dsf}")
 
         # Update the guider's conditioning
         self.inner_set_conds({"positive": positive, "negative": negative})
@@ -1079,16 +1082,16 @@ class ICLoRAGuider(MultimodalGuider):
         # 4. Regenerate noise to match expanded latent dimensions
         noise = comfy.sample.prepare_noise(latent_image, kwargs.get("seed", 0))
 
-        print(f"[RSICLoRAGuider] Guide frames appended: {self._num_guide_frames} "
-              f"frame(s), latent temporal dim now "
-              f"{latent_image.unbind()[0].shape[2] if latent_image.is_nested else latent_image.shape[2]}")
+        logger.info(f"Guide frames appended: {self._num_guide_frames} "
+                    f"frame(s), latent temporal dim now "
+                    f"{latent_image.unbind()[0].shape[2] if latent_image.is_nested else latent_image.shape[2]}")
 
         # 5. Run parent sampling (MultimodalGuider -> CFGGuider)
         result = super().sample(noise, latent_image, sampler, sigmas, **kwargs)
 
         # 6. Strip guide frames from the output
         result = self._strip_guide(result)
-        print(f"[RSICLoRAGuider] Guide frames stripped, output temporal dim: "
-              f"{result.unbind()[0].shape[2] if result.is_nested else result.shape[2]}")
+        logger.info(f"Guide frames stripped, output temporal dim: "
+                    f"{result.unbind()[0].shape[2] if result.is_nested else result.shape[2]}")
 
         return result

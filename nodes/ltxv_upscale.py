@@ -1,7 +1,10 @@
 import gc
+import logging
 import math
 
 import torch
+
+logger = logging.getLogger(__name__)
 import comfy.model_management as mm
 import comfy.model_sampling
 import comfy.samplers
@@ -105,11 +108,11 @@ class RSLTXVUpscale:
         do_temporal = temporal_upscale_model is not None
         temporal_label = " + 2x temporal" if do_temporal else ""
         if do_spatial:
-            print(f"[RSLTXVUpscale] Starting: {images.shape[0]} frames, {images.shape[2]}x{images.shape[1]} → {images.shape[2]*2}x{images.shape[1]*2}{temporal_label}")
+            logger.info(f"Starting: {images.shape[0]} frames, {images.shape[2]}x{images.shape[1]} → {images.shape[2]*2}x{images.shape[1]*2}{temporal_label}")
         elif do_temporal:
-            print(f"[RSLTXVUpscale] Starting 2x temporal: {images.shape[0]} frames, {images.shape[2]}x{images.shape[1]}")
+            logger.info(f"Starting 2x temporal: {images.shape[0]} frames, {images.shape[2]}x{images.shape[1]}")
         else:
-            print("[RSLTXVUpscale] WARNING: No upscale models connected")
+            logger.warning("No upscale models connected")
         try:
             result = self._upscale_impl(
                 model, positive, negative, vae, images,
@@ -126,7 +129,7 @@ class RSLTXVUpscale:
             )
             return {"result": result}
         except Exception:
-            print("[RSLTXVUpscale] Error during upscale, cleaning up VRAM")
+            logger.warning("Error during upscale, cleaning up VRAM")
             raise
         finally:
             self._free_vram()
@@ -150,11 +153,11 @@ class RSLTXVUpscale:
         # 1. ENCODE INPUT VIDEO TO LATENT
         # ----------------------------------------------------------------
 
-        print("[RSLTXVUpscale] Encoding input video to latent space")
+        logger.info("Encoding input video to latent space")
         latent = vae.encode_tiled(images[:, :, :, :3],
                                   tile_x=512, tile_y=512, overlap=128)
         input_dtype = latent.dtype
-        print(f"[RSLTXVUpscale] Input latent shape: {list(latent.shape)}")
+        logger.info(f"Input latent shape: {list(latent.shape)}")
 
         # ----------------------------------------------------------------
         # 2. TEMPORAL UPSCALE (optional — 2x frame count at input resolution)
@@ -162,7 +165,7 @@ class RSLTXVUpscale:
 
         output_frame_rate = frame_rate
         if temporal_upscale_model is not None:
-            print("[RSLTXVUpscale] Temporal upscaling latent 2x")
+            logger.info("Temporal upscaling latent 2x")
             self._free_vram()
 
             temporal_dtype = next(temporal_upscale_model.parameters()).dtype
@@ -178,14 +181,14 @@ class RSLTXVUpscale:
             latent = t_upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
 
             output_frame_rate = frame_rate * 2
-            print(f"[RSLTXVUpscale] After temporal upscale: latent shape {list(latent.shape)}, output fps={output_frame_rate:.1f}")
+            logger.info(f"After temporal upscale: latent shape {list(latent.shape)}, output fps={output_frame_rate:.1f}")
 
         # ----------------------------------------------------------------
         # 3. SPATIAL UPSCALE LATENT 2x (optional)
         # ----------------------------------------------------------------
 
         if do_spatial:
-            print("[RSLTXVUpscale] Spatial upscaling latent 2x")
+            logger.info("Spatial upscaling latent 2x")
             self._free_vram()
 
             model_dtype = next(upscale_model.parameters()).dtype
@@ -204,7 +207,7 @@ class RSLTXVUpscale:
 
             upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
             latent = upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
-            print(f"[RSLTXVUpscale] Upscaled latent shape: {list(latent.shape)}")
+            logger.info(f"Upscaled latent shape: {list(latent.shape)}")
             del up_latents, upsampled
 
         # ----------------------------------------------------------------
@@ -246,7 +249,7 @@ class RSLTXVUpscale:
                 dtype=latent.dtype, device=latent.device,
             )
             denoise_mask[:, :, :first_encoded.shape[2]] = 0.0
-            print(f"[RSLTXVUpscale] First frame injected ({encode_w}x{encode_h})")
+            logger.info(f"First frame injected ({encode_w}x{encode_h})")
 
             # 5. AUDIO LATENTS (optional — requires audio_vae for AV model)
             has_audio = audio_vae is not None
@@ -254,7 +257,7 @@ class RSLTXVUpscale:
             if has_audio:
                 if audio is not None:
                     # Encode provided audio — mask=0 to preserve
-                    print("[RSLTXVUpscale] Encoding input audio latents")
+                    logger.info("Encoding input audio latents")
                     audio_samples = audio_vae.encode(audio)
                     audio_noise_mask = torch.zeros_like(audio_samples)
                 else:
@@ -262,7 +265,7 @@ class RSLTXVUpscale:
                     # Use post-upscale video latent T to derive frame count
                     ref = latent.unbind()[0] if hasattr(latent, 'is_nested') and latent.is_nested else latent
                     num_frames = (ref.shape[2] - 1) * 8 + 1
-                    print(f"[RSLTXVUpscale] Creating empty audio latents for generation ({num_frames} frames at {output_frame_rate}fps)")
+                    logger.info(f"Creating empty audio latents for generation ({num_frames} frames at {output_frame_rate}fps)")
                     audio_samples = torch.zeros(
                         (1, audio_vae.latent_channels,
                          audio_vae.num_of_latents_from_frames(num_frames, output_frame_rate),
@@ -275,7 +278,7 @@ class RSLTXVUpscale:
                 denoise_mask = comfy.nested_tensor.NestedTensor((denoise_mask, audio_noise_mask))
 
             # 6. RE-DIFFUSE
-            print(f"[RSLTXVUpscale] Re-diffusing: {upscale_steps} steps, cfg={upscale_cfg}, denoise={upscale_denoise}")
+            logger.info(f"Re-diffusing: {upscale_steps} steps, cfg={upscale_cfg}, denoise={upscale_denoise}")
             self._free_vram()
 
             positive = node_helpers.conditioning_set_values(positive, {"frame_rate": output_frame_rate})
@@ -307,7 +310,7 @@ class RSLTXVUpscale:
                     lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
                     self.loaded_lora = (lora_path, lora)
                 m, _ = comfy.sd.load_lora_for_models(m, None, lora, upscale_lora_strength, 0)
-                print(f"[RSLTXVUpscale] Applied upscale LoRA: {upscale_lora} (strength={upscale_lora_strength})")
+                logger.info(f"Applied upscale LoRA: {upscale_lora} (strength={upscale_lora_strength})")
 
             sampling_base = comfy.model_sampling.ModelSamplingFlux
             sampling_type = comfy.model_sampling.CONST
@@ -322,7 +325,7 @@ class RSLTXVUpscale:
             mm_shift = (max_shift - base_shift) / (x2 - x1)
             b = base_shift - mm_shift * x1
             shift = up_tokens * mm_shift + b
-            print(f"[RSLTXVUpscale] Shift: tokens={up_tokens}, shift={shift:.3f}")
+            logger.info(f"Shift: tokens={up_tokens}, shift={shift:.3f}")
 
             model_sampling_obj = ModelSamplingAdvanced(m.model.model_config)
             model_sampling_obj.set_parameters(shift=shift)
@@ -350,7 +353,7 @@ class RSLTXVUpscale:
             up_sampler = comfy.samplers.sampler_object("euler_ancestral")
             callback = latent_preview.prepare_callback(up_guider.model_patcher, sigmas.shape[-1] - 1)
 
-            print("[RSLTXVUpscale] Sampling...")
+            logger.info("Sampling...")
             samples = up_guider.sample(
                 up_noise, up_latent, up_sampler, sigmas,
                 denoise_mask=denoise_mask,
@@ -370,7 +373,7 @@ class RSLTXVUpscale:
             del m
             self._free_vram()
         else:
-            print("[RSLTXVUpscale] Temporal-only mode, skipping re-diffusion")
+            logger.info("Temporal-only mode, skipping re-diffusion")
 
         output_latent = {"samples": video_latent}
 
@@ -379,7 +382,7 @@ class RSLTXVUpscale:
         # ----------------------------------------------------------------
 
         if decode:
-            print("[RSLTXVUpscale] Decoding latents to images (tiled)")
+            logger.info("Decoding latents to images (tiled)")
             compression = vae.spacial_compression_decode()
             tile_size = 512 // compression
             overlap = 128 // compression
@@ -414,11 +417,11 @@ class RSLTXVUpscale:
         if audio_latent_out is not None and audio_vae is not None:
             if audio_is_input:
                 # Pass through original audio — skip VAE decode roundtrip
-                print("[RSLTXVUpscale] Audio passthrough (input audio preserved)")
+                logger.info("Audio passthrough (input audio preserved)")
                 audio_output = audio
             else:
                 # Decode generated audio
-                print("[RSLTXVUpscale] Decoding generated audio latents")
+                logger.info("Decoding generated audio latents")
                 decoded_audio = audio_vae.decode(audio_latent_out).to(audio_latent_out.device)
                 audio_output = {
                     "waveform": decoded_audio,
@@ -427,7 +430,7 @@ class RSLTXVUpscale:
         elif audio is not None:
             audio_output = audio
 
-        print("[RSLTXVUpscale] Done")
+        logger.info("Done")
         return (output_latent, out_images, audio_output)
 
     # ------------------------------------------------------------------
@@ -447,7 +450,7 @@ class RSLTXVUpscale:
         try:
             blocks = model_clone.model.diffusion_model.transformer_blocks
         except AttributeError:
-            print("[RSLTXVUpscale] Warning: Could not find transformer_blocks for FFN chunking")
+            logger.warning("Could not find transformer_blocks for FFN chunking")
             return
 
         def make_chunked_forward(ff_module, chunks):

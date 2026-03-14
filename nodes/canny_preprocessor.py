@@ -5,12 +5,15 @@ preserving aspect ratio, runs Canny edge detection, and returns the edge
 images with the computed dimensions — ready to wire into RSLTXVICLoRAGuider.
 """
 
+import logging
 import math
 
 import cv2
 import numpy as np
 import torch
 import comfy.utils
+
+logger = logging.getLogger(__name__)
 
 
 class RSCannyPreprocessor:
@@ -49,7 +52,7 @@ class RSCannyPreprocessor:
         target_w = max(128, round(target_w / 128) * 128)
         target_h = max(128, round(target_h / 128) * 128)
 
-        print(f"[RSCannyPreprocessor] {src_w}x{src_h} → {target_w}x{target_h}")
+        logger.info(f"{src_w}x{src_h} → {target_w}x{target_h}")
 
         # Resize to target resolution
         resized = comfy.utils.common_upscale(

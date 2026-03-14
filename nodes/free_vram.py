@@ -1,7 +1,10 @@
 import gc
+import logging
 
 import torch
 import comfy.model_management as mm
+
+logger = logging.getLogger(__name__)
 
 
 class RSFreeVRAM:
@@ -36,7 +39,7 @@ class RSFreeVRAM:
         mm.soft_empty_cache()
 
         free_after = torch.cuda.mem_get_info()[0] / (1024 ** 3)
-        print(f"[RS Free VRAM] {free_before:.2f} GB free → {free_after:.2f} GB free (recovered {free_after - free_before:.2f} GB)")
+        logger.info(f"{free_before:.2f} GB free → {free_after:.2f} GB free (recovered {free_after - free_before:.2f} GB)")
 
         return (output,)
 

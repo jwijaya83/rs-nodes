@@ -1,6 +1,9 @@
 import gc
+import logging
 import random
 import uuid
+
+logger = logging.getLogger(__name__)
 
 import torch
 import comfy.model_management as mm
@@ -109,7 +112,7 @@ class RSZImageGenerate:
         elif seed_mode == "decrement" and self._last_seed is not None:
             actual_seed = (self._last_seed - 1) % (0xffffffffffffffff + 1)
         self._last_seed = actual_seed
-        print(f"[RSZImageGenerate] Starting generation (seed={actual_seed}, mode={seed_mode})")
+        logger.info(f"Starting generation (seed={actual_seed}, mode={seed_mode})")
 
         try:
             images = self._generate_impl(
@@ -124,7 +127,7 @@ class RSZImageGenerate:
             )
             return {"ui": {"seed": [actual_seed]}, "result": (images,)}
         except Exception:
-            print("[RSZImageGenerate] Error during generation, cleaning up VRAM")
+            logger.info("Error during generation, cleaning up VRAM")
             raise
         finally:
             self._free_vram()
@@ -173,7 +176,7 @@ class RSZImageGenerate:
                 lora_data = comfy.utils.load_torch_file(lora_path, safe_load=True)
                 self.loaded_lora = (lora_path, lora_data)
             m, _ = comfy.sd.load_lora_for_models(m, None, lora_data, lora_strength, 0)
-            print(f"[RSZImageGenerate] Applied LoRA: {lora} (strength={lora_strength})")
+            logger.info(f"Applied LoRA: {lora} (strength={lora_strength})")
 
         # RenormCFG
         in_channels = m.model.diffusion_model.in_channels
@@ -250,7 +253,7 @@ class RSZImageGenerate:
             start_step = int((1.0 - denoise) * steps)
             sigmas = sigmas[start_step:]
 
-        print(f"[RSZImageGenerate] Schedule: {len(sigmas)-1} steps, denoise={denoise}")
+        logger.info(f"Schedule: {len(sigmas)-1} steps, denoise={denoise}")
 
         # ----------------------------------------------------------------
         # 5. SAMPLE
@@ -268,7 +271,7 @@ class RSZImageGenerate:
         callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1)
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
-        print("[RSZImageGenerate] Sampling...")
+        logger.info("Sampling...")
         samples = guider.sample(
             noise, latent_image, sampler, sigmas,
             denoise_mask=None,
@@ -286,10 +289,10 @@ class RSZImageGenerate:
         # 6. VAE DECODE
         # ----------------------------------------------------------------
 
-        print("[RSZImageGenerate] Decoding latents...")
+        logger.info("Decoding latents...")
         images = vae.decode(samples)
 
-        print("[RSZImageGenerate] Done")
+        logger.info("Done")
         return images
 
     # ------------------------------------------------------------------

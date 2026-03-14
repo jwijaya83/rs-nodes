@@ -1,5 +1,8 @@
 import gc
+import logging
 import math
+
+logger = logging.getLogger(__name__)
 
 import torch
 import comfy.model_management as mm
@@ -121,7 +124,7 @@ class RSLTXVExtend:
         max_shift=2.05,
         base_shift=0.95,
     ):
-        print("[RSLTXVExtend] Starting extension")
+        logger.info("Starting extension")
         try:
             return self._extend_impl(
                 model, positive, negative, vae, latent,
@@ -140,7 +143,7 @@ class RSLTXVExtend:
                 max_shift=max_shift, base_shift=base_shift,
             )
         except Exception:
-            print("[RSLTXVExtend] Error during extension, cleaning up VRAM")
+            logger.info("Error during extension, cleaning up VRAM")
             raise
         finally:
             self._free_vram()
@@ -177,9 +180,9 @@ class RSLTXVExtend:
         new_latent_frames = ((num_new_frames - 1) // 8) + 1
         extension_latent_frames = overlap_latent_frames + new_latent_frames
 
-        print(f"[RSLTXVExtend] Input: {input_latent_frames} latent frames, "
-              f"overlap: {overlap_latent_frames}, new: {new_latent_frames}, "
-              f"extension chunk: {extension_latent_frames}")
+        logger.info(f"Input: {input_latent_frames} latent frames, "
+                    f"overlap: {overlap_latent_frames}, new: {new_latent_frames}, "
+                    f"extension chunk: {extension_latent_frames}")
 
         m = model.clone()
 
@@ -262,7 +265,7 @@ class RSLTXVExtend:
 
         has_audio = audio is not None and audio_vae is not None
         if has_audio:
-            print("[RSLTXVExtend] Encoding audio latents")
+            logger.info("Encoding audio latents")
             audio_latents = audio_vae.encode(audio)
 
             video_samples = ext_latent_dict["samples"]
@@ -339,7 +342,7 @@ class RSLTXVExtend:
         callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1)
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
-        print("[RSLTXVExtend] Sampling extension chunk...")
+        logger.info("Sampling extension chunk...")
         samples = guider.sample(
             noise, latent_image, sampler, sigmas,
             denoise_mask=noise_mask_for_sampling,
@@ -391,7 +394,7 @@ class RSLTXVExtend:
         final_video = torch.cat([original_trimmed, ext_video], dim=2)
 
         output_latent = {"samples": final_video}
-        print(f"[RSLTXVExtend] Extended: {input_latent_frames} → {final_video.shape[2]} latent frames")
+        logger.info(f"Extended: {input_latent_frames} → {final_video.shape[2]} latent frames")
 
         # ----------------------------------------------------------------
         # 11. UPSCALE (optional)
@@ -401,7 +404,7 @@ class RSLTXVExtend:
             if upscale_fallback:
                 pre_upscale_latent = {"samples": output_latent["samples"].detach().cpu().clone()}
             try:
-                print("[RSLTXVExtend] Upscaling latents")
+                logger.info("Upscaling latents")
                 self._free_vram()
 
                 device = mm.get_torch_device()
@@ -427,7 +430,7 @@ class RSLTXVExtend:
 
                 # Optional re-diffusion at upscaled resolution
                 if upscale_denoise > 0 and upscale_steps > 0:
-                    print("[RSLTXVExtend] Re-sampling at upscaled resolution")
+                    logger.info("Re-sampling at upscaled resolution")
                     self._free_vram()
 
                     up_tokens = math.prod(upsampled.shape[2:])
@@ -475,8 +478,8 @@ class RSLTXVExtend:
             except Exception as e:
                 if not upscale_fallback:
                     raise
-                print(f"[RSLTXVExtend] WARNING: Upscale failed ({type(e).__name__}: {e})")
-                print("[RSLTXVExtend] Falling back to half-resolution decode")
+                logger.warning(f"Upscale failed ({type(e).__name__}: {e})")
+                logger.warning("Falling back to half-resolution decode")
                 self._free_vram()
                 output_latent = pre_upscale_latent
                 decode = True
@@ -487,7 +490,7 @@ class RSLTXVExtend:
 
         images = None
         if decode:
-            print("[RSLTXVExtend] Decoding latents to images (tiled)")
+            logger.info("Decoding latents to images (tiled)")
             self._free_vram()
             compression = vae.spacial_compression_decode()
             tile_size = 512 // compression
@@ -511,14 +514,14 @@ class RSLTXVExtend:
 
         audio_output = None
         if has_audio and audio_latent_out is not None and audio_vae is not None:
-            print("[RSLTXVExtend] Decoding audio latents")
+            logger.info("Decoding audio latents")
             decoded_audio = audio_vae.decode(audio_latent_out).to(audio_latent_out.device)
             audio_output = {
                 "waveform": decoded_audio,
                 "sample_rate": int(audio_vae.output_sample_rate),
             }
 
-        print("[RSLTXVExtend] Done")
+        logger.info("Done")
         return (output_latent, images, audio_output)
 
     # ------------------------------------------------------------------
@@ -538,7 +541,7 @@ class RSLTXVExtend:
         try:
             blocks = model_clone.model.diffusion_model.transformer_blocks
         except AttributeError:
-            print("[RSLTXVExtend] Warning: Could not find transformer_blocks for FFN chunking")
+            logger.warning("Could not find transformer_blocks for FFN chunking")
             return
 
         def make_chunked_forward(ff_module, chunks):

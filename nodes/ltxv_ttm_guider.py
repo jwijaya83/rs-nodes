@@ -8,9 +8,12 @@ Reference: "Time-to-Move: Training-Free Motion Controlled Video Generation
 via Dual-Clock Denoising" (arXiv:2511.08633)
 """
 
+import logging
 import math
 
 import torch
+
+logger = logging.getLogger(__name__)
 import torch.nn.functional as F
 import comfy.model_management as mm
 import comfy.model_sampling
@@ -162,16 +165,16 @@ class LTXVTTMGuider(comfy.samplers.CFGGuider):
         mask = self.ttm_mask.to(device)
         target_shape = noise.shape[2:]
         if ref.shape[2:] != target_shape:
-            print(f"[TTMGuider] WARNING: Resizing reference {list(ref.shape[2:])} → {list(target_shape)}")
-            print(f"[TTMGuider] For best quality, set TTM guider width/height to match generation resolution")
+            logger.warning(f"Resizing reference {list(ref.shape[2:])} → {list(target_shape)}")
+            logger.warning("For best quality, set TTM guider width/height to match generation resolution")
             ref = F.interpolate(ref.float(), size=target_shape, mode='trilinear', align_corners=False)
             mask = F.interpolate(mask.float(), size=target_shape, mode='nearest')
             mask = (mask > 0.5).float()
 
         # Diagnostics
         mask_coverage = mask.sum().item() / max(mask.numel(), 1) * 100
-        print(f"[TTMGuider] Mask coverage: {mask_coverage:.1f}% active")
-        print(f"[TTMGuider] Reference latent stats: mean={ref.mean():.4f}, std={ref.std():.4f}")
+        logger.info(f"Mask coverage: {mask_coverage:.1f}% active")
+        logger.info(f"Reference latent stats: mean={ref.mean():.4f}, std={ref.std():.4f}")
 
         # Recompute shift from actual generation dimensions
         tokens = math.prod(target_shape)
@@ -190,8 +193,8 @@ class LTXVTTMGuider(comfy.samplers.CFGGuider):
         model_sampling_obj.set_parameters(shift=shift)
         self.model_patcher.add_object_patch("model_sampling", model_sampling_obj)
 
-        print(f"[TTMGuider] Generation: {list(target_shape)}, shift={shift:.3f}")
-        print(f"[TTMGuider] TTM active for steps 0-{ttm_end_step} of {total_steps}")
+        logger.info(f"Generation: {list(target_shape)}, shift={shift:.3f}")
+        logger.info(f"TTM active for steps 0-{ttm_end_step} of {total_steps}")
 
         # Build model callable for the sampling loop
         extra_model_options = comfy.model_patcher.create_model_options_clone(self.model_options)
@@ -331,7 +334,7 @@ class RSLTXVTTMGuider:
         if upscale:
             width = width // 2
             height = height // 2
-            print(f"[RSLTXVTTMGuider] Upscale mode: encoding reference at {width}x{height}")
+            logger.info(f"Upscale mode: encoding reference at {width}x{height}")
 
         # Compute target resolution preserving reference aspect ratio
         src_h, src_w = reference_video.shape[1], reference_video.shape[2]
@@ -343,16 +346,16 @@ class RSLTXVTTMGuider:
         target_h = max(64, round(target_h / 32) * 32)
 
         if src_h != target_h or src_w != target_w:
-            print(f"[RSLTXVTTMGuider] Resizing to match aspect ratio: {src_w}x{src_h} → {target_w}x{target_h}")
+            logger.info(f"Resizing to match aspect ratio: {src_w}x{src_h} → {target_w}x{target_h}")
         else:
-            print(f"[RSLTXVTTMGuider] Reference resolution: {target_w}x{target_h}")
+            logger.info(f"Reference resolution: {target_w}x{target_h}")
 
         reference_video = comfy.utils.common_upscale(
             reference_video.movedim(-1, 1), target_w, target_h, "bilinear", "center"
         ).movedim(1, -1)
 
-        print(f"[RSLTXVTTMGuider] Mask input: shape={list(mask.shape)}, dim={mask.dim()}, "
-              f"min={mask.min():.3f}, max={mask.max():.3f}")
+        logger.info(f"Mask input: shape={list(mask.shape)}, dim={mask.dim()}, "
+                    f"min={mask.min():.3f}, max={mask.max():.3f}")
 
         # Normalize mask to [B, H, W] regardless of input format
         if mask.dim() == 4:
@@ -368,8 +371,8 @@ class RSLTXVTTMGuider:
             mask.unsqueeze(1), target_w, target_h, "bilinear", "center"
         ).squeeze(1)  # [B, target_h, target_w]
 
-        print(f"[RSLTXVTTMGuider] Mask after resize: {mask.shape[0]} frames, "
-              f"per-frame coverage: {['%.1f%%' % (f.mean().item() * 100) for f in mask[:4]]}...")
+        logger.info(f"Mask after resize: {mask.shape[0]} frames, "
+                    f"per-frame coverage: {['%.1f%%' % (f.mean().item() * 100) for f in mask[:4]]}...")
 
         # Pad frames to LTX VAE requirement (1 + 8*x frames)
         num_frames = reference_video.shape[0]
@@ -381,12 +384,12 @@ class RSLTXVTTMGuider:
             # Pad mask to match
             mask_pad = mask[-1:].expand(pad_count, -1, -1)
             mask = torch.cat([mask, mask_pad], dim=0)
-            print(f"[RSLTXVTTMGuider] Padded reference+mask: {num_frames} → {target_frames} frames")
+            logger.info(f"Padded reference+mask: {num_frames} → {target_frames} frames")
 
-        print(f"[RSLTXVTTMGuider] Encoding reference video ({reference_video.shape[0]} frames at {target_w}x{target_h})")
+        logger.info(f"Encoding reference video ({reference_video.shape[0]} frames at {target_w}x{target_h})")
         reference_latents = vae.encode(reference_video[:, :, :, :3])
         _, _, lat_t, lat_h, lat_w = reference_latents.shape
-        print(f"[RSLTXVTTMGuider] Reference latents: {reference_latents.shape}")
+        logger.info(f"Reference latents: {reference_latents.shape}")
 
         # Stamp frame rate onto conditioning
         positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
@@ -398,8 +401,8 @@ class RSLTXVTTMGuider:
         mask_5d = (mask_5d > 0.5).float()
 
         total_coverage = mask_5d.mean().item() * 100
-        print(f"[RSLTXVTTMGuider] Mask coverage: {total_coverage:.1f}% (mask=1 → replace with reference)")
-        print(f"[RSLTXVTTMGuider] TTM strength: {ttm_strength}")
+        logger.info(f"Mask coverage: {total_coverage:.1f}% (mask=1 → replace with reference)")
+        logger.info(f"TTM strength: {ttm_strength}")
 
         # Store on CPU — moved to GPU on demand in inner_sample
         reference_latents = reference_latents.cpu()

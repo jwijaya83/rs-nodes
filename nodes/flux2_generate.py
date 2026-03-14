@@ -1,7 +1,10 @@
 import gc
+import logging
 import math
 import random
 import uuid
+
+logger = logging.getLogger(__name__)
 
 import torch
 import comfy.model_management as mm
@@ -148,7 +151,7 @@ class RSFlux2Generate:
         elif seed_mode == "decrement" and self._last_seed is not None:
             actual_seed = (self._last_seed - 1) % (0xffffffffffffffff + 1)
         self._last_seed = actual_seed
-        print(f"[RSFlux2Generate] Starting generation (seed={actual_seed}, mode={seed_mode})")
+        logger.info(f"Starting generation (seed={actual_seed}, mode={seed_mode})")
 
         try:
             images = self._generate_impl(
@@ -165,7 +168,7 @@ class RSFlux2Generate:
             )
             return {"ui": {"seed": [actual_seed]}, "result": (images,)}
         except Exception:
-            print("[RSFlux2Generate] Error during generation, cleaning up VRAM")
+            logger.info("Error during generation, cleaning up VRAM")
             raise
         finally:
             self._free_vram()
@@ -220,7 +223,7 @@ class RSFlux2Generate:
                 ).movedim(1, -1)
 
                 ref_latent = vae.encode(scaled[:, :, :, :3])
-                print(f"[RSFlux2Generate] Reference image {i+1}: {img_w}x{img_h} → {target_w}x{target_h}")
+                logger.info(f"Reference image {i+1}: {img_w}x{img_h} → {target_w}x{target_h}")
 
                 positive = node_helpers.conditioning_set_values(
                     positive, {"reference_latents": [ref_latent]}, append=True
@@ -242,7 +245,7 @@ class RSFlux2Generate:
                 lora_data = comfy.utils.load_torch_file(lora_path, safe_load=True)
                 self.loaded_lora = (lora_path, lora_data)
             m, _ = comfy.sd.load_lora_for_models(m, None, lora_data, lora_strength, 0)
-            print(f"[RSFlux2Generate] Applied LoRA: {lora} (strength={lora_strength})")
+            logger.info(f"Applied LoRA: {lora} (strength={lora_strength})")
 
         # Attention override
         attn_func = None
@@ -259,9 +262,9 @@ class RSFlux2Generate:
             m.model_options.setdefault("transformer_options", {})[
                 "optimized_attention_override"
             ] = lambda func, *args, **kwargs: attn_func(*args, **kwargs)
-            print("[RSFlux2Generate] Using SageAttention")
+            logger.info("Using SageAttention")
         else:
-            print("[RSFlux2Generate] Using default attention")
+            logger.info("Using default attention")
 
         # FFN chunking (double blocks only — single blocks have fused MLP)
         if ffn_chunks > 0:
@@ -274,7 +277,7 @@ class RSFlux2Generate:
         if latent_upscale == "on":
             first_w = ((width // 2) // 16) * 16
             first_h = ((height // 2) // 16) * 16
-            print(f"[RSFlux2Generate] Latent upscale: first pass {first_w}x{first_h} → {width}x{height}")
+            logger.info(f"Latent upscale: first pass {first_w}x{first_h} → {width}x{height}")
         else:
             first_w = width
             first_h = height
@@ -294,7 +297,7 @@ class RSFlux2Generate:
                 samples, size=(height // 8, width // 8),
                 mode="bilinear", align_corners=False,
             )
-            print(f"[RSFlux2Generate] Latent upscaled, re-diffusing at denoise={upscale_denoise}")
+            logger.info(f"Latent upscaled, re-diffusing at denoise={upscale_denoise}")
 
             samples = self._sample_pass(
                 m, positive, negative, cfg, seed + 1,
@@ -312,15 +315,15 @@ class RSFlux2Generate:
         # 6. VAE DECODE
         # ----------------------------------------------------------------
 
-        print("[RSFlux2Generate] Decoding latents...")
+        logger.info("Decoding latents...")
         pixel_count = samples.shape[2] * 8 * samples.shape[3] * 8
         if pixel_count > 1024 * 1024:
-            print(f"[RSFlux2Generate] Large image ({samples.shape[3]*8}x{samples.shape[2]*8}), using tiled decode")
+            logger.info(f"Large image ({samples.shape[3]*8}x{samples.shape[2]*8}), using tiled decode")
             images = vae.decode_tiled(samples)
         else:
             images = vae.decode(samples)
 
-        print("[RSFlux2Generate] Done")
+        logger.info("Done")
         return images
 
     def _sample_pass(self, m, positive, negative, cfg, seed, width, height, steps, denoise, init_latent=None):
@@ -344,7 +347,7 @@ class RSFlux2Generate:
             start_step = int((1.0 - denoise) * steps)
             sigmas = sigmas[start_step:]
 
-        print(f"[RSFlux2Generate] Schedule: seq_len={image_seq_len}, mu={mu:.4f}, {len(sigmas)-1} steps")
+        logger.info(f"Schedule: seq_len={image_seq_len}, mu={mu:.4f}, {len(sigmas)-1} steps")
 
         guider = comfy.samplers.CFGGuider(m)
         guider.set_conds(positive, negative)
@@ -358,7 +361,7 @@ class RSFlux2Generate:
         callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1)
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
-        print("[RSFlux2Generate] Sampling...")
+        logger.info("Sampling...")
         samples = guider.sample(
             noise, latent_image, sampler, sigmas,
             denoise_mask=None,
@@ -385,7 +388,7 @@ class RSFlux2Generate:
         try:
             double_blocks = model_clone.model.diffusion_model.double_blocks
         except AttributeError:
-            print("[RSFlux2Generate] Warning: Could not find double_blocks for FFN chunking")
+            logger.warning("Could not find double_blocks for FFN chunking")
             return
 
         def make_chunked_forward(ff_module, chunks):

@@ -1,4 +1,8 @@
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class RSVideoTrim:
@@ -41,12 +45,12 @@ class RSVideoTrim:
                 H, W, C = images.shape[1], images.shape[2], images.shape[3]
                 trimmed_images = torch.zeros((1, H, W, C), dtype=images.dtype, device=images.device)
                 frame_count = 1
-                print(f"[RSVideoTrim] Warning: in_point >= out_point after clamping — returning single black frame")
+                logger.warning("in_point >= out_point after clamping — returning single black frame")
             else:
                 trimmed_images = images[start_frame:end_frame]
                 frame_count = trimmed_images.shape[0]
-                print(f"[RSVideoTrim] Images trimmed: {in_point:.2f}s-{out_point:.2f}s "
-                      f"(frames {start_frame}-{end_frame}, {frame_count} frames)")
+                logger.info(f"Images trimmed: {in_point:.2f}s-{out_point:.2f}s "
+                            f"(frames {start_frame}-{end_frame}, {frame_count} frames)")
 
         # --- Trim audio ---
         if audio is not None:
@@ -63,12 +67,12 @@ class RSVideoTrim:
             if start_sample >= end_sample:
                 trimmed_waveform = torch.zeros((waveform.shape[0], waveform.shape[1], 1),
                                                dtype=waveform.dtype, device=waveform.device)
-                print(f"[RSVideoTrim] Warning: audio in_point >= out_point — returning silence")
+                logger.warning("audio in_point >= out_point — returning silence")
             else:
                 trimmed_waveform = waveform[..., start_sample:end_sample]
                 duration = trimmed_waveform.shape[-1] / sample_rate
-                print(f"[RSVideoTrim] Audio trimmed: {in_point:.2f}s-{out_point:.2f}s "
-                      f"(samples {start_sample}-{end_sample}, {duration:.2f}s)")
+                logger.info(f"Audio trimmed: {in_point:.2f}s-{out_point:.2f}s "
+                            f"(samples {start_sample}-{end_sample}, {duration:.2f}s)")
 
             trimmed_audio = {"waveform": trimmed_waveform, "sample_rate": sample_rate}
 
