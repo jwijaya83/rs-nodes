@@ -853,6 +853,8 @@ class RSLTXVGenerate:
                         start_step = int((1.0 - upscale_denoise) * upscale_steps)
                         up_sig = up_sig[start_step:]
 
+                    logger.info(f"Rediffusion sigmas ({len(up_sig)}): {up_sig.tolist()}")
+
                     # Use IC-LoRA guider if original guider had control_info
                     _iclora_info = getattr(guider, 'control_info', None)
                     if _iclora_info and _iclora_info.get("controls"):
