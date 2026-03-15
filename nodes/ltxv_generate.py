@@ -995,6 +995,10 @@ class RSLTXVGenerate:
                         positive = node_helpers.conditioning_set_values(positive, {"keyframe_idxs": None})
                         negative = node_helpers.conditioning_set_values(negative, {"keyframe_idxs": None})
 
+                    # Free rediffusion model to reclaim VRAM for VAE decode
+                    del up_model, up_guider
+                    self._free_vram()
+
                 if False:  # T2V pass 2 removed — single rediffusion with MultimodalGuider is sufficient
                     logger.info("T2V pass 2: decoding first frame for I2V guidance")
                     self._free_vram()
