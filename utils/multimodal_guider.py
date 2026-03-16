@@ -155,7 +155,8 @@ def _ltx2_forward(
         vx += attn1_out * vgate_msa * video_scale
         del vgate_msa, attn1_out
         vx.add_(self.attn2(
-            comfy.ldm.common_dit.rms_norm(vx), context=v_context,
+            comfy.ldm.common_dit.rms_norm(vx),
+            context=v_context.contiguous() if v_context is not None else None,
             mask=attention_mask, transformer_options=transformer_options,
         ), alpha=video_scale)
 
@@ -172,7 +173,8 @@ def _ltx2_forward(
         ax += attn1_out * agate_msa * audio_scale
         del agate_msa, attn1_out
         ax.add_(self.audio_attn2(
-            comfy.ldm.common_dit.rms_norm(ax), context=a_context,
+            comfy.ldm.common_dit.rms_norm(ax),
+            context=a_context.contiguous() if a_context is not None else None,
             mask=attention_mask, transformer_options=transformer_options,
         ), alpha=audio_scale)
 

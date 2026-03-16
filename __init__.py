@@ -70,4 +70,12 @@ try:
 except ImportError:
     pass
 
+# RTX Super Resolution (V3 node) — only available if nvvfx is installed
+try:
+    from .nodes.rtx_super_resolution import RSRTXSuperResolution
+    NODE_CLASS_MAPPINGS["RSRTXSuperResolution"] = RSRTXSuperResolution
+    NODE_DISPLAY_NAME_MAPPINGS["RSRTXSuperResolution"] = "RS RTX Super Resolution"
+except ImportError:
+    pass
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
