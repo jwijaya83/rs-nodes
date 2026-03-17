@@ -30,6 +30,8 @@ class RSCannyPreprocessor:
                 "height":         ("INT", {"default": 512, "min": 128, "max": 8192, "step": 128}),
                 "low_threshold":  ("INT", {"default": 100, "min": 0, "max": 255, "step": 1}),
                 "high_threshold": ("INT", {"default": 200, "min": 0, "max": 255, "step": 1}),
+                "clahe_clip":     ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.1,
+                                             "tooltip": "CLAHE adaptive contrast. Equalizes dark/bright regions for even edge density. 0 = disabled."}),
             },
         }
 
@@ -39,7 +41,7 @@ class RSCannyPreprocessor:
     CATEGORY = "rs-nodes"
 
     def process(self, image, width=768, height=512,
-                low_threshold=100, high_threshold=200):
+                low_threshold=100, high_threshold=200, clahe_clip=2.0):
         # image is [B, H, W, C] float32 0-1
         src_h, src_w = image.shape[1], image.shape[2]
         aspect = src_w / src_h
@@ -66,6 +68,9 @@ class RSCannyPreprocessor:
         for i in range(num_frames):
             frame_np = (resized[i].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
             gray = cv2.cvtColor(frame_np, cv2.COLOR_RGB2GRAY)
+            if clahe_clip > 0:
+                clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
+                gray = clahe.apply(gray)
             edges = cv2.Canny(gray, low_threshold, high_threshold)
             # Convert single-channel edges to 3-channel
             edges_rgb = np.stack([edges, edges, edges], axis=-1)

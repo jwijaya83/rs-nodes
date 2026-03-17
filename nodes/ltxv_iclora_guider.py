@@ -164,6 +164,10 @@ class RSLTXVICLoRAGuider:
             "max_shift": max_shift,
             "base_shift": base_shift,
             "frame_rate": frame_rate,
+            "audio_stg_scale": audio_stg_scale,
+            "video_modality_scale": video_modality_scale,
+            "audio_modality_scale": audio_modality_scale,
+            "video_attn_scale": video_attn_scale,
         }
 
         # --- Create ICLoRAGuider (deferred encoding at sample() time) ---

@@ -1297,6 +1297,10 @@ class RSLTXVGenerate:
             stg_scale_end=ci["stg_end"] if ci.get("stg_end", -1) >= 0 else None,
             cfg_star_rescale=ci.get("cfg_star_rescale", True),
             skip_sigma_threshold=ci.get("skip_sigma", 0.0),
+            audio_stg_scale=ci["audio_stg_scale"] if ci.get("audio_stg_scale", -1) >= 0 else None,
+            video_modality_scale=ci.get("video_modality_scale", 0.0),
+            audio_modality_scale=ci.get("audio_modality_scale", 3.0),
+            video_attn_scale=ci.get("video_attn_scale", 1.03),
         )
         up_guider.control_info = ci
         logger.info("IC-LoRA guider rebuilt for upscale (deferred encoding)")
