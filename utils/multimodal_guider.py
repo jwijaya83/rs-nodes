@@ -41,6 +41,7 @@ class STGFlag:
     """Mutable flag shared by all block wrappers, toggled per forward pass."""
     do_skip: bool = False
     skip_layers: List[int] = None
+    perturbation: float = 1.0  # 1.0 = full skip (original), <1.0 = soft blend
 
 
 class PatchAttention(contextlib.AbstractContextManager):
@@ -50,8 +51,10 @@ class PatchAttention(contextlib.AbstractContextManager):
     Matches the official ComfyUI-LTXVideo stg.py PatchAttention.
     """
 
-    def __init__(self, attn_idx: Optional[Union[int, List[int]]] = None):
+    def __init__(self, attn_idx: Optional[Union[int, List[int]]] = None,
+                 perturbation: float = 1.0):
         self.current_idx = -1
+        self.perturbation = perturbation
         if isinstance(attn_idx, int):
             self.attn_idx = [attn_idx]
         elif attn_idx is None:
@@ -80,13 +83,20 @@ class PatchAttention(contextlib.AbstractContextManager):
     def stg_attention(self, q, k, v, heads, *args, **kwargs):
         self.current_idx += 1
         if self.current_idx in self.attn_idx:
-            return v
+            if self.perturbation >= 1.0:
+                return v
+            # Soft perturbation: blend real attention with identity
+            real = self.original_attention(q, k, v, heads, *args, **kwargs)
+            return torch.lerp(real, v, self.perturbation)
         return self.original_attention(q, k, v, heads, *args, **kwargs)
 
     def stg_attention_masked(self, q, k, v, heads, *args, **kwargs):
         self.current_idx += 1
         if self.current_idx in self.attn_idx:
-            return v
+            if self.perturbation >= 1.0:
+                return v
+            real = self.original_attention_masked(q, k, v, heads, *args, **kwargs)
+            return torch.lerp(real, v, self.perturbation)
         return self.original_attention_masked(q, k, v, heads, *args, **kwargs)
 
 
@@ -103,7 +113,7 @@ class STGBlockWrapper:
         context_manager = contextlib.nullcontext()
         stg_indexes = args["transformer_options"].get("stg_indexes", [0])
         if self.flag.do_skip and self.idx in self.flag.skip_layers:
-            context_manager = PatchAttention(stg_indexes)
+            context_manager = PatchAttention(stg_indexes, self.flag.perturbation)
         with context_manager:
             return extra_args["original_block"](args)
 
@@ -309,6 +319,10 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
         skip_sigma_threshold=0.0,
         # VRAM-efficient forward + attention scaling
         video_attn_scale=1.0,
+        # Soft STG: 1.0 = full attention skip (original), <1.0 = blend
+        stg_perturbation=1.0,
+        # STG attention index: [0] = self-attn (default), [1] = cross-attn
+        stg_indexes=None,
     ):
         if stg_blocks is None:
             stg_blocks = [29]
@@ -352,8 +366,13 @@ class MultimodalGuider(comfy.samplers.CFGGuider):
 
         self.inner_set_conds({"positive": positive, "negative": negative})
 
+        # Set STG attention index override if specified
+        if stg_indexes is not None:
+            model.model_options.setdefault("transformer_options", {})["stg_indexes"] = stg_indexes
+
         # Install STG block wrappers on ALL blocks (matching official)
-        self.stg_flag = STGFlag(skip_layers=list(stg_blocks))
+        self.stg_flag = STGFlag(skip_layers=list(stg_blocks),
+                                perturbation=stg_perturbation)
         self._patch_model(self.model_patcher, self.stg_flag)
 
         # Apply VRAM-efficient forward with attention scaling (LTXAV only)
@@ -1005,9 +1024,18 @@ class ICLoRAGuider(MultimodalGuider):
     # sample() override — full guide frame lifecycle
     # ------------------------------------------------------------------
 
+    # Official Lightricks distilled IC-LoRA sigma schedule
+    DISTILLED_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
+
     def sample(self, noise, latent_image, sampler, sigmas, **kwargs):
         # 1. Apply model sampling shift (deferred until latent dims known)
         self._apply_model_sampling(latent_image)
+
+        # Distilled mode: when cfg=1.0, use official sigma schedule + euler
+        if self.video_cfg == 1.0:
+            sigmas = torch.tensor(self.DISTILLED_SIGMAS, dtype=torch.float32)
+            sampler = comfy.samplers.sampler_object("euler")
+            logger.info(f"Distilled mode: euler sampler, official sigma schedule ({len(sigmas)-1} steps)")
 
         # 2. Encode guide + inject into latent and conditioning
         denoise_mask = kwargs.get("denoise_mask", None)
