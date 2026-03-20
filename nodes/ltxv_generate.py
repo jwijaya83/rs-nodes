@@ -688,56 +688,65 @@ class RSLTXVGenerate:
                     positive = node_helpers.conditioning_set_values(positive, {"frame_rate": frame_rate})
                     negative = node_helpers.conditioning_set_values(negative, {"frame_rate": frame_rate})
 
-                # Spatial upscale (2x resolution)
-                upscale_label = "2x temporal + 2x spatial" if do_temporal_upscale else "2x spatial"
-                logger.info(f"Upscaling video latents ({upscale_label})")
-                self._free_vram()
+                # IC-LoRA: first pass skips spatial upscale (half-res re-diffusion),
+                # then runs again with full spatial upscale + normal settings.
+                _iclora_pre = getattr(guider, 'control_info', None)
+                _iclora_needs_normal_upscale = _iclora_pre is not None and _iclora_pre.get("control_image") is not None
+                is_iclora = _iclora_needs_normal_upscale
 
-                model_dtype = next(upscale_model.parameters()).dtype
-                up_latents = output_latent["samples"]
+                if is_iclora:
+                    logger.info("IC-LoRA: skipping spatial upscale (half-res re-diffusion)")
+                    upsampled = output_latent["samples"]
+                else:
+                    upscale_label = "2x temporal + 2x spatial" if do_temporal_upscale else "2x spatial"
+                    logger.info(f"Upscaling video latents ({upscale_label})")
+                    self._free_vram()
 
-                memory_required = mm.module_size(upscale_model)
-                memory_required += math.prod(up_latents.shape) * 3000.0
-                mm.free_memory(memory_required, device)
+                    model_dtype = next(upscale_model.parameters()).dtype
+                    up_latents = output_latent["samples"]
 
-                try:
-                    upscale_model.to(device)
-                    if upscale_tiling:
-                        # Temporal chunking with overlap context for temporal convolutions
-                        latent_t = up_latents.shape[2]
-                        us_chunk_t = upscale_tile_t if upscale_tile_t > 0 else latent_t
-                        us_overlap = min(2, us_chunk_t // 2) if us_chunk_t < latent_t else 0
-                        if us_chunk_t < latent_t:
-                            logger.info(f"Upscale model: chunking {latent_t} latent frames, chunk_t={us_chunk_t}, overlap={us_overlap}")
-                        chunks_out = []
-                        t_pos = 0
-                        while t_pos < latent_t:
-                            ctx_start = max(0, t_pos - us_overlap)
-                            ctx_end = min(t_pos + us_chunk_t + us_overlap, latent_t)
-                            if ctx_end < latent_t and (latent_t - ctx_end) < us_overlap + 1:
-                                ctx_end = latent_t
-                            chunk = up_latents[:, :, ctx_start:ctx_end]
-                            chunk = chunk.to(dtype=model_dtype, device=device)
-                            chunk = vae.first_stage_model.per_channel_statistics.un_normalize(chunk)
-                            out = upscale_model(chunk).to(device=mm.intermediate_device())
-                            trim_start = t_pos - ctx_start
-                            keep_end = min(t_pos + us_chunk_t, latent_t) - ctx_start
-                            if ctx_end == latent_t and t_pos + us_chunk_t < latent_t:
-                                keep_end = out.shape[2]
-                            chunks_out.append(out[:, :, trim_start:keep_end])
-                            t_pos = ctx_start + keep_end
-                        upsampled = torch.cat(chunks_out, dim=2)
-                        del chunks_out
-                    else:
-                        # Original single-pass
-                        up_latents = up_latents.to(dtype=model_dtype, device=device)
-                        up_latents = vae.first_stage_model.per_channel_statistics.un_normalize(up_latents)
-                        upsampled = upscale_model(up_latents)
-                finally:
-                    upscale_model.cpu()
+                    memory_required = mm.module_size(upscale_model)
+                    memory_required += math.prod(up_latents.shape) * 3000.0
+                    mm.free_memory(memory_required, device)
 
-                upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
-                upsampled = upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
+                    try:
+                        upscale_model.to(device)
+                        if upscale_tiling:
+                            # Temporal chunking with overlap context for temporal convolutions
+                            latent_t = up_latents.shape[2]
+                            us_chunk_t = upscale_tile_t if upscale_tile_t > 0 else latent_t
+                            us_overlap = min(2, us_chunk_t // 2) if us_chunk_t < latent_t else 0
+                            if us_chunk_t < latent_t:
+                                logger.info(f"Upscale model: chunking {latent_t} latent frames, chunk_t={us_chunk_t}, overlap={us_overlap}")
+                            chunks_out = []
+                            t_pos = 0
+                            while t_pos < latent_t:
+                                ctx_start = max(0, t_pos - us_overlap)
+                                ctx_end = min(t_pos + us_chunk_t + us_overlap, latent_t)
+                                if ctx_end < latent_t and (latent_t - ctx_end) < us_overlap + 1:
+                                    ctx_end = latent_t
+                                chunk = up_latents[:, :, ctx_start:ctx_end]
+                                chunk = chunk.to(dtype=model_dtype, device=device)
+                                chunk = vae.first_stage_model.per_channel_statistics.un_normalize(chunk)
+                                out = upscale_model(chunk).to(device=mm.intermediate_device())
+                                trim_start = t_pos - ctx_start
+                                keep_end = min(t_pos + us_chunk_t, latent_t) - ctx_start
+                                if ctx_end == latent_t and t_pos + us_chunk_t < latent_t:
+                                    keep_end = out.shape[2]
+                                chunks_out.append(out[:, :, trim_start:keep_end])
+                                t_pos = ctx_start + keep_end
+                            upsampled = torch.cat(chunks_out, dim=2)
+                            del chunks_out
+                        else:
+                            # Original single-pass
+                            up_latents = up_latents.to(dtype=model_dtype, device=device)
+                            up_latents = vae.first_stage_model.per_channel_statistics.un_normalize(up_latents)
+                            upsampled = upscale_model(up_latents)
+                    finally:
+                        upscale_model.cpu()
+
+                    upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
+                    upsampled = upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
                 output_latent = {"samples": upsampled}
 
                 # Re-inject guide images at full resolution into upscaled latent
@@ -1025,6 +1034,171 @@ class RSLTXVGenerate:
                     # Free rediffusion model to reclaim VRAM for VAE decode
                     del up_model, up_guider
                     self._free_vram()
+
+                # IC-LoRA pass 3: normal spatial upscale + re-diffusion
+                # (passes 1+2 produced a refined half-res latent, now upscale it properly)
+                if _iclora_needs_normal_upscale:
+                    is_iclora = False  # Disable IC-LoRA skip for this pass
+                    _iclora_needs_normal_upscale = False
+
+                    # --- Spatial upscale ---
+                    logger.info("IC-LoRA pass 3: spatial 2x upscale + normal re-diffusion")
+                    self._free_vram()
+
+                    model_dtype = next(upscale_model.parameters()).dtype
+                    up_latents = output_latent["samples"]
+
+                    memory_required = mm.module_size(upscale_model)
+                    memory_required += math.prod(up_latents.shape) * 3000.0
+                    mm.free_memory(memory_required, device)
+
+                    try:
+                        upscale_model.to(device)
+                        if upscale_tiling:
+                            latent_t = up_latents.shape[2]
+                            us_chunk_t = upscale_tile_t if upscale_tile_t > 0 else latent_t
+                            us_overlap = min(2, us_chunk_t // 2) if us_chunk_t < latent_t else 0
+                            if us_chunk_t < latent_t:
+                                logger.info(f"Upscale model: chunking {latent_t} latent frames, chunk_t={us_chunk_t}, overlap={us_overlap}")
+                            chunks_out = []
+                            t_pos = 0
+                            while t_pos < latent_t:
+                                ctx_start = max(0, t_pos - us_overlap)
+                                ctx_end = min(t_pos + us_chunk_t + us_overlap, latent_t)
+                                if ctx_end < latent_t and (latent_t - ctx_end) < us_overlap + 1:
+                                    ctx_end = latent_t
+                                chunk = up_latents[:, :, ctx_start:ctx_end]
+                                chunk = chunk.to(dtype=model_dtype, device=device)
+                                chunk = vae.first_stage_model.per_channel_statistics.un_normalize(chunk)
+                                out = upscale_model(chunk).to(device=mm.intermediate_device())
+                                trim_start = t_pos - ctx_start
+                                keep_end = min(t_pos + us_chunk_t, latent_t) - ctx_start
+                                if ctx_end == latent_t and t_pos + us_chunk_t < latent_t:
+                                    keep_end = out.shape[2]
+                                chunks_out.append(out[:, :, trim_start:keep_end])
+                                t_pos = ctx_start + keep_end
+                            upsampled = torch.cat(chunks_out, dim=2)
+                            del chunks_out
+                        else:
+                            up_latents = up_latents.to(dtype=model_dtype, device=device)
+                            up_latents = vae.first_stage_model.per_channel_statistics.un_normalize(up_latents)
+                            upsampled = upscale_model(up_latents)
+                    finally:
+                        upscale_model.cpu()
+
+                    upsampled = vae.first_stage_model.per_channel_statistics.normalize(upsampled)
+                    upsampled = upsampled.to(dtype=input_dtype, device=mm.intermediate_device())
+                    output_latent = {"samples": upsampled}
+
+                    # --- Re-inject guides at full resolution ---
+                    up_scale_factors = vae.downscale_index_formula
+                    up_guides = []
+                    if first_image is not None:
+                        up_guides.append((first_image, 0, first_strength, "first"))
+                    if middle_image is not None:
+                        mid_idx = (num_frames - 1) // 2
+                        mid_idx = max(0, (mid_idx // 8) * 8)
+                        if mid_idx == 0 and num_frames > 8:
+                            mid_idx = 8
+                        up_guides.append((middle_image, mid_idx, middle_strength, "middle"))
+                    if last_image is not None:
+                        up_guides.append((last_image, -1, last_strength, "last"))
+
+                    up_noise_mask = None
+                    if up_guides:
+                        up_latent_dict = {"samples": upsampled}
+                        up_noise_mask = up_get_noise_mask(up_latent_dict)
+                        for img, frame_idx, strength_val, label in up_guides:
+                            _, _, latent_length, latent_height, latent_width = up_latent_dict["samples"].shape
+                            _, up_t = UpGuide.encode(vae, latent_width, latent_height, img, up_scale_factors)
+                            frame_idx_actual, latent_idx = UpGuide.get_latent_index(
+                                positive, latent_length, len(img), frame_idx, up_scale_factors
+                            )
+                            logger.info(f"Pass 3 re-inject {label}: frame_idx={frame_idx_actual}, latent_idx={latent_idx}, strength={strength_val}")
+                            positive, negative, up_latent_samples, up_noise_mask = UpGuide.append_keyframe(
+                                positive, negative, frame_idx_actual,
+                                up_latent_dict["samples"], up_noise_mask,
+                                up_t, strength_val, up_scale_factors,
+                            )
+                            up_latent_dict = {"samples": up_latent_samples, "noise_mask": up_noise_mask}
+                        upsampled = up_latent_dict["samples"]
+                        output_latent = {"samples": upsampled}
+
+                    # --- Normal re-diffusion ---
+                    has_image_guides = len(up_guides) > 0
+                    do_rediffusion = has_image_guides and upscale_denoise > 0 and upscale_steps > 0
+                    if do_rediffusion:
+                        logger.info(f"Pass 3 re-diffusion ({upscale_steps} steps, cfg={upscale_cfg})")
+                        self._free_vram()
+
+                        up_combined = upsampled
+                        up_model = m.clone()
+                        if upscale_lora and upscale_lora != "none" and upscale_lora_strength != 0:
+                            lora_path = folder_paths.get_full_path_or_raise("loras", upscale_lora)
+                            lora = None
+                            if self.loaded_lora is not None and self.loaded_lora[0] == lora_path:
+                                lora = self.loaded_lora[1]
+                            if lora is None:
+                                lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+                                self.loaded_lora = (lora_path, lora)
+                            up_model, _ = comfy.sd.load_lora_for_models(up_model, None, lora, upscale_lora_strength, 0)
+                            logger.info(f"Applied upscale LoRA: {upscale_lora} (strength={upscale_lora_strength})")
+
+                        up_tokens = math.prod(upsampled.shape[2:])
+                        up_shift = up_tokens * mm_shift + b
+                        logger.info(f"Pass 3 shift: tokens={up_tokens}, shift={up_shift:.3f}")
+
+                        up_model_sampling = ModelSamplingAdvanced(up_model.model.model_config)
+                        up_model_sampling.set_parameters(shift=up_shift)
+                        up_model.add_object_patch("model_sampling", up_model_sampling)
+
+                        exp_shift = math.exp(up_shift)
+                        t = torch.linspace(1.0, 0.0, upscale_steps + 1, dtype=torch.float64)
+                        non_zero = t != 0
+                        inv_t_m1 = torch.where(non_zero, 1.0 / t - 1.0, torch.zeros_like(t))
+                        omz = torch.where(non_zero, inv_t_m1 / (exp_shift + inv_t_m1), torch.ones_like(t))
+                        nz_omz = omz[non_zero]
+                        sf = nz_omz[-1] / (1.0 - 0.1)
+                        omz[non_zero] = nz_omz / sf
+                        up_sig = torch.where(non_zero, 1.0 - omz, torch.zeros_like(omz)).float()
+                        start_step = int((1.0 - upscale_denoise) * upscale_steps)
+                        up_sig = up_sig[start_step:]
+
+                        logger.info(f"Pass 3 sigmas ({len(up_sig)}): {up_sig.tolist()}")
+
+                        # Standard CFGGuider — no IC-LoRA, no distilled
+                        up_guider = comfy.samplers.CFGGuider(up_model)
+                        up_guider.set_conds(positive, negative)
+                        up_guider.set_cfg(upscale_cfg)
+
+                        up_latent_image = comfy.sample.fix_empty_latent_channels(up_guider.model_patcher, up_combined)
+                        up_noise = comfy.sample.prepare_noise(up_latent_image, seed + 1)
+                        up_sampler = sampler if sampler is not None else comfy.samplers.sampler_object("euler_ancestral")
+
+                        up_callback = latent_preview.prepare_callback(up_guider.model_patcher, up_sig.shape[-1] - 1)
+                        up_samples = up_guider.sample(
+                            up_noise, up_latent_image, up_sampler, up_sig,
+                            denoise_mask=up_noise_mask,
+                            callback=up_callback,
+                            disable_pbar=disable_pbar,
+                            seed=seed + 1,
+                        )
+                        up_samples = up_samples.to(mm.intermediate_device())
+
+                        if up_samples.is_nested:
+                            up_parts = up_samples.unbind()
+                            output_latent = {"samples": up_parts[0]}
+                        else:
+                            output_latent = {"samples": up_samples}
+
+                        _, up_num_keyframes = up_get_keyframe_idxs(positive)
+                        if up_num_keyframes > 0:
+                            output_latent["samples"] = output_latent["samples"][:, :, :-up_num_keyframes]
+                            positive = node_helpers.conditioning_set_values(positive, {"keyframe_idxs": None})
+                            negative = node_helpers.conditioning_set_values(negative, {"keyframe_idxs": None})
+
+                        del up_model, up_guider
+                        self._free_vram()
 
                 if False:  # T2V pass 2 removed — single rediffusion with MultimodalGuider is sufficient
                     logger.info("T2V pass 2: decoding first frame for I2V guidance")
