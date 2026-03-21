@@ -1043,7 +1043,11 @@ class RSLTXVGenerate:
 
                     # --- Spatial upscale ---
                     logger.info("IC-LoRA pass 3: spatial 2x upscale + normal re-diffusion")
-                    self._free_vram()
+                    # Aggressive VRAM cleanup — unload diffusion model from pass 2
+                    mm.unload_all_models()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    mm.soft_empty_cache()
 
                     model_dtype = next(upscale_model.parameters()).dtype
                     up_latents = output_latent["samples"]
@@ -1129,7 +1133,11 @@ class RSLTXVGenerate:
                     do_rediffusion = has_image_guides and upscale_denoise > 0 and upscale_steps > 0
                     if do_rediffusion:
                         logger.info(f"Pass 3 re-diffusion ({upscale_steps} steps, cfg={upscale_cfg})")
-                        self._free_vram()
+                        # Free spatial upscale model VRAM before loading diffusion model
+                        mm.unload_all_models()
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        mm.soft_empty_cache()
 
                         up_combined = upsampled
                         up_model = m.clone()
