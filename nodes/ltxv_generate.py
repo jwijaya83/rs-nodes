@@ -54,6 +54,7 @@ class RSLTXVGenerate:
                 "last_strength":     ("FLOAT", {"default": 0.7,  "min": 0.0, "max": 1.0, "step": 0.01}),
                 "guide_strength":    ("FLOAT", {"default": 0.7,  "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Strength for guide_video frames."}),
                 "guide_every_nth":   ("INT",   {"default": 8,   "min": 1,   "max": 64,  "step": 1,    "tooltip": "Inject a guide every N frames. Match this to the splitter's every_nth."}),
+                "guide_index_list":  ("STRING", {"default": "",  "tooltip": "Comma-separated frame indices to inject as guides (e.g. '0,8,24'). Overrides guide_every_nth when set."}),
                 "crf":               ("INT",   {"default": 35,   "min": 0,   "max": 100}),
                 # Audio
                 "audio":             ("AUDIO",),
@@ -144,6 +145,7 @@ class RSLTXVGenerate:
         last_strength=1.0,
         guide_strength=0.7,
         guide_every_nth=8,
+        guide_index_list="",
         crf=35,
         # Audio
         audio=None,
@@ -208,7 +210,7 @@ class RSLTXVGenerate:
                 guide_video=guide_video,
                 first_strength=first_strength, middle_strength=middle_strength,
                 last_strength=last_strength, guide_strength=guide_strength,
-                guide_every_nth=guide_every_nth, crf=crf,
+                guide_every_nth=guide_every_nth, guide_index_list=guide_index_list, crf=crf,
                 audio=audio, audio_vae=audio_vae,
                 audio_cfg=audio_cfg, stg_scale=stg_scale,
                 stg_perturbation=stg_perturbation,
@@ -246,7 +248,7 @@ class RSLTXVGenerate:
         model, positive, negative, vae,
         width, height, num_frames, steps, cfg, seed, frame_rate,
         first_image, middle_image, last_image, guide_video,
-        first_strength, middle_strength, last_strength, guide_strength, guide_every_nth, crf,
+        first_strength, middle_strength, last_strength, guide_strength, guide_every_nth, guide_index_list, crf,
         audio, audio_vae,
         audio_cfg, stg_scale, stg_perturbation, audio_stg_scale, cfg_end, stg_end,
         stg_blocks, rescale, video_modality_scale, audio_modality_scale,
@@ -429,12 +431,19 @@ class RSLTXVGenerate:
 
         guides = []
         if guide_video is not None:
-            # Video-to-video: inject every Nth frame as a guide
             num_video_frames = guide_video.shape[0]
-            for i in range(0, num_video_frames, guide_every_nth):
+            # Parse index list if provided, otherwise use every_nth
+            if guide_index_list and guide_index_list.strip():
+                indices = [int(x.strip()) for x in guide_index_list.split(",") if x.strip()]
+                # Support negative indices (from end)
+                indices = [i if i >= 0 else num_video_frames + i for i in indices]
+                indices = [i for i in indices if 0 <= i < num_video_frames]
+            else:
+                indices = list(range(0, num_video_frames, guide_every_nth))
+            for i in indices:
                 frame = guide_video[i:i+1]  # single frame [1, H, W, C]
                 guides.append((frame, i, guide_strength, f"v2v_{i}"))
-            logger.info(f"Video-to-video: {len(guides)} guide frames from {num_video_frames} input frames (every {guide_every_nth})")
+            logger.info(f"Video-to-video: {len(guides)} guide frames at indices {indices}")
         else:
             if first_image is not None:
                 guides.append((first_image, 0, first_strength, "first"))
@@ -788,7 +797,13 @@ class RSLTXVGenerate:
                     up_guides = []
                     if guide_video is not None:
                         num_video_frames = guide_video.shape[0]
-                        for i in range(0, num_video_frames, guide_every_nth):
+                        if guide_index_list and guide_index_list.strip():
+                            up_indices = [int(x.strip()) for x in guide_index_list.split(",") if x.strip()]
+                            up_indices = [i if i >= 0 else num_video_frames + i for i in up_indices]
+                            up_indices = [i for i in up_indices if 0 <= i < num_video_frames]
+                        else:
+                            up_indices = list(range(0, num_video_frames, guide_every_nth))
+                        for i in up_indices:
                             frame = guide_video[i:i+1]
                             up_guides.append((frame, i, guide_strength, f"v2v_{i}"))
                     else:
