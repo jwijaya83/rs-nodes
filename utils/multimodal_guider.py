@@ -915,7 +915,8 @@ class ICLoRAGuider(MultimodalGuider):
             if latent_w % dsf != 0 or latent_h % dsf != 0:
                 raise ValueError(
                     f"Latent spatial size {latent_w}x{latent_h} must be "
-                    f"divisible by latent_downscale_factor {dsf}"
+                    f"divisible by latent_downscale_factor {dsf}. "
+                    f"Set width/height to multiples of {32 * dsf} (e.g. 768 instead of 736)."
                 )
             dil_h = guide_latent.shape[3] * dsf
             dil_w = guide_latent.shape[4] * dsf
@@ -1031,11 +1032,32 @@ class ICLoRAGuider(MultimodalGuider):
         # 1. Apply model sampling shift (deferred until latent dims known)
         self._apply_model_sampling(latent_image)
 
-        # Distilled mode: when cfg=1.0, use official sigma schedule + euler
+        # Distilled mode: when cfg=1.0, use official sigma schedule
         if self.video_cfg == 1.0:
-            sigmas = torch.tensor(self.DISTILLED_SIGMAS, dtype=torch.float32)
-            sampler = comfy.samplers.sampler_object("euler")
-            logger.info(f"Distilled mode: euler sampler, official sigma schedule ({len(sigmas)-1} steps)")
+            base_sigmas = torch.tensor(self.DISTILLED_SIGMAS, dtype=torch.float32)
+            # On subsequent passes, trim early (high-noise) sigmas so we refine
+            # without destroying what previous passes built
+            rediff_pass = getattr(self, '_current_rediff_pass', 0)
+            total_passes = getattr(self, '_total_rediff_passes', 1)
+            if rediff_pass > 0 and total_passes > 1:
+                # Each subsequent pass starts from a lower noise level
+                # Pass 0: full schedule (8 steps)
+                # Pass 1: skip first 2 sigmas (start from 0.9875)
+                # Pass 2: skip first 4 sigmas (start from 0.975)
+                skip = min(rediff_pass * 2, len(base_sigmas) - 3)  # keep at least 2 steps
+                sigmas = base_sigmas[skip:]
+                logger.info(f"Re-diffusion pass {rediff_pass + 1}/{total_passes}: trimmed to {len(sigmas)-1} steps, start_sigma={sigmas[0]:.4f}")
+            else:
+                sigmas = base_sigmas
+            ic_sampler = getattr(self, 'ic_lora_sampler', None)
+            if ic_sampler is not None:
+                sampler = ic_sampler
+                sampler_name = getattr(ic_sampler, 'sampler_function', None)
+                sampler_name = sampler_name.__name__ if sampler_name else type(ic_sampler).__name__
+                logger.info(f"Distilled mode: sampler={sampler_name}, official sigma schedule ({len(sigmas)-1} steps)")
+            else:
+                sampler = comfy.samplers.sampler_object("euler")
+                logger.info(f"Distilled mode: sampler=euler, official sigma schedule ({len(sigmas)-1} steps)")
 
         # 2. Encode guide + inject into latent and conditioning
         denoise_mask = kwargs.get("denoise_mask", None)

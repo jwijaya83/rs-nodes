@@ -79,6 +79,9 @@ class RSLTXVICLoRAGuider:
                                                    "tooltip": "Audio modality isolation (3 = match official default)"}),
                 "video_attn_scale":  ("FLOAT", {"default": 1.03, "min": 0.0, "max": 10.0, "step": 0.01,
                                                 "tooltip": "Video attention scale (1.03 recommended)"}),
+                "sampler":           ("SAMPLER", {"tooltip": "Sampler for IC-LoRA guidance passes. Default: euler."}),
+                "rediffusion_passes": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1,
+                                               "tooltip": "Number of half-res re-diffusion passes (stage 2)."}),
             },
         }
 
@@ -98,6 +101,7 @@ class RSLTXVICLoRAGuider:
         upscale=False, width=768, height=512,
         audio_stg_scale=-1.0, video_modality_scale=0.0,
         audio_modality_scale=3.0, video_attn_scale=1.03,
+        sampler=None, rediffusion_passes=1,
     ):
         from ..utils.multimodal_guider import ICLoRAGuider
 
@@ -174,6 +178,8 @@ class RSLTXVICLoRAGuider:
             "video_modality_scale": video_modality_scale,
             "audio_modality_scale": audio_modality_scale,
             "video_attn_scale": video_attn_scale,
+            "_ic_lora_sampler": sampler,
+            "_rediffusion_passes": rediffusion_passes,
         }
 
         # --- Create ICLoRAGuider (deferred encoding at sample() time) ---
@@ -205,6 +211,7 @@ class RSLTXVICLoRAGuider:
 
         # Attach control_info for upscale rebuild
         guider.control_info = control_info
+        guider.ic_lora_sampler = sampler
 
         logger.info(f"Guider created (cfg={cfg}, stg={stg_scale}, rescale={rescale})")
         return (guider, out_width, out_height)

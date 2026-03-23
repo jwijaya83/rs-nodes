@@ -15,6 +15,8 @@ from .nodes.flux2_generate import RSFlux2Generate
 from .nodes.prompt_formatter_local import RSPromptFormatterLocal
 from .nodes.z_image_generate import RSZImageGenerate
 from .nodes.counter import RSCounter
+from .nodes.frame_splitter import RSFrameSplitter
+from .nodes.frame_collector import RSFrameCollector
 
 WEB_DIRECTORY = "./web"
 
@@ -36,6 +38,8 @@ NODE_CLASS_MAPPINGS = {
     "RSPromptFormatterLocal": RSPromptFormatterLocal,
     "RSZImageGenerate": RSZImageGenerate,
     "RSCounter": RSCounter,
+    "RSFrameSplitter": RSFrameSplitter,
+    "RSFrameCollector": RSFrameCollector,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -56,6 +60,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSPromptFormatterLocal": "RS Prompt Formatter Local",
     "RSZImageGenerate": "RS Z-Image Generate",
     "RSCounter": "RS Counter",
+    "RSFrameSplitter": "RS Frame Splitter",
+    "RSFrameCollector": "RS Frame Collector",
 }
 
 # MOSS-TTS nodes — only available if dependencies (transformers, huggingface_hub) are installed
