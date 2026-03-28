@@ -430,20 +430,37 @@ class RSLTXVGenerate:
         noise_mask = get_noise_mask(latent_dict)
 
         guides = []
+        guide_video_latent = None  # Single VAE encode for entire guide video
         if guide_video is not None:
             num_video_frames = guide_video.shape[0]
             # Parse index list if provided, otherwise use every_nth
             if guide_index_list and guide_index_list.strip():
                 indices = [int(x.strip()) for x in guide_index_list.split(",") if x.strip()]
-                # Support negative indices (from end)
                 indices = [i if i >= 0 else num_video_frames + i for i in indices]
                 indices = [i for i in indices if 0 <= i < num_video_frames]
             else:
                 indices = list(range(0, num_video_frames, guide_every_nth))
+
+            # Encode entire guide video in one VAE pass
+            scale_factors = vae.downscale_index_formula
+            time_sf = scale_factors[0]
+            _, _, _, latent_height, latent_width = latent_dict["samples"].shape
+            _, guide_video_latent = LTXVAddGuide.encode(
+                vae, latent_width, latent_height, guide_video, scale_factors
+            )
+            logger.info(f"Video guide: encoded {num_video_frames} frames → latent {list(guide_video_latent.shape)}")
+
+            # Map pixel indices to latent frame indices and slice
             for i in indices:
-                frame = guide_video[i:i+1]  # single frame [1, H, W, C]
-                guides.append((frame, i, guide_strength, f"v2v_{i}"))
-            logger.info(f"Video-to-video: {len(guides)} guide frames at indices {indices}")
+                # Latent frame index: frame 0 → latent 0, frames 1-8 → latent 1, etc.
+                if i == 0:
+                    lat_idx = 0
+                else:
+                    lat_idx = (i - 1) // time_sf + 1
+                lat_idx = min(lat_idx, guide_video_latent.shape[2] - 1)
+                guide_slice = guide_video_latent[:, :, lat_idx:lat_idx+1, :, :]
+                guides.append((guide_slice, i, guide_strength, f"v2v_{i}"))
+            logger.info(f"Video-to-video: {len(guides)} guide latent slices at pixel indices {indices}")
         else:
             if first_image is not None:
                 guides.append((first_image, 0, first_strength, "first"))
@@ -458,14 +475,21 @@ class RSLTXVGenerate:
 
         if guides:
             scale_factors = vae.downscale_index_formula
-            for img, frame_idx, strength_val, label in guides:
+            for guide_entry, frame_idx, strength_val, label in guides:
                 _, _, latent_length, latent_height, latent_width = latent_dict["samples"].shape
 
-                # Use LTXVAddGuide.encode directly (resize + VAE encode, no CRF)
-                _, t = LTXVAddGuide.encode(vae, latent_width, latent_height, img, scale_factors)
+                if guide_video_latent is not None:
+                    # Already encoded — guide_entry is a latent slice
+                    t = guide_entry
+                else:
+                    # Individual image — encode per-frame
+                    _, t = LTXVAddGuide.encode(vae, latent_width, latent_height, guide_entry, scale_factors)
 
+                # guide_length: for pre-encoded latent slices use 1 pixel frame,
+                # for individual images use the actual pixel frame count
+                guide_length = 1 if guide_video_latent is not None else len(guide_entry)
                 frame_idx_actual, latent_idx = LTXVAddGuide.get_latent_index(
-                    positive, latent_length, len(img), frame_idx, scale_factors
+                    positive, latent_length, guide_length, frame_idx, scale_factors
                 )
 
                 logger.info(f"Guide {label}: frame_idx={frame_idx_actual}, latent_idx={latent_idx}, strength={strength_val}")
@@ -795,6 +819,7 @@ class RSLTXVGenerate:
                     # Re-inject all guides at upscaled resolution (crop guides handle
                     # positioning correctly, so multiple guides no longer cause snapping)
                     up_guides = []
+                    up_guide_video_latent = None
                     if guide_video is not None:
                         num_video_frames = guide_video.shape[0]
                         if guide_index_list and guide_index_list.strip():
@@ -803,9 +828,21 @@ class RSLTXVGenerate:
                             up_indices = [i for i in up_indices if 0 <= i < num_video_frames]
                         else:
                             up_indices = list(range(0, num_video_frames, guide_every_nth))
+
+                        # Encode entire guide video in one VAE pass at upscale resolution
+                        _, _, _, up_lat_h, up_lat_w = upsampled.shape
+                        _, up_guide_video_latent = UpGuide.encode(
+                            vae, up_lat_w, up_lat_h, guide_video, up_scale_factors
+                        )
+                        time_sf = up_scale_factors[0]
                         for i in up_indices:
-                            frame = guide_video[i:i+1]
-                            up_guides.append((frame, i, guide_strength, f"v2v_{i}"))
+                            if i == 0:
+                                lat_idx = 0
+                            else:
+                                lat_idx = (i - 1) // time_sf + 1
+                            lat_idx = min(lat_idx, up_guide_video_latent.shape[2] - 1)
+                            guide_slice = up_guide_video_latent[:, :, lat_idx:lat_idx+1, :, :]
+                            up_guides.append((guide_slice, i, guide_strength, f"v2v_{i}"))
                     else:
                         if first_image is not None:
                             up_guides.append((first_image, 0, first_strength, "first"))
@@ -824,13 +861,17 @@ class RSLTXVGenerate:
                         up_latent_dict = {"samples": upsampled}
                         up_noise_mask = up_get_noise_mask(up_latent_dict)
 
-                        for img, frame_idx, strength_val, label in up_guides:
+                        for guide_entry, frame_idx, strength_val, label in up_guides:
                             _, _, latent_length, latent_height, latent_width = up_latent_dict["samples"].shape
 
-                            _, up_t = UpGuide.encode(vae, latent_width, latent_height, img, up_scale_factors)
+                            if up_guide_video_latent is not None:
+                                up_t = guide_entry
+                            else:
+                                _, up_t = UpGuide.encode(vae, latent_width, latent_height, guide_entry, up_scale_factors)
 
+                            guide_length = 1 if up_guide_video_latent is not None else len(guide_entry)
                             frame_idx_actual, latent_idx = UpGuide.get_latent_index(
-                                positive, latent_length, len(img), frame_idx, up_scale_factors
+                                positive, latent_length, guide_length, frame_idx, up_scale_factors
                             )
 
                             logger.info(f"Upscale re-inject {label}: frame_idx={frame_idx_actual}, latent_idx={latent_idx}, strength={strength_val}")

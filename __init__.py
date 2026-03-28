@@ -72,14 +72,14 @@ try:
     from .nodes.moss_tts_loader import RSMossTTSLoader
     NODE_CLASS_MAPPINGS["RSMossTTSLoader"] = RSMossTTSLoader
     NODE_DISPLAY_NAME_MAPPINGS["RSMossTTSLoader"] = "RS MOSS TTS Loader"
-except ImportError:
+except Exception:
     pass
 
 try:
     from .nodes.moss_tts_save import RSMossTTSSave
     NODE_CLASS_MAPPINGS["RSMossTTSSave"] = RSMossTTSSave
     NODE_DISPLAY_NAME_MAPPINGS["RSMossTTSSave"] = "RS MOSS TTS Batch Save"
-except ImportError:
+except Exception:
     pass
 
 # RTX Super Resolution (V3 node) — only available if nvvfx is installed
