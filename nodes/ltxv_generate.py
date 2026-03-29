@@ -89,6 +89,8 @@ class RSLTXVGenerate:
                 "upscale_fallback":  ("BOOLEAN", {"default": False}),
                 "upscale_tiling":    ("BOOLEAN", {"default": False, "tooltip": "Enable temporal tiling for upscale. Reduces VRAM but will cause temporal instability in fine details. Use ffn_chunks instead if possible."}),
                 "upscale_tile_t":    ("INT",     {"default": 4, "min": 0, "max": 256, "step": 1, "tooltip": "Temporal tile size (latent frames) when upscale_tiling is enabled (0 = auto). Reduce if OOM during upscale."}),
+                "rediffusion_mask":  ("MASK", {"tooltip": "Spatial mask for rediffusion. 1=rediffuse (subject), 0=preserve (background). Use RMBG to generate."}),
+                "rediffusion_mask_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Strength of the rediffusion mask. 0=ignore mask (full rediffusion everywhere), 1=full mask effect."}),
                 # Output
                 "decode":            ("BOOLEAN", {"default": True}),
                 "tile_t":            ("INT",     {"default": 0, "min": 0, "max": 256, "step": 1, "tooltip": "Temporal tile size for VAE decode (0 = auto). Lower values reduce VRAM but may cause seams."}),
@@ -179,6 +181,8 @@ class RSLTXVGenerate:
         upscale_fallback=False,
         upscale_tiling=False,
         upscale_tile_t=4,
+        rediffusion_mask=None,
+        rediffusion_mask_strength=1.0,
         # Output
         decode=False,
         tile_t=0,
@@ -231,6 +235,8 @@ class RSLTXVGenerate:
                 upscale_fallback=upscale_fallback,
                 upscale_tiling=upscale_tiling,
                 upscale_tile_t=upscale_tile_t,
+                rediffusion_mask=rediffusion_mask,
+                rediffusion_mask_strength=rediffusion_mask_strength,
                 decode=decode, tile_t=tile_t,
                 guider=guider, sampler=sampler, sigmas=sigmas,
                 max_shift=max_shift, base_shift=base_shift,
@@ -257,6 +263,7 @@ class RSLTXVGenerate:
         upscale, upscale_model, temporal_upscale_model, upscale_lora, upscale_lora_strength,
         upscale_steps, upscale_cfg, upscale_denoise, upscale_fallback,
         upscale_tiling, upscale_tile_t,
+        rediffusion_mask, rediffusion_mask_strength,
         decode, tile_t,
         guider, sampler, sigmas,
         max_shift, base_shift,
@@ -585,6 +592,10 @@ class RSLTXVGenerate:
             tokens = math.prod(latent_samples_ref.shape[2:])
 
         x1, x2 = 1024, 4096
+        # Clamp tokens to prevent schedule collapse at high resolutions.
+        # The linear shift formula is calibrated for x1–x2; beyond ~8k tokens
+        # exp(shift) dominates and sigmas compress to ~1.0 (no denoising).
+        tokens = min(tokens, x2 * 2)
         mm_shift = (max_shift - base_shift) / (x2 - x1)
         b = base_shift - mm_shift * x1
         shift = tokens * mm_shift + b
@@ -924,7 +935,7 @@ class RSLTXVGenerate:
 
                         if has_image_guides:
                             # I2V: compute shift from upscaled latent tokens
-                            up_tokens = math.prod(upsampled.shape[2:])
+                            up_tokens = min(math.prod(upsampled.shape[2:]), x2 * 2)
                             up_shift = up_tokens * mm_shift + b
                             logger.info(f"Upscale shift: tokens={up_tokens}, shift={up_shift:.3f}")
 
@@ -949,7 +960,7 @@ class RSLTXVGenerate:
                         else:
                             # T2V: same computed sigma schedule as I2V, with correct
                             # shift from actual token count.
-                            up_tokens = math.prod(upsampled.shape[2:])
+                            up_tokens = min(math.prod(upsampled.shape[2:]), x2 * 2)
                             up_shift = up_tokens * mm_shift + b
                             logger.info(f"T2V upscale: tokens={up_tokens}, shift={up_shift:.3f}")
 
@@ -992,6 +1003,25 @@ class RSLTXVGenerate:
                         up_latent_image = comfy.sample.fix_empty_latent_channels(up_guider.model_patcher, up_combined)
                         up_noise = comfy.sample.prepare_noise(up_latent_image, seed + 1)
                         up_sampler = getattr(guider, 'ic_lora_sampler', None) or comfy.samplers.sampler_object("euler_ancestral")
+
+                        # Apply rediffusion mask: modulate noise_mask so masked-out
+                        # regions (background) are preserved from the first pass.
+                        if rediffusion_mask is not None:
+                            _, _, _, up_lat_h, up_lat_w = upsampled.shape
+                            # Create noise_mask if none exists from guides
+                            if up_noise_mask is None:
+                                up_noise_mask = torch.ones(
+                                    upsampled.shape[0], 1, upsampled.shape[2], up_lat_h, up_lat_w,
+                                    device=upsampled.device, dtype=upsampled.dtype,
+                                )
+                            # Handle NestedTensor (AV model) — apply mask to video portion only
+                            if up_noise_mask.is_nested:
+                                vid_nm, aud_nm = up_noise_mask.unbind()
+                                vid_nm = self._apply_rediffusion_mask(vid_nm, rediffusion_mask, rediffusion_mask_strength, up_lat_h, up_lat_w)
+                                up_noise_mask = comfy.nested_tensor.NestedTensor((vid_nm, aud_nm))
+                            else:
+                                up_noise_mask = self._apply_rediffusion_mask(up_noise_mask, rediffusion_mask, rediffusion_mask_strength, up_lat_h, up_lat_w)
+                            logger.info(f"Applied rediffusion mask (strength={rediffusion_mask_strength})")
 
                         # Determine temporal tiling for re-diffusion
                         video_t = upsampled.shape[2]
@@ -1238,7 +1268,7 @@ class RSLTXVGenerate:
                             up_model, _ = comfy.sd.load_lora_for_models(up_model, None, lora, upscale_lora_strength, 0)
                             logger.info(f"Applied upscale LoRA: {upscale_lora} (strength={upscale_lora_strength})")
 
-                        up_tokens = math.prod(upsampled.shape[2:])
+                        up_tokens = min(math.prod(upsampled.shape[2:]), x2 * 2)
                         up_shift = up_tokens * mm_shift + b
                         logger.info(f"Pass 3 shift: tokens={up_tokens}, shift={up_shift:.3f}")
 
@@ -1347,7 +1377,7 @@ class RSLTXVGenerate:
                             self.loaded_lora = (lora_path, lora)
                         p2_model, _ = comfy.sd.load_lora_for_models(p2_model, None, lora, upscale_lora_strength, 0)
 
-                    p2_tokens = math.prod(video_latent.shape[2:])
+                    p2_tokens = min(math.prod(video_latent.shape[2:]), x2 * 2)
                     p2_shift = p2_tokens * mm_shift + b
                     p2_ms = ModelSamplingAdvanced(p2_model.model.model_config)
                     p2_ms.set_parameters(shift=p2_shift)
@@ -1427,6 +1457,164 @@ class RSLTXVGenerate:
                 output_latent = pre_upscale_latent
                 decode = True
 
+        # ----------------------------------------------------------------
+        # 7b. MASKED REDIFFUSION (no upscale — full-res first pass + selective rediffusion)
+        # ----------------------------------------------------------------
+
+        if not do_upscale and rediffusion_mask is not None and upscale_denoise > 0 and upscale_steps > 0:
+            logger.info(f"Masked rediffusion: {upscale_steps} steps, denoise={upscale_denoise}, cfg={upscale_cfg}")
+            self._free_vram()
+
+            rd_latent = output_latent["samples"]
+
+            # Build noise_mask: ones everywhere (all regions eligible for denoise),
+            # then modulate by the rediffusion mask
+            rd_noise_mask = torch.ones(
+                rd_latent.shape[0], 1, rd_latent.shape[2], rd_latent.shape[3], rd_latent.shape[4],
+                device=rd_latent.device, dtype=rd_latent.dtype,
+            )
+            rd_noise_mask = self._apply_rediffusion_mask(rd_noise_mask, rediffusion_mask, rediffusion_mask_strength)
+
+            # Compute shift + sigmas from current latent tokens
+            rd_tokens = min(math.prod(rd_latent.shape[2:]), x2 * 2)
+            rd_shift = rd_tokens * mm_shift + b
+            logger.info(f"Masked rediffusion shift: tokens={rd_tokens}, shift={rd_shift:.3f}")
+
+            rd_model = m.clone()
+
+            # Apply upscale LoRA if specified
+            if upscale_lora and upscale_lora != "none" and upscale_lora_strength != 0:
+                lora_path = folder_paths.get_full_path_or_raise("loras", upscale_lora)
+                lora = None
+                if self.loaded_lora is not None and self.loaded_lora[0] == lora_path:
+                    lora = self.loaded_lora[1]
+                if lora is None:
+                    lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+                    self.loaded_lora = (lora_path, lora)
+                rd_model, _ = comfy.sd.load_lora_for_models(rd_model, None, lora, upscale_lora_strength, 0)
+                logger.info(f"Applied rediffusion LoRA: {upscale_lora} (strength={upscale_lora_strength})")
+
+            rd_model_sampling = ModelSamplingAdvanced(rd_model.model.model_config)
+            rd_model_sampling.set_parameters(shift=rd_shift)
+            rd_model.add_object_patch("model_sampling", rd_model_sampling)
+
+            # Build sigma schedule
+            exp_shift = math.exp(rd_shift)
+            t = torch.linspace(1.0, 0.0, upscale_steps + 1, dtype=torch.float64)
+            non_zero = t != 0
+            inv_t_m1 = torch.where(non_zero, 1.0 / t - 1.0, torch.zeros_like(t))
+            omz = torch.where(non_zero, inv_t_m1 / (exp_shift + inv_t_m1), torch.ones_like(t))
+            nz_omz = omz[non_zero]
+            sf = nz_omz[-1] / (1.0 - 0.1)
+            omz[non_zero] = nz_omz / sf
+            rd_sig = torch.where(non_zero, 1.0 - omz, torch.zeros_like(omz)).float()
+
+            # Trim to denoise strength
+            start_step = int((1.0 - upscale_denoise) * upscale_steps)
+            rd_sig = rd_sig[start_step:]
+            logger.info(f"Masked rediffusion sigmas ({len(rd_sig)}): {rd_sig.tolist()}")
+
+            # Re-inject guides for the rediffusion pass
+            from comfy_extras.nodes_lt import LTXVAddGuide as RdGuide, get_noise_mask as rd_get_noise_mask
+
+            rd_guides = []
+            rd_guide_video_latent = None
+            if guide_video is not None:
+                num_video_frames = guide_video.shape[0]
+                if guide_index_list and guide_index_list.strip():
+                    rd_indices = [int(x.strip()) for x in guide_index_list.split(",") if x.strip()]
+                    rd_indices = [i if i >= 0 else num_video_frames + i for i in rd_indices]
+                    rd_indices = [i for i in rd_indices if 0 <= i < num_video_frames]
+                else:
+                    rd_indices = list(range(0, num_video_frames, guide_every_nth))
+
+                rd_scale_factors = vae.downscale_index_formula
+                _, _, _, rd_lat_h, rd_lat_w = rd_latent.shape
+                _, rd_guide_video_latent = RdGuide.encode(
+                    vae, rd_lat_w, rd_lat_h, guide_video, rd_scale_factors
+                )
+                time_sf = rd_scale_factors[0]
+                for i in rd_indices:
+                    if i == 0:
+                        lat_idx = 0
+                    else:
+                        lat_idx = (i - 1) // time_sf + 1
+                    lat_idx = min(lat_idx, rd_guide_video_latent.shape[2] - 1)
+                    guide_slice = rd_guide_video_latent[:, :, lat_idx:lat_idx+1, :, :]
+                    rd_guides.append((guide_slice, i, guide_strength, f"v2v_{i}"))
+            else:
+                if first_image is not None:
+                    rd_guides.append((first_image, 0, first_strength, "first"))
+                if middle_image is not None:
+                    mid_idx = (num_frames - 1) // 2
+                    mid_idx = max(0, (mid_idx // 8) * 8)
+                    if mid_idx == 0 and num_frames > 8:
+                        mid_idx = 8
+                    rd_guides.append((middle_image, mid_idx, middle_strength, "middle"))
+                if last_image is not None:
+                    rd_guides.append((last_image, -1, last_strength, "last"))
+
+            if rd_guides:
+                rd_scale_factors = vae.downscale_index_formula
+                rd_latent_dict = {"samples": rd_latent}
+                rd_guide_noise_mask = rd_get_noise_mask(rd_latent_dict)
+
+                for guide_entry, frame_idx, strength_val, label in rd_guides:
+                    _, _, latent_length, latent_height, latent_width = rd_latent_dict["samples"].shape
+
+                    if rd_guide_video_latent is not None:
+                        rd_t = guide_entry
+                    else:
+                        _, rd_t = RdGuide.encode(vae, latent_width, latent_height, guide_entry, rd_scale_factors)
+
+                    guide_length = 1 if rd_guide_video_latent is not None else len(guide_entry)
+                    frame_idx_actual, latent_idx = RdGuide.get_latent_index(
+                        positive, latent_length, guide_length, frame_idx, rd_scale_factors
+                    )
+
+                    logger.info(f"Masked rediff guide {label}: frame_idx={frame_idx_actual}, latent_idx={latent_idx}")
+
+                    positive, negative, rd_latent_samples, rd_guide_noise_mask = RdGuide.append_keyframe(
+                        positive, negative, frame_idx_actual,
+                        rd_latent_dict["samples"], rd_guide_noise_mask,
+                        rd_t, strength_val, rd_scale_factors,
+                    )
+                    rd_latent_dict = {"samples": rd_latent_samples, "noise_mask": rd_guide_noise_mask}
+
+                rd_latent = rd_latent_dict["samples"]
+                # Apply rediffusion mask to the guide noise mask
+                _, _, _, rd_lat_h, rd_lat_w = rd_latent.shape
+                rd_noise_mask = self._apply_rediffusion_mask(rd_guide_noise_mask, rediffusion_mask, rediffusion_mask_strength, rd_lat_h, rd_lat_w)
+
+            # Build guider
+            rd_guider = comfy.samplers.CFGGuider(rd_model)
+            rd_guider.set_conds(positive, negative)
+            rd_guider.set_cfg(upscale_cfg)
+
+            rd_latent_image = comfy.sample.fix_empty_latent_channels(rd_guider.model_patcher, rd_latent)
+            rd_noise = comfy.sample.prepare_noise(rd_latent_image, seed + 1)
+            rd_sampler = comfy.samplers.sampler_object("euler_ancestral")
+
+            rd_callback = latent_preview.prepare_callback(rd_guider.model_patcher, rd_sig.shape[-1] - 1)
+            rd_samples = rd_guider.sample(
+                rd_noise, rd_latent_image, rd_sampler, rd_sig,
+                denoise_mask=rd_noise_mask,
+                callback=rd_callback,
+                disable_pbar=disable_pbar,
+                seed=seed + 1,
+            )
+            rd_samples = rd_samples.to(mm.intermediate_device())
+
+            # Crop appended guide frames
+            _, rd_num_keyframes = get_keyframe_idxs(positive)
+            if rd_num_keyframes > 0:
+                rd_samples = rd_samples[:, :, :-rd_num_keyframes]
+                positive = node_helpers.conditioning_set_values(positive, {"keyframe_idxs": None})
+                negative = node_helpers.conditioning_set_values(negative, {"keyframe_idxs": None})
+
+            output_latent = {"samples": rd_samples}
+            logger.info("Masked rediffusion complete")
+
         # Free model clones to reclaim CPU RAM from offloaded weights
         del m
         self._free_vram()
@@ -1439,7 +1627,9 @@ class RSLTXVGenerate:
             logger.info("Decoding latents to images (tiled)")
             compression = vae.spacial_compression_decode()
             tile_size = 512 // compression
-            overlap = 128 // compression  # larger overlap to reduce tile seams
+            # Scale overlap with resolution: ~25% of tile_size, clamped to [4, 8] latent pixels
+            lat_max_dim = max(output_latent["samples"].shape[3], output_latent["samples"].shape[4])
+            overlap = min(8, max(4, lat_max_dim // 8))
             temporal_compression = vae.temporal_compression_decode()
             if tile_t > 0:
                 # User override
@@ -1452,9 +1642,10 @@ class RSLTXVGenerate:
                 decode_tile_t = None
                 overlap_t = None
 
-            # Add tiny noise to break up tile boundary artifacts
+            # Add tiny noise to break up tile boundary artifacts, scaled with resolution
             samples = output_latent["samples"]
-            samples = samples + torch.randn_like(samples) * 1e-5
+            noise_scale = 1e-5 + (lat_max_dim / 60.0) * 3e-4  # ~1e-5 at 540p, ~3e-4 at 1080p
+            samples = samples + torch.randn_like(samples) * noise_scale
 
             images = vae.decode_tiled(
                 samples,
@@ -1582,6 +1773,38 @@ class RSLTXVGenerate:
         up_guider.ic_lora_sampler = ci.get("_ic_lora_sampler", None)
         logger.info("IC-LoRA guider rebuilt for upscale (deferred encoding)")
         return up_guider
+
+    @staticmethod
+    def _apply_rediffusion_mask(noise_mask, mask, strength=1.0, latent_h=None, latent_w=None):
+        """Multiply noise_mask by a spatial mask resized to latent dims.
+
+        noise_mask: [B, 1, T, H, W] — existing rediffusion mask (may have 1x1 spatial)
+        mask: [H, W] or [B, H, W] — pixel-space subject mask (1=rediffuse, 0=preserve)
+        strength: 0.0 = ignore mask entirely, 1.0 = full mask effect
+        latent_h/latent_w: actual latent spatial dims (required when noise_mask is 1x1)
+        """
+        import torch.nn.functional as F
+
+        # Ensure 2D → [1, 1, H, W] for interpolation
+        if mask.ndim == 2:
+            m = mask.unsqueeze(0).unsqueeze(0)
+        elif mask.ndim == 3:
+            m = mask[:1].unsqueeze(0)  # take first batch, add channel dim
+        else:
+            m = mask
+
+        # Use explicit latent dims if provided, otherwise read from noise_mask
+        if latent_h is None or latent_w is None:
+            _, _, _, latent_h, latent_w = noise_mask.shape
+        m = F.interpolate(m.float(), size=(latent_h, latent_w), mode="bilinear", align_corners=False)
+
+        # Blend: strength=1 → full mask, strength=0 → all ones (no masking)
+        m = m * strength + (1.0 - strength)
+
+        # Broadcast: [1, 1, 1, H, W] — applies uniformly across time and channels
+        m = m.unsqueeze(2).to(device=noise_mask.device, dtype=noise_mask.dtype)
+
+        return noise_mask * m
 
     def _free_vram(self):
         """Unload models and flush all VRAM/RAM caches."""
