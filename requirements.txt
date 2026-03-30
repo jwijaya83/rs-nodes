@@ -1,2 +1,1 @@
 openai-whisper
-protobuf>=6.31.1

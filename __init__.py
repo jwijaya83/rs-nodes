@@ -17,7 +17,6 @@ from .nodes.z_image_generate import RSZImageGenerate
 from .nodes.counter import RSCounter
 from .nodes.frame_splitter import RSFrameSplitter
 from .nodes.frame_collector import RSFrameCollector
-from .nodes.gemini_generate import RSGeminiGenerate
 
 WEB_DIRECTORY = "./web"
 
@@ -41,7 +40,6 @@ NODE_CLASS_MAPPINGS = {
     "RSCounter": RSCounter,
     "RSFrameSplitter": RSFrameSplitter,
     "RSFrameCollector": RSFrameCollector,
-    "RSGeminiGenerate": RSGeminiGenerate,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -64,7 +62,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSCounter": "RS Counter",
     "RSFrameSplitter": "RS Frame Splitter",
     "RSFrameCollector": "RS Frame Collector",
-    "RSGeminiGenerate": "RS Gemini Generate",
 }
 
 # MOSS-TTS nodes — only available if dependencies (transformers, huggingface_hub) are installed
