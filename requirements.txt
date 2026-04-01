@@ -1,1 +1,9 @@
 openai-whisper
+peft>=0.14.0
+accelerate>=1.2.1
+optimum-quanto>=0.2.6
+bitsandbytes>=0.45.2
+sentencepiece>=0.2.0
+pydantic>=2.10.4
+pyyaml
+pillow-heif

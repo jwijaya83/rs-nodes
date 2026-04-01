@@ -17,6 +17,8 @@ from .nodes.z_image_generate import RSZImageGenerate
 from .nodes.counter import RSCounter
 from .nodes.frame_splitter import RSFrameSplitter
 from .nodes.frame_collector import RSFrameCollector
+from .nodes.ltxv_prepare_dataset import RSLTXVPrepareDataset
+from .nodes.ltxv_train_lora import RSLTXVTrainLoRA
 
 WEB_DIRECTORY = "./web"
 
@@ -40,6 +42,8 @@ NODE_CLASS_MAPPINGS = {
     "RSCounter": RSCounter,
     "RSFrameSplitter": RSFrameSplitter,
     "RSFrameCollector": RSFrameCollector,
+    "RSLTXVPrepareDataset": RSLTXVPrepareDataset,
+    "RSLTXVTrainLoRA": RSLTXVTrainLoRA,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -62,6 +66,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSCounter": "RS Counter",
     "RSFrameSplitter": "RS Frame Splitter",
     "RSFrameCollector": "RS Frame Collector",
+    "RSLTXVPrepareDataset": "RS LTXV Prepare Dataset",
+    "RSLTXVTrainLoRA": "RS LTXV Train LoRA",
 }
 
 # MOSS-TTS nodes — only available if dependencies (transformers, huggingface_hub) are installed
