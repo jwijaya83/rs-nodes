@@ -96,6 +96,7 @@ class RSLTXVTrainLoRA:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "LTX-2 model loaded via CheckpointLoaderSimple"}),
+                "output_name": ("STRING", {"default": "my_lora", "tooltip": "Name for the output LoRA file (without extension)"}),
                 "preprocessed_data_root": ("STRING", {"default": "", "tooltip": "Path output by RSLTXVPrepareDataset"}),
                 "model_path": (checkpoints, {"tooltip": "LTX-2 safetensors checkpoint (used to load EmbeddingsProcessor and VAE)"}),
             },
@@ -144,7 +145,9 @@ class RSLTXVTrainLoRA:
                 "keep_last_n":         ("INT",   {"default": 2,   "min": -1, "max": 100,
                                                   "tooltip": "-1 = keep all"}),
                 # Resume
-                "resume_checkpoint": ("STRING", {"default": "", "tooltip": "Path to a .safetensors LoRA checkpoint to resume from"}),
+                "resume": ("BOOLEAN", {"default": False, "tooltip": "Resume from latest checkpoint in output directory"}),
+                # Debug
+                "validation_only": ("BOOLEAN", {"default": False, "tooltip": "TEMP: Skip training, just run one validation step using latest checkpoint"}),
             },
         }
 
@@ -159,6 +162,23 @@ class RSLTXVTrainLoRA:
         # Always re-execute — training is never cacheable
         return float("nan")
 
+    @staticmethod
+    def _find_latest_checkpoint(output_dir: Path) -> str:
+        """Find the checkpoint with the highest step number."""
+        import re
+        ckpt_dir = output_dir / "checkpoints"
+        if not ckpt_dir.is_dir():
+            return ""
+        best_step, best_path = -1, ""
+        for f in ckpt_dir.glob("lora_weights_step_*.safetensors"):
+            m = re.search(r"step_(\d+)", f.stem)
+            if m and int(m.group(1)) > best_step:
+                best_step = int(m.group(1))
+                best_path = str(f)
+        if best_path:
+            print(f"Auto-resume: found latest checkpoint at step {best_step}")
+        return best_path
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -166,6 +186,7 @@ class RSLTXVTrainLoRA:
     def train(
         self,
         model,
+        output_name: str,
         preprocessed_data_root: str,
         model_path: str,
         preset: str = "subject",
@@ -197,7 +218,8 @@ class RSLTXVTrainLoRA:
         validation_frames: int = 49,
         checkpoint_interval: int = 500,
         keep_last_n: int = 2,
-        resume_checkpoint: str = "",
+        resume: bool = False,
+        validation_only: bool = False,
         vae=None,
     ):
         validate_submodule()
@@ -223,10 +245,17 @@ class RSLTXVTrainLoRA:
         output_dir = data_root.parent / "training_output"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        loras_dir = Path(folder_paths.get_folder_paths("loras")[0])
+        # Use the loras folder that already has files (extra_model_paths), fall back to first
+        lora_paths = folder_paths.get_folder_paths("loras")
+        loras_dir = Path(lora_paths[0])
+        for p in lora_paths:
+            pp = Path(p)
+            if pp.is_dir() and any(pp.iterdir()):
+                loras_dir = pp
+                break
         loras_dir.mkdir(parents=True, exist_ok=True)
 
-        lora_name = data_root.parent.name
+        lora_name = output_name.strip() or data_root.parent.name
 
         # Make sure ltx packages are importable
         _setup_ltx_paths()
@@ -300,10 +329,21 @@ class RSLTXVTrainLoRA:
                 cached_validation_embeddings = None
                 validation_config = None
 
-        # ---- Step 4: free all other VRAM so training has headroom ----
+        # ---- Step 4: free all other VRAM and RAM so training has headroom ----
         # Aggressively unload everything from GPU. The transformer will be moved
         # back to GPU by the InProcessTrainer after quantization + LoRA setup.
         mm.unload_all_models()
+
+        # Destroy CLIP weights — no longer needed (validation embeddings are cached).
+        # This frees ~24 GB RAM (Gemma 12B). User must reload checkpoint after
+        # training anyway (quantization is in-place).
+        if clip is not None:
+            try:
+                clip.patcher.model.to("meta")
+            except Exception:
+                pass
+            clip = None
+
         # Explicitly move ComfyUI components to CPU
         if vae is not None:
             try:
@@ -321,6 +361,7 @@ class RSLTXVTrainLoRA:
         gc.collect()
         torch.cuda.empty_cache()
         logger.info(f"VRAM freed. GPU memory: {torch.cuda.memory_allocated() / 1024**3:.1f} GB")
+        logger.info(f"RAM usage: {__import__('psutil').Process().memory_info().rss / 1024**3:.1f} GB")
 
         # ---- Step 5: load VAE decoder for validation ----
         if vae is not None:
@@ -417,7 +458,7 @@ class RSLTXVTrainLoRA:
             audio_vae_decoder=audio_vae_decoder,
             vocoder=vocoder,
             seed=42,
-            resume_checkpoint=resume_checkpoint,
+            resume_checkpoint=self._find_latest_checkpoint(output_dir) if resume else "",
             layer_offloading=True,
         )
 
@@ -431,9 +472,14 @@ class RSLTXVTrainLoRA:
             # Training requires autograd, so we must fully exit inference mode for
             # the entire training run.  This is the outermost exit point — all
             # tensors created inside will be normal (non-inference) tensors.
-            with torch.inference_mode(False):
-                lora_path = trainer.train(progress_bar=pbar, cancel_check=cancel_check)
-            status = f"Training complete! {steps} steps. LoRA saved to: {lora_path}"
+            if validation_only:
+                device = mm.get_torch_device()
+                trainer.run_validation_only(device)
+                status = "Validation-only run complete."
+            else:
+                with torch.inference_mode(False):
+                    lora_path = trainer.train(progress_bar=pbar, cancel_check=cancel_check)
+                status = f"Training complete! {steps} steps. LoRA saved to: {lora_path}"
         except Exception as e:
             status = f"Training failed: {e}"
             logger.error(f"Training failed: {e}", exc_info=True)

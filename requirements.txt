@@ -1,4 +1,5 @@
 openai-whisper
+transformers>=4.46.0,<5
 peft>=0.14.0
 accelerate>=1.2.1
 optimum-quanto>=0.2.6

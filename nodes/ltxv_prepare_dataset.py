@@ -302,6 +302,7 @@ class RSLTXVPrepareDataset:
                 "resolution_buckets": ("STRING", {"default": "576x576x49", "tooltip": "WxHxF resolution buckets, semicolon-separated (e.g. '576x576x49;768x512x25')"}),
                 "lora_trigger": ("STRING", {"default": "", "tooltip": "Trigger word prepended to all captions"}),
                 "caption_mode": (["ollama", "skip", "auto_filename"], {"default": "ollama", "tooltip": "ollama=vision model captions, skip=use filenames, auto_filename=clean filenames"}),
+                "caption_style": (["subject", "subject + style", "style", "motion", "general"], {"default": "subject", "tooltip": "Captioning focus: subject=person identity, subject+style=person+cinematography, style=visual aesthetics only, motion=movement/action, general=balanced"}),
                 "ollama_url": ("STRING", {"default": "http://localhost:11434", "tooltip": "Ollama server URL (only used when caption_mode=ollama)"}),
                 "ollama_model": ("STRING", {"default": "gemma3:27b", "tooltip": "Ollama vision model for captioning (only used when caption_mode=ollama)"}),
                 "with_audio": ("BOOLEAN", {"default": False, "tooltip": "Extract and encode audio latents"}),
@@ -335,6 +336,7 @@ class RSLTXVPrepareDataset:
         resolution_buckets: str = "576x576x49",
         lora_trigger: str = "",
         caption_mode: str = "ollama",
+        caption_style: str = "subject",
         ollama_url: str = "http://localhost:11434",
         ollama_model: str = "gemma3:27b",
         with_audio: bool = False,
@@ -519,10 +521,15 @@ class RSLTXVPrepareDataset:
         self._caption_dataset_json(
             dataset_json_path, clip_paths, caption_mode, lora_trigger,
             ollama_url=ollama_url, ollama_model=ollama_model,
-            target_face_b64=target_face_b64,
+            target_face_b64=target_face_b64, caption_style=caption_style,
         )
 
         # --- PHASE 3: Encode conditions and latents ---
+        # Reload entries from JSON — captioning may have rejected some clips,
+        # and existing_entries in memory still has the pre-rejection list.
+        with open(dataset_json_path) as f:
+            existing_entries = json.load(f)
+
         conditions_dir = output_dir / "conditions"
         latents_dir = output_dir / "latents"
         need_subprocess = False
@@ -1023,6 +1030,7 @@ class RSLTXVPrepareDataset:
         ollama_url: str = "",
         ollama_model: str = "",
         target_face_b64: str | None = None,
+        caption_style: str = "subject",
     ):
         """Caption entries in the dataset JSON. Reads existing JSON, skips
         already-captioned entries, saves incrementally after each new caption.
@@ -1055,6 +1063,7 @@ class RSLTXVPrepareDataset:
                 caption = self._caption_with_ollama(
                     vf, ollama_url, ollama_model, lora_trigger,
                     target_face_b64=target_face_b64,
+                    caption_style=caption_style,
                 )
 
                 # LLM QC: if it returned MISMATCH, remove this entry and track it
@@ -1109,7 +1118,7 @@ class RSLTXVPrepareDataset:
 
     def _caption_with_ollama(
         self, clip_path: Path, ollama_url: str, ollama_model: str, lora_trigger: str,
-        target_face_b64: str | None = None,
+        target_face_b64: str | None = None, caption_style: str = "subject",
     ) -> str:
         """Caption a clip frame via Ollama. If target_face_b64 is provided,
         first verifies the person matches (separate call), then captions clean.
@@ -1146,14 +1155,63 @@ class RSLTXVPrepareDataset:
                 f" Start the caption with '{lora_trigger}'."
             )
 
-        system_prompt = (
-            "You are a video training caption generator."
-            " Describe what you see in a single detailed paragraph."
-            " Focus on: the subject's appearance, expression, "
-            "pose, clothing, lighting, background, and camera angle. Be factual and specific. "
-            "Do not use poetic language or speculation. Do not start with 'The image shows' or "
-            "'In this frame'." + trigger_instruction
-        )
+        _CAPTION_PROMPTS = {
+            "subject": (
+                "You are a video training caption generator for character/subject learning."
+                " Describe what you see in a single detailed paragraph."
+                " Describe in detail: lighting, color grading, background, environment, "
+                "camera angle, pose, expression, and clothing."
+                " Do NOT describe the subject's defining physical features (face shape, hair color/style, "
+                "skin tone, eye color, body type) — the trigger word handles identity."
+                " Be factual and specific. "
+                "Do not use poetic language or speculation. Do not start with 'The image shows' or "
+                "'In this frame'."
+            ),
+            "subject + style": (
+                "You are a video training caption generator for character + style learning."
+                " Describe what you see in a single detailed paragraph."
+                " Describe: background, environment, camera angle, pose, expression, and clothing."
+                " Do NOT describe the subject's defining physical features (face shape, hair color/style, "
+                "skin tone, eye color, body type) — the trigger word handles identity."
+                " Do NOT describe lighting, color grading, contrast, shadows, film grain, "
+                "depth of field, or visual mood — the LoRA should learn the visual style."
+                " Be factual and specific. "
+                "Do not use poetic language or speculation. Do not start with 'The image shows' or "
+                "'In this frame'."
+            ),
+            "style": (
+                "You are a video training caption generator for visual style learning."
+                " Describe what you see in a single detailed paragraph."
+                " Describe the scene content: subjects, people, objects, actions, setting, "
+                "and composition."
+                " Do NOT describe the visual treatment — no lighting style, color grading, contrast, "
+                "shadows, highlights, film grain, texture, depth of field, or visual mood."
+                " The LoRA should learn all visual style characteristics."
+                " Be factual and specific. "
+                "Do not use poetic language or speculation. Do not start with 'The image shows' or "
+                "'In this frame'."
+            ),
+            "motion": (
+                "You are a video training caption generator for motion learning."
+                " Describe what you see in a single detailed paragraph."
+                " Describe: the subject's appearance, setting, lighting, and background."
+                " Do NOT describe camera movement (pan, tilt, dolly, zoom, tracking), "
+                "subject motion, speed, or direction of movement — the LoRA should learn motion."
+                " Be factual and specific. "
+                "Do not use poetic language or speculation. Do not start with 'The image shows' or "
+                "'In this frame'."
+            ),
+            "general": (
+                "You are a video training caption generator."
+                " Describe what you see in a single detailed paragraph."
+                " Give a balanced description covering: subjects, actions, setting, "
+                "lighting, composition, and camera angle. Be factual and specific. "
+                "Do not use poetic language or speculation. Do not start with 'The image shows' or "
+                "'In this frame'."
+            ),
+        }
+
+        system_prompt = _CAPTION_PROMPTS.get(caption_style, _CAPTION_PROMPTS["subject"]) + trigger_instruction
 
         payload = json.dumps({
             "model": ollama_model,

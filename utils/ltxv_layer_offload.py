@@ -38,7 +38,12 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         # Clone inputs BEFORE the block mutates them in-place (addcmul_ etc.)
         # IMPORTANT: always clone both — never return an input tensor from
         # a custom Function (PyTorch forbids it and silently breaks the graph).
-        ctx.save_for_backward(vx.detach().clone(), ax.detach().clone())
+        # Save on CPU — all 48 blocks' saved tensors coexist during forward,
+        # and keeping them on GPU would accumulate ~5 GB of hidden states.
+        ctx.save_for_backward(
+            vx.detach().clone().to("cpu", non_blocking=True),
+            ax.detach().clone().to("cpu", non_blocking=True),
+        )
         ctx.block = block
         ctx.block_kwargs = block_kwargs
         ctx.device = device
@@ -64,6 +69,9 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         has_audio = ctx.has_audio
 
         block.to(device, non_blocking=True)
+        # Move saved hidden states back to GPU for recomputation
+        saved_vx = saved_vx.to(device, non_blocking=True)
+        saved_ax = saved_ax.to(device, non_blocking=True)
         torch.cuda.synchronize(device)
 
         # Create non-leaf tensors with grad tracking.

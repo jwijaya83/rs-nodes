@@ -354,13 +354,14 @@ class InProcessTrainer:
                 lr = self._optimizer.param_groups[0]["lr"]
                 print(f"Step {step}/{self._total_steps}  loss={loss_val:.4f}  lr={lr:.2e}")
 
-            # Validation
+            # Validation (save checkpoint first so progress is safe)
             if (
                 self._validation_config is not None
                 and self._cached_validation_embeddings is not None
                 and self._validation_config.get("interval", 0) > 0
                 and step % self._validation_config["interval"] == 0
             ):
+                self._save_checkpoint(step)
                 self._run_validation(step, device)
 
             # Checkpoint
@@ -512,9 +513,9 @@ class InProcessTrainer:
                     device=child.weight.device,
                     dtype=child.weight.dtype,
                 )
-                replacement.weight = child.weight
+                replacement.weight = torch.nn.Parameter(child.weight) if not isinstance(child.weight, torch.nn.Parameter) else child.weight
                 if child.bias is not None:
-                    replacement.bias = child.bias
+                    replacement.bias = torch.nn.Parameter(child.bias) if not isinstance(child.bias, torch.nn.Parameter) else child.bias
                 setattr(module, name, replacement)
 
     def _patch_rope_for_training(self) -> None:
@@ -702,7 +703,17 @@ class InProcessTrainer:
         state_dict = {k.replace("diffusion_model.", "", 1): v for k, v in state_dict.items()}
         base_model = self._transformer.get_base_model()
         set_peft_model_state_dict(base_model, state_dict)
-        logger.info(f"Resumed from checkpoint: {ckpt_path}")
+
+        # Restore step counter from checkpoint filename or metadata
+        import re
+        step_match = re.search(r"step_(\d+)", ckpt_path.stem)
+        if step_match:
+            self._global_step = int(step_match.group(1))
+        elif "step" in (load_file(str(ckpt_path), metadata=True) or {}):
+            self._global_step = int(load_file(str(ckpt_path), metadata=True)["step"])
+
+        logger.info(f"Resumed from checkpoint: {ckpt_path} (step {self._global_step})")
+        print(f"Resumed from checkpoint: {ckpt_path} (step {self._global_step})")
 
     def _training_step(self, batch: dict, device: torch.device) -> torch.Tensor:
         """Run one forward pass and return scalar loss tensor.
@@ -939,95 +950,169 @@ class InProcessTrainer:
                 old.unlink()
                 logger.debug(f"Removed old checkpoint: {old.name}")
 
-    def _run_validation(self, step: int, device: torch.device) -> None:
-        """Generate validation video(s) and save to output_dir/samples/."""
-        from ltx_trainer.validation_sampler import CachedPromptEmbeddings, GenerationConfig, ValidationSampler
-        from ltx_trainer.video_utils import save_video
+    def run_validation_only(self, device: torch.device) -> None:
+        """Run a single validation with full training setup (LoRA, quantization, etc).
 
+        Mirrors the exact same model state as during training.
+        """
+        # Full setup identical to train()
+        self._apply_lora()
+        if self._quantization is not None:
+            self._quantize_base_model()
+        self._freeze_non_lora_params()
+        if self._resume_checkpoint:
+            self._load_resume_checkpoint()
+
+        if self._layer_offloading:
+            from .ltxv_layer_offload import setup_layer_offloading
+            self._transformer.eval()
+            setup_layer_offloading(self._transformer, device)
+        else:
+            self._transformer.to(device)
+            self._transformer.eval()
+
+        self._run_validation(self._global_step, device)
+
+    def _run_validation(self, step: int, device: torch.device) -> None:
+        """Generate a validation sample using the layer-offloaded model.
+
+        Does NOT use ltx_trainer's ValidationSampler (which tries to load the
+        full model to GPU).  Instead runs a simple Euler flow-matching loop
+        through our monkey-patched forward that streams blocks one at a time.
+        """
         cfg = self._validation_config
         cached = self._cached_validation_embeddings
-
-        # Offload transformer to CPU to free VRAM for VAE decode
-        self._transformer.to("cpu")
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # Move VAE decoder to GPU
-        self._vae_decoder.to(device)
 
         samples_dir = self._output_dir / "samples"
         samples_dir.mkdir(parents=True, exist_ok=True)
 
-        generate_audio = cfg.get("generate_audio", False) and self._audio_vae_decoder is not None
-
-        sampler = ValidationSampler(
-            transformer=self._transformer,
-            vae_decoder=self._vae_decoder,
-            vae_encoder=None,
-            text_encoder=None,
-            audio_decoder=self._audio_vae_decoder if generate_audio else None,
-            vocoder=self._vocoder if generate_audio else None,
-        )
-
-        # Wrap cached embeddings in CachedPromptEmbeddings if they aren't already
-        if isinstance(cached, CachedPromptEmbeddings):
-            embeddings = cached
-        else:
-            # Assume it's a tuple/list with (video_pos, audio_pos, video_neg, audio_neg)
-            embeddings = CachedPromptEmbeddings(
-                video_context_positive=cached[0],
-                audio_context_positive=cached[1],
-                video_context_negative=cached[2] if len(cached) > 2 else None,
-                audio_context_negative=cached[3] if len(cached) > 3 else None,
-            )
-
-        gen_config = GenerationConfig(
-            prompt=cfg.get("prompt", ""),
-            negative_prompt=cfg.get("negative_prompt", "worst quality, inconsistent motion, blurry, jittery, distorted"),
-            height=cfg.get("height", 576),
-            width=cfg.get("width", 576),
-            num_frames=cfg.get("num_frames", 49),
-            frame_rate=cfg.get("frame_rate", 25.0),
-            num_inference_steps=cfg.get("num_inference_steps", 30),
-            guidance_scale=cfg.get("guidance_scale", 4.0),
-            seed=cfg.get("seed", 42),
-            generate_audio=generate_audio,
-            cached_embeddings=embeddings,
-            stg_scale=cfg.get("stg_scale", 0.0),
-            stg_blocks=cfg.get("stg_blocks", [29]),
-            stg_mode=cfg.get("stg_mode", "stg_av" if generate_audio else "stg_v"),
-        )
+        height = cfg.get("height", 576)
+        width = cfg.get("width", 576)
+        num_frames = cfg.get("num_frames", 49)
+        frame_rate = cfg.get("frame_rate", 25.0)
+        num_steps = cfg.get("num_inference_steps", 30)
+        guidance_scale = cfg.get("guidance_scale", 4.0)
+        seed = cfg.get("seed", 42)
 
         try:
-            with torch.no_grad():
-                video, audio = sampler.generate(config=gen_config, device=device)
+            self._transformer.eval()
 
-            num_frames = cfg.get("num_frames", 49)
-            frame_rate = cfg.get("frame_rate", 25.0)
+            # Build context from cached embeddings (already on CPU)
+            if isinstance(cached, dict):
+                v_ctx = cached["video_context_positive"]
+                a_ctx = cached["audio_context_positive"]
+            elif isinstance(cached, (list, tuple)):
+                v_ctx = cached[0]
+                a_ctx = cached[1]
+            else:
+                v_ctx = cached.video_context_positive
+                a_ctx = cached.audio_context_positive
+
+            v_ctx = v_ctx.to(device=device, dtype=torch.bfloat16)
+            a_ctx = a_ctx.to(device=device, dtype=torch.bfloat16)
+            context = torch.cat([v_ctx, a_ctx], dim=-1)
+
+            # Attention mask: all ones (no masking for unconditional)
+            emb_mask = torch.ones(
+                v_ctx.shape[0], v_ctx.shape[1], device=device, dtype=torch.bfloat16
+            )
+
+            # Latent dimensions
+            latent_h, latent_w = height // 32, width // 32
+            latent_t = (num_frames - 1) // 8 + 1  # temporal compression
+            C = 128  # LTXV latent channels
+
+            # Start from pure noise
+            generator = torch.Generator(device=device).manual_seed(seed)
+            x_noisy = torch.randn(1, C, latent_t, latent_h, latent_w,
+                                  device=device, dtype=torch.bfloat16,
+                                  generator=generator)
+
+            # Euler flow-matching: step from t=1 (noise) to t=0 (clean)
+            # Linear sigma schedule
+            sigmas = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                for i in range(num_steps):
+                    sigma = sigmas[i]
+                    sigma_next = sigmas[i + 1]
+                    dt = sigma_next - sigma  # negative step
+
+                    pred = self._transformer(
+                        x=[x_noisy],
+                        timestep=sigma.unsqueeze(0),
+                        context=context,
+                        attention_mask=emb_mask,
+                        frame_rate=frame_rate,
+                        transformer_options={},
+                    )
+
+                    if isinstance(pred, (list, tuple)):
+                        v_pred = pred[0]
+                    else:
+                        v_pred = pred
+
+                    # Euler step: x = x + dt * velocity
+                    x_noisy = x_noisy + dt * v_pred
+
+            # Decode latents on CUDA (VAE conv layers require it)
+            # Free VRAM by offloading transformer first
+            print(f"Validation step {step}: decoding latents...")
+            latents = x_noisy.to(dtype=torch.float32)
+            del x_noisy
+            self._transformer.to("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            self._vae_decoder.to(device)
+            # Match VAE weight dtype (usually bfloat16)
+            vae_dtype = next(self._vae_decoder.parameters()).dtype
+            latents = latents.to(dtype=vae_dtype)
+            with torch.inference_mode():
+                pixels = self._vae_decoder(latents)
+            self._vae_decoder.to("cpu")
+            del latents
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # Save as video or image
             ext = "png" if num_frames == 1 else "mp4"
             out_path = samples_dir / f"step_{step:06d}.{ext}"
 
-            if num_frames == 1:
-                from ltx_trainer.utils import save_image
-                save_image(video, out_path)
+            if num_frames == 1 and pixels.ndim >= 4:
+                from torchvision.utils import save_image as tv_save_image
+                # pixels: [B, C, H, W] or [B, C, 1, H, W]
+                if pixels.ndim == 5:
+                    pixels = pixels[:, :, 0]
+                tv_save_image(pixels.clamp(0, 1), str(out_path))
             else:
-                audio_sr = None
-                if audio is not None and self._vocoder is not None:
-                    audio_sr = getattr(self._vocoder, "output_sampling_rate", 44100)
-                save_video(
-                    video_tensor=video,
-                    output_path=out_path,
-                    fps=frame_rate,
-                    audio=audio,
-                    audio_sample_rate=audio_sr,
-                )
-            logger.info(f"Validation sample saved: {out_path.name}")
+                # Save video using imageio
+                import imageio
+                # pixels: [B, C, T, H, W] → [T, H, W, C] uint8
+                vid = pixels[0]  # remove batch
+                if vid.ndim == 4:  # [C, T, H, W]
+                    vid = vid.permute(1, 2, 3, 0)  # [T, H, W, C]
+                vid = vid.clamp(0, 1).mul(255).byte().cpu().numpy()
+                imageio.mimwrite(str(out_path), vid, fps=frame_rate)
+
+            print(f"Validation sample saved: {out_path.name}")
 
         except Exception as e:
             logger.warning(f"Validation failed at step {step}: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
-            # Restore: VAE decoder back to CPU, transformer back to GPU for training
-            self._vae_decoder.to("cpu")
-            self._transformer.to(device)
+            # Restore device layout for training
+            if self._layer_offloading:
+                # Non-block params to GPU, blocks stay on CPU
+                base = self._transformer
+                if hasattr(base, "get_base_model"):
+                    base = base.get_base_model()
+                for name, child in base.named_children():
+                    if name != "transformer_blocks":
+                        child.to(device)
+            else:
+                self._transformer.to(device)
+            self._transformer.train()
             gc.collect()
             torch.cuda.empty_cache()
