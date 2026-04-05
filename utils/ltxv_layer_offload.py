@@ -12,7 +12,6 @@ Usage (inside InProcessTrainer):
     # _process_transformer_blocks handles streaming.
 """
 
-import itertools
 import logging
 import types
 
@@ -74,29 +73,29 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         saved_ax = saved_ax.to(device, non_blocking=True)
         torch.cuda.synchronize(device)
 
-        # Create non-leaf tensors with grad tracking.
-        # clone() of a requires_grad leaf produces a non-leaf (has grad_fn),
-        # which allows the block's in-place ops (addcmul_ etc.).
+        # Create leaf tensors for gradient tracking.
         vx_leaf = saved_vx.detach().requires_grad_(True)
-        vx = vx_leaf.clone()
-
         if has_audio:
             ax_leaf = saved_ax.detach().requires_grad_(True)
-            ax = ax_leaf.clone()
         else:
             ax_leaf = None
-            ax = saved_ax
 
-        # ComfyUI's transformer blocks use addcmul_ (in-place) extensively
-        # for self-attention, cross-attention, and FFN gates.  This breaks
-        # autograd's version tracking when recomputing forward.
-        # saved_tensors_hooks clones every tensor at save-time so in-place
-        # modifications don't invalidate the backward graph.
+        # ComfyUI's transformer blocks use addcmul_ (in-place) extensively.
+        # saved_tensors_hooks clones on save to avoid version-counter errors
+        # from in-place mutations invalidating saved tensors.
+        #
+        # CRITICAL: clone() and block() must run INSIDE enable_grad() —
+        # backward() runs under no_grad by default, so clone() outside
+        # enable_grad() produces a tensor with no grad_fn, severing the
+        # gradient chain from block output back to vx_leaf.
         with torch.autograd.graph.saved_tensors_hooks(
-            lambda t: t.detach().clone(),  # pack: snapshot before in-place ops
-            lambda t: t,                   # unpack: return as-is
+            lambda t: t.clone(),   # pack: fresh storage+version (no detach!)
+            lambda t: t,            # unpack: return as-is
         ):
             with torch.enable_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                # Clone INSIDE enable_grad so CloneBackward links to vx_leaf
+                vx = vx_leaf.clone()
+                ax = ax_leaf.clone() if has_audio else saved_ax
                 out_vx, out_ax = block((vx, ax), **ctx.block_kwargs)
 
         outputs = [out_vx]
@@ -105,26 +104,43 @@ class _OffloadCheckpointFn(torch.autograd.Function):
             outputs.append(out_ax)
             grads.append(grad_ax)
 
-        torch.autograd.backward(outputs, grads)
+        # Use torch.autograd.grad with EXPLICIT inputs so we get gradients
+        # back directly — no reliance on .grad attribute accumulation.
+        inputs_list = [vx_leaf]
+        if has_audio:
+            inputs_list.append(ax_leaf)
+        param_list = [p for p in block.parameters() if p.requires_grad]
+        all_inputs = inputs_list + param_list
 
-        # Collect grads while block is on GPU, then move block to CPU
+        input_grads = torch.autograd.grad(
+            outputs, all_inputs, grads,
+            allow_unused=True, retain_graph=False,
+        )
+
+        vx_grad_out = input_grads[0]
+        ax_grad_out = input_grads[1] if has_audio else None
+        param_grads = input_grads[len(inputs_list):]
+
+        # Collect param grads on GPU, then move block to CPU
         grad_map = {}
-        for p in block.parameters():
-            if p.grad is not None:
-                grad_map[p] = p.grad.to("cpu", non_blocking=True)
-                p.grad = None  # detach before block.to("cpu")
+        for p, g in zip(param_list, param_grads):
+            if g is not None:
+                grad_map[p] = g.to("cpu", non_blocking=True)
 
         block.to("cpu", non_blocking=True)
         torch.cuda.synchronize(device)
 
-        # Re-attach CPU grads now that params are on CPU
+        # Accumulate into .grad on CPU (AdamW reads from .grad)
         for p, g in grad_map.items():
-            p.grad = g
+            if p.grad is None:
+                p.grad = g
+            else:
+                p.grad.add_(g)
 
         # Returns for: vx, ax, block, block_kwargs, device, has_audio
         return (
-            vx_leaf.grad,
-            ax_leaf.grad if has_audio else None,
+            vx_grad_out,
+            ax_grad_out,
             None, None, None, None,
         )
 
