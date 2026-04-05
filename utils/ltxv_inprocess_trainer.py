@@ -271,6 +271,19 @@ class InProcessTrainer:
         self._optimizer = self._create_optimizer(trainable_params)
         self._lr_scheduler = self._create_lr_scheduler(self._optimizer)
 
+        # On resume: fast-forward the LR scheduler to match the resumed step.
+        # Otherwise the scheduler starts at step 0 with max LR, slamming the
+        # resumed LoRA weights with a learning rate much higher than when they
+        # were saved — which destabilises training and undoes prior progress.
+        if self._global_step > 0 and self._lr_scheduler is not None:
+            for _ in range(self._global_step):
+                self._lr_scheduler.step()
+            resumed_lr = self._optimizer.param_groups[0]["lr"]
+            logger.info(
+                f"Fast-forwarded LR scheduler by {self._global_step} steps "
+                f"(resumed LR = {resumed_lr:.2e})"
+            )
+
         # Step 7: build DataLoader (num_workers=0 required on Windows)
         dataloader = DataLoader(
             self._dataset,
