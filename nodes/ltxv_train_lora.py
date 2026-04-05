@@ -15,21 +15,26 @@ from ..utils.ltxv_train_env import (
 
 logger = logging.getLogger(__name__)
 
-# Module group -> target_modules mapping for the LTX-2 transformer
+# Module group -> target_modules mapping for the LTX-2 transformer.
+# PEFT target_modules with a list uses suffix matching (key.endswith(f".{x}")),
+# NOT regex. To prevent matching audio_embeddings_connector submodules that
+# share the same attn1/attn2/ff naming, we use EXCLUDE_MODULES (see below).
 MODULE_GROUPS = {
-    "video_self_attention": ["attn1.to_k", "attn1.to_q", "attn1.to_v", "attn1.to_out.0"],
-    "video_cross_attention": ["attn2.to_k", "attn2.to_q", "attn2.to_v", "attn2.to_out.0"],
+    "video_self_attention": ["attn1.to_k", "attn1.to_q", "attn1.to_v", "attn1.to_out.0", "attn1.to_gate_logits"],
+    "video_cross_attention": ["attn2.to_k", "attn2.to_q", "attn2.to_v", "attn2.to_out.0", "attn2.to_gate_logits"],
     "video_feed_forward": ["ff.net.0.proj", "ff.net.2"],
-    "audio_self_attention": ["audio_attn1.to_k", "audio_attn1.to_q", "audio_attn1.to_v", "audio_attn1.to_out.0"],
-    "audio_cross_attention": ["audio_attn2.to_k", "audio_attn2.to_q", "audio_attn2.to_v", "audio_attn2.to_out.0"],
+    "audio_self_attention": ["audio_attn1.to_k", "audio_attn1.to_q", "audio_attn1.to_v", "audio_attn1.to_out.0", "audio_attn1.to_gate_logits"],
+    "audio_cross_attention": ["audio_attn2.to_k", "audio_attn2.to_q", "audio_attn2.to_v", "audio_attn2.to_out.0", "audio_attn2.to_gate_logits"],
     "audio_feed_forward": ["audio_ff.net.0.proj", "audio_ff.net.2"],
     "video_attends_to_audio": [
         "audio_to_video_attn.to_k", "audio_to_video_attn.to_q",
         "audio_to_video_attn.to_v", "audio_to_video_attn.to_out.0",
+        "audio_to_video_attn.to_gate_logits",
     ],
     "audio_attends_to_video": [
         "video_to_audio_attn.to_k", "video_to_audio_attn.to_q",
         "video_to_audio_attn.to_v", "video_to_audio_attn.to_out.0",
+        "video_to_audio_attn.to_gate_logits",
     ],
 }
 
@@ -334,14 +339,13 @@ class RSLTXVTrainLoRA:
         # back to GPU by the InProcessTrainer after quantization + LoRA setup.
         mm.unload_all_models()
 
-        # Destroy CLIP weights — no longer needed (validation embeddings are cached).
-        # This frees ~24 GB RAM (Gemma 12B). User must reload checkpoint after
-        # training anyway (quantization is in-place).
+        # Drop local CLIP reference so it's not held during training.
+        # We intentionally do NOT move the CLIP to "meta" — ComfyUI caches the
+        # clip object across workflow runs, and destroying its weights leaves
+        # it in a state that can't be recovered without a server restart.
+        # After mm.unload_all_models() above, the CLIP is already off the GPU;
+        # its CPU/pinned-RAM copy is kept for reuse at inference time.
         if clip is not None:
-            try:
-                clip.patcher.model.to("meta")
-            except Exception:
-                pass
             clip = None
 
         # Explicitly move ComfyUI components to CPU
@@ -365,14 +369,21 @@ class RSLTXVTrainLoRA:
 
         # ---- Step 5: load VAE decoder for validation ----
         if vae is not None:
-            # Wrap ComfyUI's CausalVideoAutoencoder as a decoder-only interface.
-            # Kept on CPU — only moved to GPU during validation passes.
-            logger.info("Using ComfyUI VAE decoder for validation (on CPU)...")
-            vae_decoder = _ComfyVAEDecoderAdapter(vae.first_stage_model)
+            # Use ComfyUI's VAE but strip inference-mode flags from its weights.
+            # ComfyUI creates all tensors under inference_mode(True); cloning the
+            # state_dict and reloading produces clean non-inference tensors that
+            # work inside the training loop's inference_mode(False) context.
+            logger.info("Preparing ComfyUI VAE decoder for validation...")
+            vae_model = vae.first_stage_model
+            with torch.inference_mode(False):
+                clean_sd = {k: v.clone() for k, v in vae_model.state_dict().items()}
+            vae_model.load_state_dict(clean_sd, assign=True)
+            del clean_sd
+            vae_decoder = _ComfyVAEDecoderAdapter(vae_model)
             vae_decoder.requires_grad_(False)
         else:
-            # We need ltx-core's VideoDecoder, not ComfyUI's wrapper.
-            logger.info("Loading VideoDecoder for validation...")
+            logger.info("Loading VideoDecoder from checkpoint for validation...")
+            _setup_ltx_paths()
             from ltx_trainer.model_loader import load_video_vae_decoder
             vae_decoder = load_video_vae_decoder(
                 checkpoint_path=model_full_path,

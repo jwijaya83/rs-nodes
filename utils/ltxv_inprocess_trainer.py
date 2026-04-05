@@ -581,10 +581,15 @@ class InProcessTrainer:
         self._unwrap_comfy_ops(self._transformer)
         logger.debug("Unwrapped ComfyUI ops → standard nn.Linear")
 
+        # exclude_modules (regex string) prevents PEFT from matching the same
+        # attn1/attn2/ff suffix patterns inside audio_embeddings_connector.
+        # Without this, ~8% of LoRA rank gets wasted on audio connector
+        # submodules that do nothing for video generation quality.
         lora_config = LoraConfig(
             r=self._rank,
             lora_alpha=self._alpha,
             target_modules=self._target_modules,
+            exclude_modules=r".*audio_embeddings_connector.*",
             lora_dropout=self._dropout,
             init_lora_weights=True,
         )
@@ -936,19 +941,35 @@ class InProcessTrainer:
         # Remove PEFT's "base_model.model." prefix
         state_dict = {k.replace("base_model.model.", "", 1): v for k, v in state_dict.items()}
 
-        # Add ComfyUI-compatible "diffusion_model." prefix
-        state_dict = {f"diffusion_model.{k}": v.to(torch.bfloat16) for k, v in state_dict.items()}
+        # ComfyUI's LoRAAdapter supports diffusers2 format natively
+        # (lora_A.weight / lora_B.weight), so we keep PEFT's native names and
+        # only add the "diffusion_model." prefix + alpha keys.
+        result = {}
+        for k, v in state_dict.items():
+            full_key = f"diffusion_model.{k}"
+            result[full_key] = v.to(torch.bfloat16)
+            # Add alpha key per LoRA pair — ComfyUI uses alpha/rank for scaling
+            if k.endswith("lora_A.weight"):
+                alpha_key = full_key.replace("lora_A.weight", "alpha")
+                result[alpha_key] = torch.tensor(float(self._alpha))
 
-        return state_dict
+        return result
 
     def _cleanup_old_checkpoints(self) -> None:
         if self._keep_last_n <= 0:
             return
-        while len(self._checkpoint_paths) > self._keep_last_n:
-            old = self._checkpoint_paths.pop(0)
-            if old.exists():
-                old.unlink()
-                logger.debug(f"Removed old checkpoint: {old.name}")
+        import re
+        ckpt_dir = self._output_dir / "checkpoints"
+        if not ckpt_dir.is_dir():
+            return
+        all_ckpts = sorted(
+            ckpt_dir.glob("lora_weights_step_*.safetensors"),
+            key=lambda p: int(m.group(1)) if (m := re.search(r"step_(\d+)", p.stem)) else 0,
+        )
+        while len(all_ckpts) > self._keep_last_n:
+            old = all_ckpts.pop(0)
+            old.unlink()
+            logger.debug(f"Removed old checkpoint: {old.name}")
 
     def run_validation_only(self, device: torch.device) -> None:
         """Run a single validation with full training setup (LoRA, quantization, etc).
@@ -1010,9 +1031,23 @@ class InProcessTrainer:
 
             v_ctx = v_ctx.to(device=device, dtype=torch.bfloat16)
             a_ctx = a_ctx.to(device=device, dtype=torch.bfloat16)
-            context = torch.cat([v_ctx, a_ctx], dim=-1)
+            context_pos = torch.cat([v_ctx, a_ctx], dim=-1)
 
-            # Attention mask: all ones (no masking for unconditional)
+            # Negative embeddings for CFG
+            if isinstance(cached, dict):
+                v_neg = cached["video_context_negative"]
+                a_neg = cached["audio_context_negative"]
+            elif isinstance(cached, (list, tuple)):
+                v_neg = cached[2]
+                a_neg = cached[3]
+            else:
+                v_neg = cached.video_context_negative
+                a_neg = cached.audio_context_negative
+            v_neg = v_neg.to(device=device, dtype=torch.bfloat16)
+            a_neg = a_neg.to(device=device, dtype=torch.bfloat16)
+            context_neg = torch.cat([v_neg, a_neg], dim=-1)
+
+            # Attention mask: all ones
             emb_mask = torch.ones(
                 v_ctx.shape[0], v_ctx.shape[1], device=device, dtype=torch.bfloat16
             )
@@ -1037,20 +1072,36 @@ class InProcessTrainer:
                     sigma = sigmas[i]
                     sigma_next = sigmas[i + 1]
                     dt = sigma_next - sigma  # negative step
+                    t = sigma.unsqueeze(0)
 
-                    pred = self._transformer(
-                        x=[x_noisy],
-                        timestep=sigma.unsqueeze(0),
-                        context=context,
+                    # Conditional prediction
+                    pred_cond = self._transformer(
+                        x=[x_noisy.clone()],
+                        timestep=t,
+                        context=context_pos,
                         attention_mask=emb_mask,
                         frame_rate=frame_rate,
                         transformer_options={},
                     )
+                    if isinstance(pred_cond, (list, tuple)):
+                        pred_cond = pred_cond[0]
 
-                    if isinstance(pred, (list, tuple)):
-                        v_pred = pred[0]
+                    # Unconditional prediction for CFG
+                    if guidance_scale > 1.0:
+                        pred_uncond = self._transformer(
+                            x=[x_noisy.clone()],
+                            timestep=t,
+                            context=context_neg,
+                            attention_mask=emb_mask,
+                            frame_rate=frame_rate,
+                            transformer_options={},
+                        )
+                        if isinstance(pred_uncond, (list, tuple)):
+                            pred_uncond = pred_uncond[0]
+                        # CFG: pred = uncond + scale * (cond - uncond)
+                        v_pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
                     else:
-                        v_pred = pred
+                        v_pred = pred_cond
 
                     # Euler step: x = x + dt * velocity
                     x_noisy = x_noisy + dt * v_pred
@@ -1068,7 +1119,7 @@ class InProcessTrainer:
             # Match VAE weight dtype (usually bfloat16)
             vae_dtype = next(self._vae_decoder.parameters()).dtype
             latents = latents.to(dtype=vae_dtype)
-            with torch.inference_mode():
+            with torch.no_grad():
                 pixels = self._vae_decoder(latents)
             self._vae_decoder.to("cpu")
             del latents
