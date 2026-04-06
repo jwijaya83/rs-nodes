@@ -88,6 +88,20 @@ class _OffloadCheckpointFn(torch.autograd.Function):
         # backward() runs under no_grad by default, so clone() outside
         # enable_grad() produces a tensor with no grad_fn, severing the
         # gradient chain from block output back to vx_leaf.
+        # Override attention to PyTorch SDPA during backward recompute.
+        # SageAttention's CUDA kernel isn't autograd-compatible, so attn2
+        # (cross-attention) LoRA layers get zero gradients when sage is active.
+        # Using PyTorch attention here ensures all 12/12 LoRA layers train.
+        from comfy.ldm.modules.attention import attention_pytorch
+        # The override is called as override(func, *args, **kwargs) by the
+        # @wrap_attn decorator, so we must accept and discard the first arg.
+        def _pytorch_override(_func, *args, **kwargs):
+            return attention_pytorch(*args, **kwargs)
+        bwd_kwargs = dict(ctx.block_kwargs)
+        bwd_tf_opts = dict(bwd_kwargs.get("transformer_options", {}))
+        bwd_tf_opts["optimized_attention_override"] = _pytorch_override
+        bwd_kwargs["transformer_options"] = bwd_tf_opts
+
         with torch.autograd.graph.saved_tensors_hooks(
             lambda t: t.clone(),   # pack: fresh storage+version (no detach!)
             lambda t: t,            # unpack: return as-is
@@ -96,7 +110,7 @@ class _OffloadCheckpointFn(torch.autograd.Function):
                 # Clone INSIDE enable_grad so CloneBackward links to vx_leaf
                 vx = vx_leaf.clone()
                 ax = ax_leaf.clone() if has_audio else saved_ax
-                out_vx, out_ax = block((vx, ax), **ctx.block_kwargs)
+                out_vx, out_ax = block((vx, ax), **bwd_kwargs)
 
         outputs = [out_vx]
         grads = [grad_vx]
