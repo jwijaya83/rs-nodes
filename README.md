@@ -62,9 +62,9 @@ pip install -r rs_nodes/requirements.txt
 
 ### External Dependencies
 
-- **[Ollama](https://ollama.com/)** — Required for RS Prompt Formatter. Install and run locally. The node auto-pulls models on first use.
+- **[Ollama](https://ollama.com/)** — Required for RS Prompt Formatter and dataset captioning (RS LTXV Prepare Dataset). Install and run locally. The nodes auto-pull models on first use.
 - **LTXV Models** — The LTXV generation/extension nodes require LTXV model checkpoints and VAEs loaded through ComfyUI's standard model loading nodes.
-- **LTX-2 Submodule** — Required for LoRA training. Run `git submodule update --init` after cloning.
+- **LTX-2 Submodule** — Required only for LoRA training (not needed for inference). Run `git submodule update --init` after cloning.
 
 ---
 
