@@ -45,26 +45,23 @@ A comprehensive custom node pack for [ComfyUI](https://github.com/comfyanonymous
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/richservo/rs-nodes.git rs_nodes
-pip install -r rs_nodes/requirements.txt
+git clone https://github.com/richservo/rs-nodes.git
+cd rs-nodes
+install.bat
 ```
 
-### Requirements
+The install script handles everything: initializes the LTX-2 submodule (for LoRA training) and installs all Python dependencies.
 
-| Dependency | Required | Purpose |
-|---|---|---|
-| `openai-whisper` | Yes | Word-level alignment for TTS segmentation |
-| `transformers` | Optional | MOSS-TTS model loading |
-| `peft` | For training | LoRA adapter creation |
-| `optimum-quanto` | For training | FP8/INT8 quantization |
-| PyTorch + CUDA | Provided by ComfyUI | GPU computation |
-| OpenCV (`cv2`) | Provided by ComfyUI | Canny edge detection, face detection |
+**Manual install** (if not on Windows):
+```bash
+git submodule update --init
+pip install -r requirements.txt
+```
 
 ### External Dependencies
 
 - **[Ollama](https://ollama.com/)** — Required for RS Prompt Formatter and dataset captioning (RS LTXV Prepare Dataset). Install and run locally. The nodes auto-pull models on first use.
 - **LTXV Models** — The LTXV generation/extension nodes require LTXV model checkpoints and VAEs loaded through ComfyUI's standard model loading nodes.
-- **LTX-2 Submodule** — Required only for LoRA training (not needed for inference). Run `git submodule update --init` after cloning.
 
 ---
 
