@@ -307,6 +307,7 @@ class RSLTXVPrepareDataset:
                 "ollama_model": ("STRING", {"default": "gemma3:27b", "tooltip": "Ollama vision model for captioning (only used when caption_mode=ollama)"}),
                 "with_audio": ("BOOLEAN", {"default": False, "tooltip": "Extract and encode audio latents"}),
                 "load_text_encoder_in_8bit": ("BOOLEAN", {"default": True, "tooltip": "Load text encoder in 8-bit to save VRAM"}),
+                "crop_mode": (["face_crop", "full_frame"], {"default": "face_crop", "tooltip": "face_crop=crop around detected face, full_frame=scale entire frame to target resolution (aspect-preserving, letterboxed). Both modes use face detection for clip selection when enabled."}),
                 "face_detection": ("BOOLEAN", {"default": True, "tooltip": "Enable face detection: crop around faces, discard clips with no faces"}),
                 "target_face": ("IMAGE", {"tooltip": "Reference face image. When connected, only keeps clips matching this specific face."}),
                 "face_similarity": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Face match threshold (0-1). Higher = stricter matching. 0.40 is a good default."}),
@@ -341,6 +342,7 @@ class RSLTXVPrepareDataset:
         ollama_model: str = "gemma3:27b",
         with_audio: bool = False,
         load_text_encoder_in_8bit: bool = True,
+        crop_mode: str = "face_crop",
         face_detection: bool = True,
         target_face=None,
         face_similarity: float = 0.40,
@@ -449,6 +451,7 @@ class RSLTXVPrepareDataset:
                     result = self._process_image(
                         item["path"], clips_dir, target_w, target_h, face_detection,
                         target_embedding=target_embedding, face_similarity=face_similarity,
+                        crop_mode=crop_mode,
                     )
                     if result:
                         entry = {"caption": "", "media_path": str(result), "source_file": source_path}
@@ -464,6 +467,7 @@ class RSLTXVPrepareDataset:
                         item["path"], clips_dir, target_w, target_h, target_frames,
                         face_detection,
                         target_embedding=target_embedding, face_similarity=face_similarity,
+                        crop_mode=crop_mode,
                     )
                     for result in results:
                         entry = {"caption": "", "media_path": str(result), "source_file": source_path}
@@ -774,19 +778,22 @@ class RSLTXVPrepareDataset:
 
     @staticmethod
     def _resolve_resolution_buckets(resolution_buckets: str, entries: list[dict]) -> str:
-        """Add a 1-frame image bucket if the dataset contains images."""
-        has_images = any(
-            e.get("media_path", "").lower().endswith((".png", ".jpg", ".jpeg"))
-            for e in entries
-        )
-        if has_images:
-            first = resolution_buckets.split(";")[0].strip()
-            parts = first.split("x")
-            if len(parts) == 3:
-                image_bucket = f"{parts[0]}x{parts[1]}x1"
-                if image_bucket not in resolution_buckets:
-                    resolution_buckets = f"{resolution_buckets};{image_bucket}"
-                    logger.info(f"Added image resolution bucket: {image_bucket}")
+        """Add 1-frame image buckets for each unique image resolution in the dataset."""
+        existing_buckets = set(resolution_buckets.split(";"))
+        for entry in entries:
+            media_path = entry.get("media_path", "")
+            if not media_path.lower().endswith((".png", ".jpg", ".jpeg")):
+                continue
+            # Read actual image dimensions
+            img = cv2.imread(media_path)
+            if img is None:
+                continue
+            h, w = img.shape[:2]
+            image_bucket = f"{w}x{h}x1"
+            if image_bucket not in existing_buckets:
+                resolution_buckets = f"{resolution_buckets};{image_bucket}"
+                existing_buckets.add(image_bucket)
+                logger.info(f"Added image resolution bucket: {image_bucket}")
         return resolution_buckets
 
     def _scan_media(self, folder: Path) -> list[dict]:
@@ -834,8 +841,9 @@ class RSLTXVPrepareDataset:
         self, img_path: Path, clips_dir: Path,
         target_w: int, target_h: int, face_detection: bool,
         target_embedding: np.ndarray | None = None, face_similarity: float = 0.40,
+        crop_mode: str = "face_crop",
     ) -> Path | None:
-        """Process a single image: detect face, crop, save as PNG.
+        """Process a single image: detect face, crop or scale, save as PNG.
         Returns output path or None if no face found (when face_detection is on).
         """
         out_path = clips_dir / (img_path.stem + "_img.png")
@@ -847,23 +855,36 @@ class RSLTXVPrepareDataset:
             logger.warning(f"Could not read image: {img_path}")
             return None
 
-        crop = self._get_face_crop(frame, target_w, target_h, face_detection)
-        if crop is None:
-            logger.info(f"No face detected, skipping: {img_path.name}")
-            return None
-
-        # Check face identity match if target provided
-        if target_embedding is not None and face_detection:
+        # Face detection only for face_crop mode — stills in full_frame mode
+        # are assumed to be the subject (user curated the folder)
+        if crop_mode != "full_frame" and face_detection:
             face = _detect_face_dnn(frame)
-            if face is None or not self._check_face_match(frame, face, target_embedding, face_similarity):
-                logger.info(f"Face doesn't match target, skipping: {img_path.name}")
+            if face is None:
+                logger.info(f"No face detected, skipping: {img_path.name}")
                 return None
+            if target_embedding is not None:
+                if not self._check_face_match(frame, face, target_embedding, face_similarity):
+                    logger.info(f"Face doesn't match target, skipping: {img_path.name}")
+                    return None
 
-        cx, cy, cw, ch = crop
-        cropped = frame[cy:cy+ch, cx:cx+cw]
-        resized = cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+        if crop_mode == "full_frame":
+            # Images: use native resolution (32-aligned) since 1-frame tensors are tiny
+            h, w = frame.shape[:2]
+            native_w = (w // 32) * 32
+            native_h = (h // 32) * 32
+            if native_w < 32 or native_h < 32:
+                native_w, native_h = target_w, target_h
+            resized = cv2.resize(frame, (native_w, native_h), interpolation=cv2.INTER_LANCZOS4)
+        else:
+            crop = self._get_face_crop(frame, target_w, target_h, face_detection)
+            if crop is None:
+                logger.info(f"No face detected, skipping: {img_path.name}")
+                return None
+            cx, cy, cw, ch = crop
+            cropped = frame[cy:cy+ch, cx:cx+cw]
+            resized = cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+
         cv2.imwrite(str(out_path), resized)
-
         logger.info(f"Processed image: {img_path.name} -> {out_path.name}")
         return out_path
 
@@ -872,9 +893,10 @@ class RSLTXVPrepareDataset:
         target_w: int, target_h: int, target_frames: int,
         face_detection: bool,
         target_embedding: np.ndarray | None = None, face_similarity: float = 0.40,
+        crop_mode: str = "face_crop",
     ) -> list[Path]:
-        """Split a video into chunks, detect faces, crop around them.
-        Returns list of output clip paths (skips chunks with no face).
+        """Split a video into chunks, detect faces, crop or scale.
+        Returns list of output clip paths (skips chunks with no face when face_detection is on).
         """
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -906,27 +928,30 @@ class RSLTXVPrepareDataset:
             crop = None
             matched_sample = None
 
+            # Face detection for clip selection (both modes use this)
             if face_detection:
-                sample = self._read_frame(video_path, sample_frame_idx)
-                if sample is not None:
-                    crop = self._get_face_crop(sample, target_w, target_h, True)
-                    matched_sample = sample
-                if crop is None:
-                    # Try a few more frames in case the middle one was bad
-                    for offset in [0, (end_frame - start_frame) // 4, -(end_frame - start_frame) // 4]:
-                        alt_idx = sample_frame_idx + offset
-                        if start_frame <= alt_idx < end_frame:
-                            sample = self._read_frame(video_path, alt_idx)
-                            if sample is not None:
-                                crop = self._get_face_crop(sample, target_w, target_h, True)
-                            if crop is not None:
-                                matched_sample = sample
-                                break
-                    if crop is None:
-                        logger.info(f"No face in chunk {chunk_idx} of {video_path.name}, skipping")
-                        start_frame = end_frame
-                        chunk_idx += 1
+                face_found = False
+                for try_idx in [sample_frame_idx,
+                                start_frame,
+                                start_frame + (end_frame - start_frame) // 4,
+                                start_frame + 3 * (end_frame - start_frame) // 4]:
+                    if not (start_frame <= try_idx < end_frame):
                         continue
+                    sample = self._read_frame(video_path, try_idx)
+                    if sample is None:
+                        continue
+                    face = _detect_face_dnn(sample)
+                    if face is not None:
+                        matched_sample = sample
+                        if crop_mode == "face_crop":
+                            crop = _compute_face_crop(*face, frame_w, frame_h, target_w, target_h)
+                        face_found = True
+                        break
+                if not face_found:
+                    logger.info(f"No face in chunk {chunk_idx} of {video_path.name}, skipping")
+                    start_frame = end_frame
+                    chunk_idx += 1
+                    continue
 
                 # Check face identity match if target provided
                 if target_embedding is not None and matched_sample is not None:
@@ -936,17 +961,25 @@ class RSLTXVPrepareDataset:
                         start_frame = end_frame
                         chunk_idx += 1
                         continue
-            else:
-                # No face detection: center crop
+            elif crop_mode == "face_crop":
+                # No face detection + face_crop: center crop
                 crop = self._center_crop(frame_w, frame_h, target_w, target_h)
 
-            cx, cy, cw, ch = crop
             out_path = clips_dir / f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
 
             if not out_path.exists():
                 start_time = start_frame / fps
                 num_frames = end_frame - start_frame
-                vf = f"crop={cw}:{ch}:{cx}:{cy},scale={target_w}:{target_h}:flags=lanczos"
+
+                if crop_mode == "full_frame":
+                    # Scale full frame to fit target, preserving aspect ratio, pad with black
+                    vf = (
+                        f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+                        f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+                    )
+                else:
+                    cx, cy, cw, ch = crop
+                    vf = f"crop={cw}:{ch}:{cx}:{cy},scale={target_w}:{target_h}:flags=lanczos"
 
                 cmd = [
                     "ffmpeg", "-y",
@@ -1000,6 +1033,24 @@ class RSLTXVPrepareDataset:
         fx, fy, fw, fh = face
         frame_h, frame_w = frame.shape[:2]
         return _compute_face_crop(fx, fy, fw, fh, frame_w, frame_h, target_w, target_h)
+
+    def _scale_to_fit(
+        self, frame: np.ndarray, target_w: int, target_h: int,
+    ) -> np.ndarray:
+        """Scale frame to fit within target dimensions, preserving aspect ratio.
+        Pads with black to reach exact target size."""
+        h, w = frame.shape[:2]
+        scale = min(target_w / w, target_h / h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+
+        # Pad to exact target size
+        result = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        pad_x = (target_w - new_w) // 2
+        pad_y = (target_h - new_h) // 2
+        result[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+        return result
 
     def _center_crop(
         self, frame_w: int, frame_h: int, target_w: int, target_h: int,

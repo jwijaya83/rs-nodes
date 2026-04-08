@@ -149,6 +149,11 @@ class RSLTXVTrainLoRA:
                 "checkpoint_interval": ("INT",   {"default": 500, "min": 1,  "max": 10000}),
                 "keep_last_n":         ("INT",   {"default": 2,   "min": -1, "max": 100,
                                                   "tooltip": "-1 = keep all"}),
+                # Divergence detection
+                "diverge_detect_steps": ("INT", {"default": 150, "min": 10, "max": 5000, "step": 10,
+                                                 "tooltip": "Steps above best EMA loss before entering monitoring mode"}),
+                "diverge_stop_steps":   ("INT", {"default": 300, "min": 10, "max": 5000, "step": 10,
+                                                 "tooltip": "Steps in monitoring without recovery before stopping training"}),
                 # Resume
                 "resume": ("BOOLEAN", {"default": False, "tooltip": "Resume from latest checkpoint in output directory"}),
                 # Debug
@@ -226,6 +231,8 @@ class RSLTXVTrainLoRA:
         validation_frames: int = 49,
         checkpoint_interval: int = 500,
         keep_last_n: int = 2,
+        diverge_detect_steps: int = 150,
+        diverge_stop_steps: int = 300,
         resume: bool = False,
         validation_only: bool = False,
         vae=None,
@@ -468,6 +475,8 @@ class RSLTXVTrainLoRA:
             quantization=quantization if quantization != "none" else None,
             keep_last_n=keep_last_n,
             checkpoint_interval=checkpoint_interval,
+            diverge_detect_steps=diverge_detect_steps,
+            diverge_stop_steps=diverge_stop_steps,
             validation_config=validation_config,
             cached_validation_embeddings=cached_validation_embeddings,
             audio_vae_decoder=audio_vae_decoder,

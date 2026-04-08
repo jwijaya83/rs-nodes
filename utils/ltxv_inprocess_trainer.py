@@ -121,6 +121,8 @@ class InProcessTrainer:
         resume_checkpoint: str = "",
         layer_offloading: bool = True,
         node_id: str = "",
+        diverge_detect_steps: int = 150,
+        diverge_stop_steps: int = 300,
     ):
         _setup_ltx_paths()
 
@@ -164,6 +166,18 @@ class InProcessTrainer:
         self._global_step = 0
         self._checkpoint_paths: list[Path] = []
         self._lora_applied = False
+
+        # Divergence detection state
+        self._ema_loss = None           # EMA-smoothed loss
+        self._diverge_detect_steps = diverge_detect_steps
+        self._diverge_stop_steps = diverge_stop_steps
+        self._ema_alpha = 0.02          # EMA decay (smooth over ~50 steps)
+        self._best_ema_loss = None      # Lowest EMA loss seen
+        self._best_ema_step = 0         # Step at which best EMA was recorded
+        self._diverge_detect_step = 0   # Step when upward trend first detected
+        self._diverge_monitoring = False # Currently in monitoring mode
+        self._pre_diverge_ckpt = None   # Path to checkpoint saved at detection
+        self._diverge_final_ckpt = None # Set when divergence stops training — used by _save_final_lora
 
     # ------------------------------------------------------------------
     # Public API
@@ -422,9 +436,72 @@ class InProcessTrainer:
                         "total_steps": self._total_steps,
                         "loss": loss_val,
                         "lr": lr,
+                        "ema_loss": self._ema_loss,
+                        "monitoring": self._diverge_monitoring,
+                        "checkpoint_interval": self._checkpoint_interval,
                     })
                 except Exception:
                     pass
+
+            # --- Divergence detection ---
+            # Track EMA loss and detect sustained upward trends.
+            # Skip the first 25% of steps (warmup) — matches trendline's 75% window.
+            # If loss climbs for detect_steps: enter monitoring (checkpoint every 100).
+            # If no recovery within stop_steps: stop and keep pre-divergence checkpoint.
+            warmup_end = start_step + max(50, int((self._total_steps - start_step) * 0.25))
+            if self._ema_loss is None:
+                self._ema_loss = loss_val
+            else:
+                self._ema_loss = (1 - self._ema_alpha) * self._ema_loss + self._ema_alpha * loss_val
+
+            if step >= warmup_end:
+                # Initialize best on first post-warmup step
+                if self._best_ema_loss is None:
+                    self._best_ema_loss = self._ema_loss
+                    self._best_ema_step = step
+
+                # Update best if we've improved
+                if self._ema_loss < self._best_ema_loss:
+                    prev_best = self._best_ema_loss
+                    self._best_ema_loss = self._ema_loss
+                    self._best_ema_step = step
+                    # Recovery — exit monitoring if active
+                    if self._diverge_monitoring:
+                        print(f"[divergence] Recovered at step {step} — EMA loss {self._ema_loss:.4f} < prev best {prev_best:.4f}")
+                        self._diverge_monitoring = False
+                        self._diverge_detect_step = 0
+                        self._pre_diverge_ckpt = None
+                        # Resume normal checkpoint cleanup now that we've recovered
+                        self._cleanup_old_checkpoints()
+
+                # Check for sustained upward trend
+                steps_above_best = step - self._best_ema_step
+                if not self._diverge_monitoring and steps_above_best >= self._diverge_detect_steps:
+                    self._diverge_monitoring = True
+                    self._diverge_detect_step = step
+                    self._pre_diverge_ckpt = self._save_checkpoint(step)
+                    print(
+                        f"[divergence] Upward trend detected at step {step} — "
+                        f"EMA loss {self._ema_loss:.4f} vs best {self._best_ema_loss:.4f} "
+                        f"(best was at step {self._best_ema_step}). "
+                        f"Monitoring for {self._diverge_stop_steps} steps, checkpointing every 100."
+                    )
+
+                # In monitoring mode: checkpoint every 100 steps, stop after stop_steps
+                if self._diverge_monitoring:
+                    steps_in_monitoring = step - self._diverge_detect_step
+                    if steps_in_monitoring > 0 and steps_in_monitoring % 100 == 0:
+                        self._save_checkpoint(step)
+
+                    if steps_in_monitoring >= self._diverge_stop_steps:
+                        print(
+                            f"[divergence] No recovery after {self._diverge_stop_steps} steps — stopping training. "
+                            f"Best checkpoint was at step {self._best_ema_step}. "
+                            f"Rewinding to pre-divergence checkpoint: {self._pre_diverge_ckpt}"
+                        )
+                        # Flag so _save_final_lora uses the pre-divergence checkpoint
+                        self._diverge_final_ckpt = self._pre_diverge_ckpt
+                        break
 
             # Validation (save checkpoint first so progress is safe)
             if (
@@ -1020,12 +1097,30 @@ class InProcessTrainer:
             logger.warning(f"Failed to save optimizer sidecar ({e}) — resume will use fresh optimizer")
 
         self._checkpoint_paths.append(save_path)
-        self._cleanup_old_checkpoints()
+        # Don't delete old checkpoints during monitoring — keep them all for rewind
+        if not self._diverge_monitoring:
+            self._cleanup_old_checkpoints()
 
         return save_path
 
     def _save_final_lora(self) -> Path:
-        """Save the final LoRA weights to the ComfyUI loras folder."""
+        """Save the final LoRA weights to the ComfyUI loras folder.
+
+        If training was stopped by divergence detection, copies the
+        pre-divergence checkpoint instead of the current (diverged) weights.
+        """
+        self._loras_dir.mkdir(parents=True, exist_ok=True)
+        dest = self._loras_dir / f"{self._lora_name}.safetensors"
+
+        # If divergence stopped training, use the pre-divergence checkpoint
+        diverge_ckpt = getattr(self, "_diverge_final_ckpt", None)
+        if diverge_ckpt and Path(diverge_ckpt).exists():
+            print(f"[divergence] Saving pre-divergence checkpoint as final LoRA: {diverge_ckpt}")
+            shutil.copy2(diverge_ckpt, dest)
+            # Also copy to output dir for consistency
+            shutil.copy2(diverge_ckpt, self._output_dir / f"{self._lora_name}.safetensors")
+            return dest
+
         from safetensors.torch import save_file
 
         # Write to output_dir first
@@ -1034,8 +1129,6 @@ class InProcessTrainer:
         save_file(state_dict, final_in_output, metadata={"steps": str(self._total_steps)})
 
         # Copy to loras folder
-        self._loras_dir.mkdir(parents=True, exist_ok=True)
-        dest = self._loras_dir / f"{self._lora_name}.safetensors"
         shutil.copy2(final_in_output, dest)
 
         return dest
@@ -1078,6 +1171,10 @@ class InProcessTrainer:
         while len(all_ckpts) > self._keep_last_n:
             old = all_ckpts.pop(0)
             old.unlink()
+            # Also remove the optimizer state sidecar
+            sidecar = old.with_suffix(".state.pt")
+            if sidecar.exists():
+                sidecar.unlink()
             logger.debug(f"Removed old checkpoint: {old.name}")
 
     def run_validation_only(self, device: torch.device) -> None:

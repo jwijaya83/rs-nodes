@@ -160,12 +160,12 @@ const lossData = {};  // node_id -> { steps: [], losses: [], lrs: [] }
 
 function createLossChart() {
     const container = document.createElement("div");
-    container.style.cssText = "width:100%;padding:4px;box-sizing:border-box;";
+    container.style.cssText = "width:100%;padding:4px;box-sizing:border-box;position:relative;overflow:visible;";
 
     const canvas = document.createElement("canvas");
     canvas.width = 400;
     canvas.height = 180;
-    canvas.style.cssText = "width:100%;height:180px;background:#1a1a1a;border-radius:4px;";
+    canvas.style.cssText = "width:100%;min-height:180px;background:#1a1a1a;border-radius:4px;position:absolute;left:0;top:0;z-index:1;";
     container.appendChild(canvas);
 
     return { container, canvas };
@@ -173,8 +173,19 @@ function createLossChart() {
 
 function drawLossChart(canvas, data) {
     const ctx = canvas.getContext("2d");
-    const W = canvas.width;
-    const H = canvas.height;
+    const dpr = window.devicePixelRatio || 1;
+
+    // Match canvas buffer to display size
+    const rect = canvas.getBoundingClientRect();
+    const cssW = rect.width || canvas.width / dpr;
+    const cssH = rect.height || canvas.height / dpr;
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Draw in CSS pixels — the DPR scale handles sharpness
+    const W = cssW;
+    const H = cssH;
     const pad = { top: 20, right: 12, bottom: 28, left: 52 };
     const plotW = W - pad.left - pad.right;
     const plotH = H - pad.top - pad.bottom;
@@ -209,8 +220,9 @@ function drawLossChart(canvas, data) {
         allSmoothed[i] = alpha * allSmoothed[i - 1] + (1 - alpha) * allLosses[i];
     }
 
-    // Trailing window: show last 500 points (or all if fewer)
-    const maxVisible = 500;
+    // Trailing window: 2x checkpoint interval (tighter view during monitoring)
+    const interval = data.monitoring ? 100 : (data.checkpointInterval || 500);
+    const maxVisible = interval * 2;
     const visStart = Math.max(0, allSteps.length - maxVisible);
     const steps = allSteps.slice(visStart);
     const losses = allLosses.slice(visStart);
@@ -320,20 +332,21 @@ function drawLossChart(canvas, data) {
     }
 
     // Title
-    ctx.fillStyle = "#ccc";
+    ctx.fillStyle = data.monitoring ? "#ff6644" : "#ccc";
     ctx.font = "10px monospace";
     ctx.textAlign = "left";
     const lastLoss = losses[losses.length - 1];
     const lastSmooth = smoothed[smoothed.length - 1];
+    const status = data.monitoring ? "  DIVERGENCE MONITORING" : "";
     ctx.fillText(
-        `Step ${maxStep}/${data.totalSteps || "?"}  loss=${lastLoss.toFixed(4)}  smooth=${lastSmooth.toFixed(4)}`,
+        `Step ${maxStep}/${data.totalSteps || "?"}  loss=${lastLoss.toFixed(4)}  smooth=${lastSmooth.toFixed(4)}${status}`,
         pad.left, pad.top - 6
     );
 }
 
 // Listen for training updates from the backend
 api.addEventListener("rs-training-update", (event) => {
-    const { node_id, step, total_steps, loss, lr } = event.detail;
+    const { node_id, step, total_steps, loss, lr, ema_loss, monitoring, checkpoint_interval } = event.detail;
     if (!node_id) return;
 
     if (!lossData[node_id]) {
@@ -341,6 +354,9 @@ api.addEventListener("rs-training-update", (event) => {
     }
     const d = lossData[node_id];
     d.totalSteps = total_steps;
+    d.emaLoss = ema_loss;
+    d.monitoring = monitoring;
+    if (checkpoint_interval) d.checkpointInterval = checkpoint_interval;
     d.steps.push(step);
     d.losses.push(loss);
     d.lrs.push(lr);
@@ -382,29 +398,44 @@ app.registerExtension({
             node._lossCanvas = canvas;
             node._lossChartWidget = chartWidget;
 
-            // Add spacer widgets below the chart so the node is tall enough.
-            // ComfyUI sizes the node based on widget count, not DOM height,
-            // so the canvas overflows without extra slots to claim the space.
-            for (let i = 0; i < 3; i++) {
+            // Add spacer widgets to claim vertical space for the chart.
+            // ComfyUI sizes nodes by widget count, so we need these.
+            const SPACER_COUNT = 8;
+            const spacers = [];
+            for (let i = 0; i < SPACER_COUNT; i++) {
                 const spacer = document.createElement("div");
                 spacer.style.cssText = "width:100%;height:1px;";
-                node.addDOMWidget(
+                spacers.push(node.addDOMWidget(
                     "chart_spacer_" + i, "custom", spacer,
                     { serialize: false }
-                );
+                ));
             }
+
+            // On resize, set the canvas height to cover the spacer region
+            function updateChartSize() {
+                if (!spacers.length) return;
+                // The chart container and spacers are stacked — measure from
+                // the chart container top to the last spacer bottom
+                const chartRect = container.getBoundingClientRect();
+                const lastRect = spacers[spacers.length - 1].element?.getBoundingClientRect();
+                if (!chartRect || !lastRect || chartRect.height < 1) return;
+                const totalH = lastRect.bottom - chartRect.top - 20;
+                const h = Math.max(180, totalH);
+                canvas.style.height = h + "px";
+                drawLossChart(canvas, lossData[node.id]);
+            }
+
+            const origResize = node.onResize;
+            node.onResize = function () {
+                if (origResize) origResize.apply(this, arguments);
+                updateChartSize();
+            };
 
             node.size[0] = Math.max(node.size[0] || 0, 480);
 
-            // Initial draw (placeholder)
+            // Initial draw
             requestAnimationFrame(() => {
-                // Match canvas resolution to display size
-                const rect = canvas.getBoundingClientRect();
-                if (rect.width > 0) {
-                    canvas.width = Math.round(rect.width * (window.devicePixelRatio || 1));
-                    canvas.height = Math.round(180 * (window.devicePixelRatio || 1));
-                }
-                drawLossChart(canvas, lossData[node.id]);
+                updateChartSize();
             });
         }
     },
