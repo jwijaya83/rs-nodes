@@ -351,12 +351,17 @@ class InProcessTrainer:
             )
 
         # Step 7: build DataLoader (num_workers=0 required on Windows)
+        # Use a Generator seeded from current time so each run (and resume)
+        # gets a different shuffle order instead of repeating the same sequence.
+        dl_generator = torch.Generator()
+        dl_generator.manual_seed(int(torch.seed()) ^ self._global_step)
         dataloader = DataLoader(
             self._dataset,
             batch_size=1,
             shuffle=True,
             drop_last=True,
             num_workers=0,
+            generator=dl_generator,
         )
 
         data_iter = iter(dataloader)
