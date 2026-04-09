@@ -133,6 +133,7 @@ class RSLTXVTrainLoRA:
                 "optimizer":              (["adamw8bit", "adamw"], {"default": "adamw8bit"}),
                 "scheduler":              (["linear", "constant", "cosine", "cosine_with_restarts", "polynomial"],),
                 "gradient_checkpointing": ("BOOLEAN", {"default": True}),
+                "ffn_chunks":             ("INT",     {"default": 0, "min": 0, "max": 16, "step": 1, "tooltip": "Split FFN layers into N chunks along sequence dim to reduce peak VRAM. 0 = disabled, 4 = good default. Trades speed for memory."}),
                 # Quantization
                 "quantization": (["fp8-quanto", "int8-quanto", "int4-quanto", "none"], {"default": "fp8-quanto", "tooltip": "fp8 recommended (no C++ build tools needed). int4/int2 require 'pip install ninja' + C++ compiler."}),
                 # Strategy
@@ -142,7 +143,7 @@ class RSLTXVTrainLoRA:
                 # Validation
                 "clip": ("CLIP", {"tooltip": "Text encoder for encoding the validation prompt. Connect the same CLIP used for generation."}),
                 "validation_prompt":   ("STRING", {"default": "", "multiline": True, "tooltip": "Prompt for validation video generation during training"}),
-                "validation_interval": ("INT",   {"default": 250, "min": 1, "max": 10000}),
+                "validation_interval": ("INT",   {"default": 0, "min": 0, "max": 10000, "tooltip": "0 = disabled"}),
                 "validation_width":    ("INT",   {"default": 576, "min": 64, "max": 8192, "step": 32}),
                 "validation_height":   ("INT",   {"default": 576, "min": 64, "max": 8192, "step": 32}),
                 "validation_frames":   ("INT",   {"default": 49,  "min": 1,  "max": 257,  "step": 8}),
@@ -221,6 +222,7 @@ class RSLTXVTrainLoRA:
         optimizer: str = "adamw8bit",
         scheduler: str = "linear",
         gradient_checkpointing: bool = True,
+        ffn_chunks: int = 0,
         quantization: str = "fp8-quanto",
         strategy: str = "text_to_video",
         first_frame_conditioning_p: float = 0.5,
@@ -315,7 +317,7 @@ class RSLTXVTrainLoRA:
         cached_validation_embeddings = None
         validation_config = None
 
-        if clip is not None and validation_prompt.strip():
+        if clip is not None and validation_prompt.strip() and validation_interval > 0:
             logger.info("Encoding validation prompt...")
             try:
                 cached_validation_embeddings = self._encode_validation_prompt(
@@ -487,6 +489,7 @@ class RSLTXVTrainLoRA:
             resume_checkpoint=self._find_latest_checkpoint(output_dir) if resume else "",
             layer_offloading=True,
             node_id=str(unique_id) if unique_id is not None else "",
+            ffn_chunks=ffn_chunks,
         )
 
         pbar = comfy.utils.ProgressBar(steps)

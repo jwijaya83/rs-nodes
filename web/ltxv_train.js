@@ -156,7 +156,7 @@ function addSections(node, sections) {
 // ---------------------------------------------------------------------------
 // Live loss chart
 // ---------------------------------------------------------------------------
-const lossData = {};  // node_id -> { steps: [], losses: [], lrs: [] }
+const lossData = {};  // node_id -> { steps: [], losses: [], lrs: [], timestamps: [] }
 
 function createLossChart() {
     const container = document.createElement("div");
@@ -338,8 +338,18 @@ function drawLossChart(canvas, data) {
     const lastLoss = losses[losses.length - 1];
     const lastSmooth = smoothed[smoothed.length - 1];
     const status = data.monitoring ? "  DIVERGENCE MONITORING" : "";
+
+    // Step timing
+    let timeStr = "";
+    const ts = data.timestamps;
+    if (ts && ts.length >= 2) {
+        const lastTime = (ts[ts.length - 1] - ts[ts.length - 2]) / 1000;
+        const avgTime = (ts[ts.length - 1] - ts[0]) / ((ts.length - 1) * 1000);
+        timeStr = `  ${lastTime.toFixed(1)}s/step  avg=${avgTime.toFixed(1)}s`;
+    }
+
     ctx.fillText(
-        `Step ${maxStep}/${data.totalSteps || "?"}  loss=${lastLoss.toFixed(4)}  smooth=${lastSmooth.toFixed(4)}${status}`,
+        `Step ${maxStep}/${data.totalSteps || "?"}  loss=${lastLoss.toFixed(4)}  smooth=${lastSmooth.toFixed(4)}${timeStr}${status}`,
         pad.left, pad.top - 6
     );
 }
@@ -350,7 +360,7 @@ api.addEventListener("rs-training-update", (event) => {
     if (!node_id) return;
 
     if (!lossData[node_id]) {
-        lossData[node_id] = { steps: [], losses: [], lrs: [], totalSteps: total_steps };
+        lossData[node_id] = { steps: [], losses: [], lrs: [], timestamps: [], totalSteps: total_steps };
     }
     const d = lossData[node_id];
     d.totalSteps = total_steps;
@@ -360,6 +370,7 @@ api.addEventListener("rs-training-update", (event) => {
     d.steps.push(step);
     d.losses.push(loss);
     d.lrs.push(lr);
+    d.timestamps.push(performance.now());
 
     // Redraw chart if the node has one
     const node = app.graph.getNodeById(Number(node_id));

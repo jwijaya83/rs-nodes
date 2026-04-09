@@ -123,6 +123,7 @@ class InProcessTrainer:
         node_id: str = "",
         diverge_detect_steps: int = 150,
         diverge_stop_steps: int = 300,
+        ffn_chunks: int = 0,
     ):
         _setup_ltx_paths()
 
@@ -171,6 +172,7 @@ class InProcessTrainer:
         self._ema_loss = None           # EMA-smoothed loss
         self._diverge_detect_steps = diverge_detect_steps
         self._diverge_stop_steps = diverge_stop_steps
+        self._ffn_chunks = ffn_chunks
         self._ema_alpha = 0.02          # EMA decay (smooth over ~50 steps)
         self._best_ema_loss = None      # Lowest EMA loss seen
         self._best_ema_step = 0         # Step at which best EMA was recorded
@@ -239,6 +241,11 @@ class InProcessTrainer:
             if hasattr(base, "set_gradient_checkpointing"):
                 base.set_gradient_checkpointing(True)
                 logger.debug("Gradient checkpointing enabled")
+
+        # Step 4b: FFN chunking — split feed-forward layers along sequence dim
+        # to reduce peak activation memory (same technique as inference)
+        if self._ffn_chunks > 0:
+            self._apply_ffn_chunking()
 
         # Step 5: move model to GPU (or set up layer offloading)
         if self._layer_offloading:
@@ -397,6 +404,8 @@ class InProcessTrainer:
                     "is incompatible with this PEFT version. Try quantization='none'."
                 )
             loss.backward()
+            loss_val = loss.item()
+            del loss  # Release computation graph immediately
 
             # With layer offloading, LoRA grads were moved to CPU by the
             # backward hooks.  Ensure param/grad device agreement for the
@@ -413,18 +422,22 @@ class InProcessTrainer:
             if self._lr_scheduler is not None:
                 self._lr_scheduler.step()
             self._optimizer.zero_grad(set_to_none=True)
+            del batch  # Release batch tensors before next allocation
+
+            # VRAM defragmentation every step — running near the 16GB ceiling,
+            # even small fragmentation can cause sudden allocation failures
+            torch.cuda.empty_cache()
 
             self._global_step = step
 
             # Progress
             if progress_bar is not None:
                 progress_bar.update_absolute(step, self._total_steps)
-
-            # Loss logging (print directly — logger.info duplicates in ComfyUI)
-            loss_val = loss.item()
             lr = self._optimizer.param_groups[0]["lr"]
             if step % 10 == 0:
-                print(f"Step {step}/{self._total_steps}  loss={loss_val:.4f}  lr={lr:.2e}")
+                vram_gb = torch.cuda.memory_allocated() / 1024**3
+                vram_peak = torch.cuda.max_memory_allocated() / 1024**3
+                print(f"Step {step}/{self._total_steps}  loss={loss_val:.4f}  lr={lr:.2e}  vram={vram_gb:.1f}G  peak={vram_peak:.1f}G")
 
             # Live chart update via websocket
             if self._node_id:
@@ -572,6 +585,48 @@ class InProcessTrainer:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _apply_ffn_chunking(self) -> None:
+        """Monkeypatch FFN layers to process in chunks along the sequence dim.
+
+        Reduces peak activation memory during training by splitting the large
+        FFN intermediate tensors into smaller chunks.  Same technique as the
+        inference node but applied directly to the raw transformer (no ComfyUI
+        model clone / add_object_patch).
+        """
+        base = (
+            self._transformer.get_base_model()
+            if hasattr(self._transformer, "get_base_model")
+            else self._transformer
+        )
+        try:
+            blocks = base.transformer_blocks
+        except AttributeError:
+            logger.warning("Could not find transformer_blocks for FFN chunking")
+            return
+
+        num_chunks = self._ffn_chunks
+        patched = 0
+
+        def _make_chunked_forward(original_forward, chunks):
+            def chunked_forward(x, *args, **kwargs):
+                if x.shape[1] <= chunks:
+                    return original_forward(x, *args, **kwargs)
+                chunk_size = (x.shape[1] + chunks - 1) // chunks
+                output_chunks = []
+                for i in range(0, x.shape[1], chunk_size):
+                    chunk = x[:, i : i + chunk_size]
+                    output_chunks.append(original_forward(chunk, *args, **kwargs))
+                return torch.cat(output_chunks, dim=1)
+
+            return chunked_forward
+
+        for block in blocks:
+            if hasattr(block, "ff"):
+                block.ff.forward = _make_chunked_forward(block.ff.forward, num_chunks)
+                patched += 1
+
+        logger.info(f"FFN chunking enabled: {num_chunks} chunks across {patched} blocks")
 
     def _enable_input_require_grads(self) -> None:
         """Force the first patchify layer's output to require grad.
