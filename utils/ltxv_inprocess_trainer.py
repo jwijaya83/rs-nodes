@@ -438,6 +438,7 @@ class InProcessTrainer:
                 vram_gb = torch.cuda.memory_allocated() / 1024**3
                 vram_peak = torch.cuda.max_memory_allocated() / 1024**3
                 print(f"Step {step}/{self._total_steps}  loss={loss_val:.4f}  lr={lr:.2e}  vram={vram_gb:.1f}G  peak={vram_peak:.1f}G")
+                torch.cuda.reset_peak_memory_stats()
 
             # Live chart update via websocket
             if self._node_id:
