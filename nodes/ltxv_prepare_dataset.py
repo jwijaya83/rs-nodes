@@ -464,13 +464,22 @@ class RSLTXVPrepareDataset:
 
         # Verify existing clips still exist on disk, remove entries for missing clips
         valid_entries = []
+        removed_missing = 0
         for entry in existing_entries:
             clip_path = Path(entry["media_path"])
             if clip_path.exists():
                 valid_entries.append(entry)
             else:
                 logger.info(f"Clip missing from disk, removing: {clip_path.name}")
+                removed_missing += 1
         existing_entries = valid_entries
+        # Persist the cleaned entries immediately — otherwise, if there are no
+        # new media files to trigger the save inside the processing loop
+        # below, manually-deleted clips would keep reappearing in the JSON.
+        if removed_missing > 0:
+            with open(dataset_json_path, "w") as f:
+                json.dump(existing_entries, f, indent=2)
+            logger.info(f"Removed {removed_missing} missing-clip entries from dataset.json")
 
         if new_media:
             logger.info(f"Processing {len(new_media)} new media files ({len(existing_entries)} already done)")
@@ -584,16 +593,22 @@ class RSLTXVPrepareDataset:
             _, buf = cv2.imencode(".png", frame)
             target_face_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
 
-        # Build cast list for Gemma QC: when character_refs is populated, the
-        # caption step asks Gemma whether any known character is visible and
-        # drops the clip if not.  Names are derived from ref filenames.
+        # Build cast list for Gemma identification + caption: when
+        # character_refs is populated, Gemma is shown each reference image
+        # labeled with its name, then the clip frames, and asked to identify
+        # which referenced characters appear.  The confirmed subset is then
+        # used to drive caption naming.
         cast_names: list[str] = sorted(character_refs.keys()) if character_refs else []
+        cast_refs: list[tuple[str, str]] = (
+            [(n, character_refs[n]["image_b64"]) for n in cast_names]
+            if character_refs else []
+        )
 
         self._caption_dataset_json(
             dataset_json_path, clip_paths, caption_mode, lora_trigger,
             ollama_url=ollama_url, ollama_model=ollama_model,
             target_face_b64=target_face_b64, caption_style=caption_style,
-            cast_names=cast_names,
+            cast_names=cast_names, cast_refs=cast_refs,
         )
 
         # --- PHASE 3: Encode conditions and latents ---
@@ -936,10 +951,14 @@ class RSLTXVPrepareDataset:
         Each file's stem becomes the character's trigger word.  For references
         where a human face is detected, a face embedding is stored.  Otherwise,
         if a CLIP vision model is provided, a CLIP image embedding is stored
-        for whole-frame visual matching (puppets, props, objects).
+        for whole-frame visual matching (puppets, props, objects).  We also
+        store a base64-encoded copy of the reference image so Gemma can see
+        the actual character when doing identification at caption time.
 
-        Returns {trigger: {"type": "face"|"clip", "embedding": np.ndarray}}.
+        Returns {trigger: {"type": "face"|"clip", "embedding": np.ndarray,
+                           "image_b64": str}}.
         """
+        import base64 as _b64
         refs: dict[str, dict] = {}
         folder = Path(refs_folder)
         if not folder.exists() or not folder.is_dir():
@@ -955,12 +974,31 @@ class RSLTXVPrepareDataset:
                 continue
             trigger = f.stem.lower().replace("_", "-")
 
+            # Encode the reference image once so Gemma can see it during
+            # identification. We resize to something reasonable to keep
+            # payloads small but still recognizable.
+            ref_frame = frame
+            h, w = ref_frame.shape[:2]
+            max_dim = 512
+            if max(h, w) > max_dim:
+                scale = max_dim / max(h, w)
+                ref_frame = cv2.resize(ref_frame, (int(w * scale), int(h * scale)))
+            ok, buf = cv2.imencode(".jpg", ref_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not ok:
+                logger.warning(f"Could not encode reference image for {f.name}")
+                continue
+            image_b64 = _b64.b64encode(buf.tobytes()).decode("utf-8")
+
             # Try face detection first — most reliable for humans
             face = _detect_face_dnn(frame)
             if face is not None:
                 embedding = _get_face_embedding(frame, face)
                 if embedding is not None:
-                    refs[trigger] = {"type": "face", "embedding": embedding}
+                    refs[trigger] = {
+                        "type": "face",
+                        "embedding": embedding,
+                        "image_b64": image_b64,
+                    }
                     logger.info(f"Loaded character reference (face): {trigger}")
                     continue
 
@@ -975,7 +1013,11 @@ class RSLTXVPrepareDataset:
             if emb is None:
                 logger.warning(f"Could not compute CLIP embedding for: {f.name}")
                 continue
-            refs[trigger] = {"type": "clip", "embedding": emb}
+            refs[trigger] = {
+                "type": "clip",
+                "embedding": emb,
+                "image_b64": image_b64,
+            }
             logger.info(f"Loaded character reference (clip-vision): {trigger}")
         return refs
 
@@ -1433,6 +1475,7 @@ class RSLTXVPrepareDataset:
         target_face_b64: str | None = None,
         caption_style: str = "subject",
         cast_names: list[str] | None = None,
+        cast_refs: list[tuple[str, str]] | None = None,
     ):
         """Caption entries in the dataset JSON. Reads existing JSON, skips
         already-captioned entries, saves incrementally after each new caption.
@@ -1467,6 +1510,7 @@ class RSLTXVPrepareDataset:
                     target_face_b64=target_face_b64,
                     caption_style=caption_style,
                     cast_names=cast_names,
+                    cast_refs=cast_refs,
                 )
 
                 # LLM QC: if it returned MISMATCH, remove this entry and track it
@@ -1523,6 +1567,7 @@ class RSLTXVPrepareDataset:
         self, clip_path: Path, ollama_url: str, ollama_model: str, lora_trigger: str,
         target_face_b64: str | None = None, caption_style: str = "subject",
         cast_names: list[str] | None = None,
+        cast_refs: list[tuple[str, str]] | None = None,
     ) -> str:
         """Caption a clip frame via Ollama. If target_face_b64 is provided,
         first verifies the person matches (separate call), then captions clean.
@@ -1562,16 +1607,20 @@ class RSLTXVPrepareDataset:
             if verify_result == "MISMATCH":
                 return "MISMATCH"
 
-        # --- Step 1b: Cast QC ---
+        # --- Step 1b: Cast identification ---
         # When a character refs folder was used, ask Gemma (over all extracted
-        # frames) whether any of the known cast members are visible.  Reject
-        # the clip if it says no.  This catches false positives from the
-        # face/clip-vision filter at extraction time.
-        if cast_names:
-            qc_result = self._ollama_verify_cast(
-                base, ollama_model, cast_names, b64_images,
+        # frames) to identify EXACTLY which of the known cast members are
+        # visible in the clip.  Returns a subset of cast_names.  If the subset
+        # is empty, reject the clip (false positive from the face/clip-vision
+        # filter at extraction time).  Otherwise, we pass the confirmed subset
+        # (not the full cast list) into the caption step, so Gemma can't
+        # misattribute names to unrecognized guest characters.
+        confirmed_cast: list[str] | None = None
+        if cast_names and cast_refs:
+            confirmed_cast = self._ollama_identify_cast(
+                base, ollama_model, cast_refs, b64_images,
             )
-            if qc_result == "MISMATCH":
+            if not confirmed_cast:
                 return "MISMATCH"
 
         # --- Step 2: Caption (clean, no reference image) ---
@@ -1660,7 +1709,77 @@ class RSLTXVPrepareDataset:
             ),
         }
 
-        system_prompt = _CAPTION_PROMPTS.get(caption_style, _CAPTION_PROMPTS["subject"]) + trigger_instruction
+        # When a cast list is provided (multi-character mode), force the
+        # multi_character prompt regardless of the user's selection, since
+        # none of the other styles instruct Gemma to use character names.
+        effective_style = "multi_character" if confirmed_cast else caption_style
+        system_prompt = _CAPTION_PROMPTS.get(effective_style, _CAPTION_PROMPTS["subject"]) + trigger_instruction
+
+        # Build the user message.  In multi-character mode, we tell Gemma
+        # ONLY about characters that were already confirmed visible by the
+        # identification step — not the full cast list — and we also send
+        # the confirmed characters' reference images alongside the clip
+        # frames so Gemma has visual ground truth for the names it's using
+        # (without having to juggle the entire cast).
+        user_content = (
+            "These images are evenly-spaced frames sampled from a single "
+            "short video clip, shown in chronological order. Write ONE "
+            "caption that describes the whole clip as a single scene. "
+            "If the clip cuts between shots or characters, include what "
+            "appears across the different frames."
+        )
+        # Image payload order: reference images (if any), then clip frames.
+        images_payload: list[str] = list(b64_images)
+        if confirmed_cast:
+            # Look up the reference image for each confirmed character from
+            # the cast_refs list passed into this call.
+            ref_by_name = {n.lower(): b for n, b in (cast_refs or [])}
+            confirmed_refs: list[tuple[str, str]] = []
+            for name in confirmed_cast:
+                img = ref_by_name.get(name.lower())
+                if img is not None:
+                    confirmed_refs.append((name, img))
+
+            names_csv = ", ".join(confirmed_cast)
+            ref_intro_lines = []
+            for i, (name, _) in enumerate(confirmed_refs, start=1):
+                ref_intro_lines.append(f"Reference image {i}: this is {name}.")
+            ref_block = "\n".join(ref_intro_lines)
+            num_refs = len(confirmed_refs)
+            num_frames = len(b64_images)
+
+            user_content = (
+                f"Confirmed characters visible in this clip: {names_csv}.\n\n"
+                + (
+                    (
+                        f"You will first see {num_refs} labeled reference "
+                        f"images, one per confirmed character:\n\n"
+                        f"{ref_block}\n\n"
+                        f"After the reference images, you will see "
+                        f"{num_frames} frames sampled from the clip, in "
+                        "chronological order.\n\n"
+                    ) if confirmed_refs else ""
+                )
+                + user_content
+                + "\n\nNAMING RULES — READ CAREFULLY:\n"
+                "1. The characters listed above have been verified as "
+                "present in this clip. Refer to them by their given names "
+                "— never 'the subject', 'the man', 'the person', or any "
+                "physical description. Use the labeled reference images "
+                "to correctly match each name to its character.\n"
+                "2. Any OTHER character visible in the clip frames is NOT "
+                "on the confirmed list and MUST be described generically "
+                "(e.g. 'a child', 'a musician', 'a group of kids', 'a "
+                "person in a costume', 'a woman at the door'). NEVER "
+                "invent or guess a name for anyone not in the confirmed "
+                "list.\n"
+                "3. Do NOT add names from memory, context, or guessing. "
+                "Only the confirmed names are allowed as proper nouns.\n"
+                "4. Wrong names are worse than no names. When in doubt, "
+                "describe without naming."
+            )
+            # Prepend reference images to the payload (before clip frames).
+            images_payload = [b for _, b in confirmed_refs] + list(b64_images)
 
         payload = json.dumps({
             "model": ollama_model,
@@ -1668,18 +1787,12 @@ class RSLTXVPrepareDataset:
                 {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
-                    "content": (
-                        "These images are evenly-spaced frames sampled from a single "
-                        "short video clip, shown in chronological order. Write ONE "
-                        "caption that describes the whole clip as a single scene. "
-                        "If the clip cuts between shots or characters, include what "
-                        "appears across the different frames."
-                    ),
-                    "images": b64_images,
+                    "content": user_content,
+                    "images": images_payload,
                 },
             ],
             "stream": False,
-            "keep_alive": 0,
+            "keep_alive": "10m",
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -1705,42 +1818,95 @@ class RSLTXVPrepareDataset:
 
         return f"{lora_trigger} {clip_path.stem}" if lora_trigger else clip_path.stem
 
-    def _ollama_verify_cast(
-        self, base_url: str, model: str, cast_names: list[str], image_b64s: list[str],
-    ) -> str:
-        """Ask Gemma whether any character from the given cast list appears in
-        the provided frames.  Returns 'MATCH' or 'MISMATCH'.  On any failure,
-        returns 'MATCH' so we don't accidentally drop good clips."""
+    def _ollama_identify_cast(
+        self, base_url: str, model: str,
+        cast_refs: list[tuple[str, str]],
+        clip_image_b64s: list[str],
+    ) -> list[str]:
+        """Ask Gemma to identify which referenced characters are visible in
+        the clip.  We give Gemma the actual reference images labeled by name
+        first, then the clip frames, so it has visual ground truth for each
+        character instead of guessing from text names alone.
+
+        cast_refs: list of (name, base64_image) pairs — one per character.
+        clip_image_b64s: frames sampled from the clip being captioned.
+
+        Returns a subset of cast names (possibly empty).  An empty list
+        means the clip should be rejected as a false positive."""
         import urllib.request
         import urllib.error
 
-        names_csv = ", ".join(cast_names)
+        cast_names = [n for n, _ in cast_refs]
+        num_refs = len(cast_refs)
+        num_frames = len(clip_image_b64s)
+
+        # Build a single user message that first introduces each reference
+        # image with its name, then the clip frames.  All images are passed
+        # in "images" in the same order they are referenced in the text.
+        ref_lines = []
+        for i, (name, _) in enumerate(cast_refs, start=1):
+            ref_lines.append(f"Reference image {i}: this is {name}.")
+        ref_block = "\n".join(ref_lines)
+
+        user_text = (
+            f"You will first see {num_refs} reference images showing "
+            f"known characters, one per character:\n\n"
+            f"{ref_block}\n\n"
+            f"After the reference images, you will see {num_frames} frames "
+            "sampled from a short video clip (in chronological order). "
+            "Your task: identify which of the referenced characters are "
+            "visibly PRESENT AND ACTING in the clip frames. Match the "
+            "characters in the clip to the reference images you were just "
+            "shown — use visual comparison, not guessing from the names.\n\n"
+            "Rules:\n"
+            "1. Include a character ONLY if you can visually match them to "
+            "one of the reference images with high confidence.\n"
+            "2. A character must be present as a live, acting subject "
+            "(standing, sitting, talking, moving, reacting). Do NOT count "
+            "statues, posters, signs, logos, name cards, photographs, "
+            "drawings, dolls, toys, action figures, title cards, or any "
+            "inanimate depiction. Do NOT count establishing shots or "
+            "miniatures where no performer is acting.\n"
+            "3. Any character in the clip frames who does NOT visually "
+            "match one of the reference images must be IGNORED — do not "
+            "assign them a name from the list. Guest stars, extras, and "
+            "unfamiliar faces are not on the reference list.\n"
+            "4. Be strict. When uncertain, leave the character out.\n\n"
+            "Respond with ONLY a comma-separated list of matching names, "
+            "spelled exactly as given in the labels above. If no "
+            "referenced characters are visibly present and acting in the "
+            "clip, respond with the single word NONE. No explanations, "
+            "no other text."
+        )
+
+        # Image order: references first, then clip frames.
+        all_images = [b64 for _, b64 in cast_refs] + list(clip_image_b64s)
+
         payload = json.dumps({
             "model": model,
             "messages": [
                 {
                     "role": "system",
                     "content": (
-                        "You are a cast verification system for a TV show dataset. "
-                        "You will receive a list of known character names and several "
-                        "frames sampled from a short video clip. Decide whether ANY "
-                        "of the named characters visibly appears in the clip. "
-                        "Respond with ONLY the word MATCH or MISMATCH. No other text. "
-                        "If you are unsure, say MATCH."
+                        "You are a strict visual cast identification system. "
+                        "You will be shown labeled reference images of "
+                        "characters, followed by frames from a video clip. "
+                        "You must identify which of those specific "
+                        "reference characters appear in the clip by visual "
+                        "comparison. Do not guess based on names alone — "
+                        "always compare to the reference images. If a "
+                        "character in the clip does not visually match any "
+                        "reference, do not assign them a name."
                     ),
                 },
                 {
                     "role": "user",
-                    "content": (
-                        f"Known characters: {names_csv}.\n\n"
-                        "Does at least one of these characters appear in these frames? "
-                        "Answer MATCH or MISMATCH."
-                    ),
-                    "images": image_b64s,
+                    "content": user_text,
+                    "images": all_images,
                 },
             ],
             "stream": False,
-            "keep_alive": 0,
+            "keep_alive": "10m",
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -1751,19 +1917,28 @@ class RSLTXVPrepareDataset:
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=300) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
-                answer = result.get("message", {}).get("content", "").strip().upper()
+                answer = result.get("message", {}).get("content", "").strip()
                 import re
                 answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL)
                 answer = re.sub(r"<think>.*", "", answer, flags=re.DOTALL)
-                answer = answer.strip().upper()
-                if "MISMATCH" in answer:
-                    return "MISMATCH"
-                return "MATCH"
+                answer = answer.strip()
+                if not answer or answer.upper() == "NONE":
+                    return []
+                # Parse the response and intersect with cast_names (case-
+                # insensitive) so we only return valid names — anything the
+                # model hallucinated outside the list is dropped.
+                cast_lower = {n.lower(): n for n in cast_names}
+                confirmed: list[str] = []
+                for raw in answer.split(","):
+                    key = raw.strip().strip(".").strip().lower()
+                    if key in cast_lower and cast_lower[key] not in confirmed:
+                        confirmed.append(cast_lower[key])
+                return confirmed
         except (urllib.error.URLError, urllib.error.HTTPError) as e:
-            logger.warning(f"Cast verification failed: {e}, assuming match")
-            return "MATCH"
+            logger.warning(f"Cast identification failed: {e}, rejecting clip")
+            return []
 
     def _ollama_verify_face(
         self, base_url: str, model: str, ref_b64: str, clip_b64: str,
@@ -1790,7 +1965,7 @@ class RSLTXVPrepareDataset:
                 },
             ],
             "stream": False,
-            "keep_alive": 0,
+            "keep_alive": "10m",
         }).encode("utf-8")
 
         req = urllib.request.Request(
