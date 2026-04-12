@@ -488,9 +488,6 @@ class RSLTXVPrepareDataset:
                 logger.info(f"Clip missing from disk, removing: {clip_path.name}")
                 removed_missing += 1
         existing_entries = valid_entries
-        # Persist the cleaned entries immediately — otherwise, if there are no
-        # new media files to trigger the save inside the processing loop
-        # below, manually-deleted clips would keep reappearing in the JSON.
         if removed_missing > 0:
             with open(dataset_json_path, "w") as f:
                 json.dump(existing_entries, f, indent=2)
@@ -1789,7 +1786,9 @@ class RSLTXVPrepareDataset:
                 base, ollama_model, cast_refs, b64_images,
             )
             if not confirmed_cast:
-                return "MISMATCH"
+                # No confirmed characters — caption generically instead
+                # of rejecting the clip.
+                confirmed_cast = None
 
         # --- Step 1c: Location identification (soft — never rejects) ---
         # When location refs are provided, ask Gemma which one the clip
@@ -1880,23 +1879,29 @@ class RSLTXVPrepareDataset:
                 "'In this frame'."
             ),
             "multi_character": (
-                "You are a video training caption generator for a multi-character scene."
-                " Describe what you see in a single detailed paragraph."
-                " Every named character should be referred to strictly by their given name — "
-                "never by physical description."
-                " Describe: background, environment, camera angle, poses, interactions between "
-                "characters, expressions, actions, and clothing context."
-                " Do NOT describe any character's defining physical features (face shape, hair, "
-                "skin tone, eye color, body type, costume colors) — the character names handle "
-                "identity."
-                " Do NOT describe lighting, color grading, contrast, shadows, film grain, "
-                "depth of field, or visual mood — the LoRA should learn the visual style."
-                " If you recognize additional well-known named characters beyond the ones already "
-                "confirmed, name them too. Only name characters you are confident about; do not "
-                "guess."
-                " Be factual and specific. "
-                "Do not use poetic language or speculation. Do not start with 'The image shows' or "
-                "'In this frame'."
+                "You are writing captions for LoRA training. The purpose of "
+                "these captions is to describe ONLY things the base video model "
+                "already understands — the LoRA will learn everything else from "
+                "the visual data directly. The base model already knows what "
+                "colors are, what objects are, what actions look like, what "
+                "environments look like. It does NOT know these specific "
+                "characters, this specific visual style, or this specific "
+                "lighting/cinematography.\n\n"
+                "Therefore:\n"
+                "- DO describe: background, environment, camera angle, poses, "
+                "interactions between characters, expressions, actions, "
+                "clothing (the model knows these concepts).\n"
+                "- DO refer to named characters strictly by their given name "
+                "— never by physical description.\n"
+                "- Do NOT describe any character's defining physical features "
+                "(face shape, hair, skin tone, eye color, body type) — the "
+                "character names handle identity and the LoRA learns appearance.\n"
+                "- Do NOT describe lighting, color grading, contrast, shadows, "
+                "film grain, depth of field, or visual mood — the LoRA should "
+                "learn the visual style.\n\n"
+                "Write a single detailed paragraph. Be factual and specific. "
+                "Do not use poetic language or speculation. Do not start with "
+                "'The image shows' or 'In this frame'."
             ),
         }
 
@@ -1939,6 +1944,12 @@ class RSLTXVPrepareDataset:
                     confirmed_refs.append((name, img))
 
             names_csv = ", ".join(confirmed_cast)
+            # Burn "REF: name" label onto each reference image so the
+            # model can visually distinguish refs from clip frames.
+            confirmed_refs = [
+                (name, self._label_ref_image(b64, name))
+                for name, b64 in confirmed_refs
+            ]
             ref_intro_lines = []
             for i, (name, _) in enumerate(confirmed_refs, start=1):
                 ref_intro_lines.append(f"Reference image {i}: this is {name}.")
@@ -1957,15 +1968,29 @@ class RSLTXVPrepareDataset:
                         f"{num_frames} frames from the clip in chronological "
                         f"order (Frame 1 through Frame {num_frames}). "
                         f"Frame 1 is the opening shot.\n\n"
+                        f"IMPORTANT: Only the numbered frames (Frame 1 "
+                        f"through Frame {num_frames}) are the actual clip "
+                        f"to caption. The reference images are ONLY for "
+                        f"identifying who is who — do NOT describe or "
+                        f"include the reference images in your caption.\n\n"
                     ) if confirmed_refs else ""
                 )
                 + user_content
                 + "\n\nNAMING RULES — READ CAREFULLY:\n"
-                "1. The characters listed above have been verified as "
-                "present in this clip. Refer to them by their given names "
-                "— never 'the subject', 'the man', 'the person', or any "
-                "physical description. Use the labeled reference images "
-                "to correctly match each name to its character.\n"
+                "0. BEFORE writing your caption, double-check the confirmed "
+                "character list against what you actually see in the clip "
+                "frames. Compare each confirmed name's reference image to "
+                "the figures in the clip. If a confirmed name does NOT "
+                "actually match any living, active character in the clip "
+                "(e.g. it was matched to a statue, toy, decoration, or "
+                "the wrong person), DROP that name and describe the figure "
+                "generically instead. The confirmed list is a suggestion, "
+                "not an obligation — accuracy matters more.\n"
+                "1. For characters you have verified are truly present, "
+                "refer to them by their given names — never 'the subject', "
+                "'the man', 'the person', or any physical description. "
+                "Use the labeled reference images to correctly match each "
+                "name to its character.\n"
                 "2. Any OTHER character visible in the clip frames is NOT "
                 "on the confirmed list and MUST be described generically "
                 "(e.g. 'a child', 'a musician', 'a group of kids', 'a "
@@ -2071,6 +2096,27 @@ class RSLTXVPrepareDataset:
 
         return f"{lora_trigger} {clip_path.stem}" if lora_trigger else clip_path.stem
 
+    @staticmethod
+    def _label_ref_image(b64: str, label: str) -> str:
+        """Burn a 'REF: label' tag onto the top-left of a base64 JPEG so
+        the vision model can visually distinguish reference images from
+        numbered clip frames."""
+        import base64 as _b64
+        raw = _b64.b64decode(b64)
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return b64
+        tag = f"REF: {label}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.7
+        thickness = 2
+        (tw, th), _ = cv2.getTextSize(tag, font, font_scale, thickness)
+        cv2.rectangle(img, (0, 0), (tw + 8, th + 10), (0, 0, 0), -1)
+        cv2.putText(img, tag, (4, th + 6), font, font_scale, (255, 255, 255), thickness)
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        return _b64.b64encode(buf.tobytes()).decode("utf-8") if ok else b64
+
     def _ollama_identify_cast(
         self, base_url: str, model: str,
         cast_refs: list[tuple[str, str]],
@@ -2093,37 +2139,48 @@ class RSLTXVPrepareDataset:
         num_refs = len(cast_refs)
         num_frames = len(clip_image_b64s)
 
-        # Build a single user message that first introduces each reference
-        # image with its name, then the clip frames.  All images are passed
-        # in "images" in the same order they are referenced in the text.
+        # Label reference images with "REF: name" and clip frames already
+        # have "Frame N" burned on, so the model can visually distinguish them.
+        labeled_cast_refs = [
+            (name, self._label_ref_image(b64, name))
+            for name, b64 in cast_refs
+        ]
         ref_lines = []
-        for i, (name, _) in enumerate(cast_refs, start=1):
+        for i, (name, _) in enumerate(labeled_cast_refs, start=1):
             ref_lines.append(f"Reference image {i}: this is {name}.")
         ref_block = "\n".join(ref_lines)
 
         user_text = (
-            f"First, {num_refs} reference images of known characters:\n\n"
+            f"First, {num_refs} reference images of known characters "
+            f"(labeled 'REF:'):\n\n"
             f"{ref_block}\n\n"
-            f"Then, {num_frames} frames from a video clip in chronological "
-            f"order.\n\n"
+            f"Then, {num_frames} frames from a video clip (labeled "
+            f"'Frame 1' through 'Frame {num_frames}').\n\n"
             "TASK: Go through EVERY reference character one by one and "
             "decide if they appear in the clip. List EVERY character you "
             "are confident appears — not just the first or most prominent "
             "one. A clip can contain many characters at once.\n\n"
             "Rules:\n"
-            "- A character must appear as a live person/figure performing, "
-            "not as a poster, statue, photo, doll, costume on a rack, or "
-            "any inanimate depiction.\n"
-            "- Match by face or unique features, not by similar clothing.\n"
+            "- ONLY count a character if they are a real, active participant "
+            "in the scene — moving, speaking, or interacting. Statues, "
+            "figurines, toys, dolls, posters, photos, costumes on racks, "
+            "decorations, or any other inanimate representation do NOT "
+            "count, even if they resemble a known character.\n"
+            "- Match by face or unique features, not by similar clothing "
+            "or color. A cowboy hat on a statue does not make it a cowboy "
+            "character.\n"
+            "- Each name can only appear ONCE. Do not assign the same name "
+            "to two different figures in the clip.\n"
             "- Ignore characters not in the reference list.\n"
-            "- When unsure about a character, leave them out.\n\n"
+            "- When unsure about a character, leave them out. A missing "
+            "name is far better than a wrong name.\n\n"
             "Respond with a comma-separated list of ALL matching names, "
             "spelled exactly as given. If none match, respond NONE. "
             "No other text."
         )
 
-        # Image order: references first, then clip frames.
-        all_images = [b64 for _, b64 in cast_refs] + list(clip_image_b64s)
+        # Image order: labeled references first, then clip frames.
+        all_images = [b64 for _, b64 in labeled_cast_refs] + list(clip_image_b64s)
 
         payload = json.dumps({
             "model": model,
@@ -2150,8 +2207,8 @@ class RSLTXVPrepareDataset:
             ],
             "stream": False,
             "keep_alive": "10m",
-            "think": False,
-            "options": {"num_ctx": 262144, "num_predict": 64},
+            "think": True,
+            "options": {"num_ctx": 262144, "num_predict": 256},
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -2238,15 +2295,21 @@ class RSLTXVPrepareDataset:
         num_refs = len(location_refs)
         num_frames = len(clip_image_b64s)
 
+        labeled_loc_refs = [
+            (name, self._label_ref_image(b64, name))
+            for name, b64 in location_refs
+        ]
         ref_lines = []
-        for i, (name, _) in enumerate(location_refs, start=1):
+        for i, (name, _) in enumerate(labeled_loc_refs, start=1):
             ref_lines.append(f"Reference image {i}: this is the {name}.")
         ref_block = "\n".join(ref_lines)
 
         user_text = (
-            f"First, {num_refs} reference images of known locations:\n\n"
+            f"First, {num_refs} reference images of known locations "
+            f"(labeled 'REF:'):\n\n"
             f"{ref_block}\n\n"
-            f"Then, {num_frames} frames from a video clip.\n\n"
+            f"Then, {num_frames} frames from a video clip (labeled "
+            f"'Frame 1' through 'Frame {num_frames}').\n\n"
             "Which ONE location does the clip take place in? Pay close "
             "attention to distinguishing details: wall colors and patterns, "
             "doors, windows, furniture, props, floor patterns, shelving, "
@@ -2257,7 +2320,7 @@ class RSLTXVPrepareDataset:
             "Respond with the single name or NONE. No other text."
         )
 
-        all_images = [b64 for _, b64 in location_refs] + list(clip_image_b64s)
+        all_images = [b64 for _, b64 in labeled_loc_refs] + list(clip_image_b64s)
 
         payload = json.dumps({
             "model": model,
