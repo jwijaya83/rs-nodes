@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time as _t
 from pathlib import Path
 
 import cv2
@@ -1572,6 +1573,12 @@ class RSLTXVPrepareDataset:
             self._ensure_ollama_model(ollama_url, ollama_model)
 
         removed_count = 0
+        # Persistent multi-turn conversation state for ollama captions.
+        # The model's thinking from earlier clips carries forward.
+        ollama_messages: list[dict] | None = None
+        caption_first_time: float = 0.0  # gen time of first caption in session
+        caption_gen_times: list[float] = []  # all gen times in session for averaging
+
         i = 0
         while i < len(entries):
             entry = entries[i]
@@ -1583,7 +1590,7 @@ class RSLTXVPrepareDataset:
 
             if caption_mode == "ollama":
                 logger.info(f"[{i+1}/{len(entries)}] Captioning: {vf.name}")
-                caption = self._caption_with_ollama(
+                prep = self._prepare_clip_for_caption(
                     vf, ollama_url, ollama_model, lora_trigger,
                     target_face_b64=target_face_b64,
                     caption_style=caption_style,
@@ -1592,12 +1599,11 @@ class RSLTXVPrepareDataset:
                     location_refs=location_refs,
                 )
 
-                # LLM QC: if it returned MISMATCH, remove this entry and track it
-                if caption.strip().upper().startswith("MISMATCH"):
+                if prep is None:
+                    # MISMATCH — reject this entry
                     logger.info(f"  LLM QC: MISMATCH — removing {vf.name}")
                     rejected_entry = entries.pop(i)
                     removed_count += 1
-                    # Save rejection to rejected.json so it doesn't get re-processed
                     rejected_path = dataset_json_path.parent / "rejected.json"
                     rejected = []
                     if rejected_path.exists():
@@ -1616,6 +1622,52 @@ class RSLTXVPrepareDataset:
                     with open(dataset_json_path, "w") as f:
                         json.dump(entries, f, indent=2)
                     continue
+
+                # Handle fallback (frame extraction failed)
+                if "fallback_caption" in prep:
+                    fc = prep["fallback_caption"]
+                    if lora_trigger:
+                        fc = f"{lora_trigger} {fc}"
+                    entry["caption"] = fc
+                    with open(dataset_json_path, "w") as f:
+                        json.dump(entries, f, indent=2)
+                    i += 1
+                    continue
+
+                # Caption via persistent multi-turn conversation
+                caption, ollama_messages, cap_gen_time, token_count = self._caption_single_ollama(
+                    prep, ollama_url, ollama_model, ollama_messages,
+                )
+
+                # Detect slowdown or context limit — reset session if either:
+                # 1. Average gen time exceeds 40% of first caption's gen time
+                # 2. Token count approaches 75% of the 128K context window
+                CTX_THRESHOLD = int(131072 * 0.75)  # ~98K tokens
+                reset_reason = None
+
+                if caption_first_time == 0.0:
+                    caption_first_time = cap_gen_time
+                caption_gen_times.append(cap_gen_time)
+
+                if len(caption_gen_times) >= 2 and caption_first_time > 0:
+                    avg_gen = sum(caption_gen_times) / len(caption_gen_times)
+                    if avg_gen > caption_first_time * 1.4:
+                        reset_reason = f"slowdown: avg {avg_gen:.1f}s gen vs first {caption_first_time:.1f}s"
+
+                if token_count > CTX_THRESHOLD:
+                    reset_reason = f"context: {token_count}/{131072} tokens"
+
+                if reset_reason:
+                    logger.info(f"  Session reset ({reset_reason}) — starting new session")
+                    ollama_messages = None
+                    caption_first_time = 0.0
+                    caption_gen_times.clear()
+
+                entry["caption"] = caption
+                with open(dataset_json_path, "w") as f:
+                    json.dump(entries, f, indent=2)
+                i += 1
+
             elif caption_mode == "auto_filename":
                 name = vf.stem
                 for suffix in ["_img"]:
@@ -1625,18 +1677,18 @@ class RSLTXVPrepareDataset:
                 caption = " ".join(caption.split())
                 if lora_trigger:
                     caption = f"{lora_trigger} {caption}"
+                entry["caption"] = caption
+                with open(dataset_json_path, "w") as f:
+                    json.dump(entries, f, indent=2)
+                i += 1
             else:
                 caption = vf.stem
                 if lora_trigger:
                     caption = f"{lora_trigger} {caption}"
-
-            entry["caption"] = caption
-
-            # Save JSON incrementally after each new caption
-            with open(dataset_json_path, "w") as f:
-                json.dump(entries, f, indent=2)
-
-            i += 1
+                entry["caption"] = caption
+                with open(dataset_json_path, "w") as f:
+                    json.dump(entries, f, indent=2)
+                i += 1
 
         if removed_count:
             logger.info(f"LLM QC removed {removed_count} mismatched clips")
@@ -1713,40 +1765,124 @@ class RSLTXVPrepareDataset:
                 f"Check that the tag exists at https://ollama.com/library"
             ) from e
 
-    def _caption_with_ollama(
+    # ---- Caption prompt definitions (shared by prep + batch) ----
+    _CAPTION_PROMPTS = {
+        "subject": (
+            "You are a video training caption generator for character/subject learning."
+            " Describe what you see in a single detailed paragraph."
+            " Describe in detail: lighting, color grading, background, environment, "
+            "camera angle, pose, expression, and clothing."
+            " Do NOT describe the subject's defining physical features (face shape, hair color/style, "
+            "skin tone, eye color, body type) — the trigger word handles identity."
+            " Be factual and specific. "
+            "Do not use poetic language or speculation. Do not start with 'The image shows' or "
+            "'In this frame'."
+        ),
+        "subject + style": (
+            "You are a video training caption generator for character + style learning."
+            " Describe what you see in a single detailed paragraph."
+            " Describe: background, environment, camera angle, pose, expression, and clothing."
+            " Do NOT describe the subject's defining physical features (face shape, hair color/style, "
+            "skin tone, eye color, body type) — the trigger word handles identity."
+            " Do NOT describe lighting, color grading, contrast, shadows, film grain, "
+            "depth of field, or visual mood — the LoRA should learn the visual style."
+            " If you recognize any other named characters in the scene besides the main subject, "
+            "refer to them by name (e.g. 'standing next to <name>'). Only name characters you are "
+            "confident about; do not guess."
+            " Be factual and specific. "
+            "Do not use poetic language or speculation. Do not start with 'The image shows' or "
+            "'In this frame'."
+        ),
+        "style": (
+            "You are a video training caption generator for visual style learning."
+            " Describe what you see in a single detailed paragraph."
+            " Describe the scene content: subjects, people, objects, actions, setting, "
+            "and composition."
+            " Do NOT describe the visual treatment — no lighting style, color grading, contrast, "
+            "shadows, highlights, film grain, texture, depth of field, or visual mood."
+            " The LoRA should learn all visual style characteristics."
+            " Be factual and specific. "
+            "Do not use poetic language or speculation. Do not start with 'The image shows' or "
+            "'In this frame'."
+        ),
+        "motion": (
+            "You are a video training caption generator for motion learning."
+            " Describe what you see in a single detailed paragraph."
+            " Describe: the subject's appearance, setting, lighting, and background."
+            " Do NOT describe camera movement (pan, tilt, dolly, zoom, tracking), "
+            "subject motion, speed, or direction of movement — the LoRA should learn motion."
+            " Be factual and specific. "
+            "Do not use poetic language or speculation. Do not start with 'The image shows' or "
+            "'In this frame'."
+        ),
+        "general": (
+            "You are a video training caption generator."
+            " Describe what you see in a single detailed paragraph."
+            " Give a balanced description covering: subjects, actions, setting, "
+            "lighting, composition, and camera angle. Be factual and specific. "
+            "Do not use poetic language or speculation. Do not start with 'The image shows' or "
+            "'In this frame'."
+        ),
+        "multi_character": (
+            "You are writing captions for LoRA training. The purpose of "
+            "these captions is to describe ONLY things the base video model "
+            "already understands — the LoRA will learn everything else from "
+            "the visual data directly. The base model already knows what "
+            "colors are, what objects are, what actions look like, what "
+            "environments look like. It does NOT know these specific "
+            "characters, this specific visual style, or this specific "
+            "lighting/cinematography.\n\n"
+            "IMPORTANT: Images labeled 'REF:' are reference photos for "
+            "character recognition ONLY. NEVER describe anything from a "
+            "REF image. NEVER include a character in your caption unless "
+            "they actually appear in the numbered clip frames. If a REF "
+            "character is not visible in the clip frames, ignore them "
+            "completely.\n\n"
+            "Therefore:\n"
+            "- ONLY describe what you see in the numbered clip frames.\n"
+            "- DO describe: background, environment, camera angle, poses, "
+            "interactions between characters, expressions, actions, "
+            "clothing (the model knows these concepts).\n"
+            "- DO refer to named characters strictly by their given name "
+            "— never by physical description. Character reference names may "
+            "include descriptive hints after the name; use ONLY the name "
+            "portion when writing captions.\n"
+            "- Do NOT describe any character's defining physical features "
+            "(face shape, hair, skin tone, eye color, body type) — the "
+            "character names handle identity and the LoRA learns appearance.\n"
+            "- Do NOT describe lighting, color grading, contrast, shadows, "
+            "film grain, depth of field, or visual mood — the LoRA should "
+            "learn the visual style.\n\n"
+            "Write a single detailed paragraph. Be factual and specific. "
+            "Do not use poetic language or speculation. Do not start with "
+            "'The image shows' or 'In this frame'.\n\n"
+            "You will be given clips one at a time. Apply the same rules "
+            "consistently to each clip."
+        ),
+    }
+
+    def _prepare_clip_for_caption(
         self, clip_path: Path, ollama_url: str, ollama_model: str, lora_trigger: str,
         target_face_b64: str | None = None, caption_style: str = "subject",
         cast_names: list[str] | None = None,
         cast_refs: list[tuple[str, str]] | None = None,
         location_refs: list[tuple[str, str]] | None = None,
-    ) -> str:
-        """Caption a clip frame via Ollama. If target_face_b64 is provided,
-        first verifies the person matches (separate call), then captions clean.
-        Returns 'MISMATCH' if the person doesn't match."""
+    ) -> dict | None:
+        """Prepare a clip for captioning: extract frames, run cast ID and
+        location ID.  Returns a dict with all info needed for the caption
+        call, or None if the clip should be rejected (MISMATCH)."""
         import base64
-        import urllib.request
-        import urllib.error
 
-        # Extract multiple evenly-spaced frames so the LLM can observe shot
-        # changes and secondary characters that may not be present in any single
-        # frame.  Falls back to the single-frame picker on failure.
         frames = self._extract_caption_frames(clip_path, num_frames=5)
         if not frames:
             single = self._extract_caption_frame(clip_path)
             if single is None:
                 logger.warning(f"Could not extract frame from {clip_path.name}, using filename")
-                return clip_path.stem
+                return {"fallback_caption": clip_path.stem}
             frames = [single]
 
-        # Downscale and JPEG-encode clip frames.  Vision models tokenize
-        # images by patch — full-HD PNGs can push a single frame to 1500+
-        # tokens, and 5 frames + 9 reference images quickly overflow the
-        # context window, causing the model to return an empty response.
-        # Full resolution clip frames — JPEG compression keeps payload
-        # manageable while preserving details for character/location ID.
         b64_images: list[str] = []
         for frame_idx, fr in enumerate(frames, start=1):
-            # Burn frame number into top-left corner so the model knows order
             label = f"Frame {frame_idx}"
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.7
@@ -1758,62 +1894,33 @@ class RSLTXVPrepareDataset:
             if ok:
                 b64_images.append(base64.b64encode(buf.tobytes()).decode("utf-8"))
         if not b64_images:
-            return clip_path.stem
-        # Single-frame handle for face verification (use the middle-ish frame)
-        b64_image = b64_images[len(b64_images) // 2]
+            return {"fallback_caption": clip_path.stem}
 
+        b64_image = b64_images[len(b64_images) // 2]
         base = ollama_url.rstrip("/")
 
-        # --- Step 1: Verify face match (if target provided) ---
+        # --- Face verification ---
         if target_face_b64:
-            verify_result = self._ollama_verify_face(
-                base, ollama_model, target_face_b64, b64_image,
-            )
-            if verify_result == "MISMATCH":
-                return "MISMATCH"
+            if self._ollama_verify_face(base, ollama_model, target_face_b64, b64_image) == "MISMATCH":
+                return None
 
-        # --- Step 1b: Cast identification ---
-        # When a character refs folder was used, ask Gemma (over all extracted
-        # frames) to identify EXACTLY which of the known cast members are
-        # visible in the clip.  Returns a subset of cast_names.  If the subset
-        # is empty, reject the clip (false positive from the face/clip-vision
-        # filter at extraction time).  Otherwise, we pass the confirmed subset
-        # (not the full cast list) into the caption step, so Gemma can't
-        # misattribute names to unrecognized guest characters.
+        # --- Cast identification ---
         confirmed_cast: list[str] | None = None
         if cast_names and cast_refs:
-            confirmed_cast = self._ollama_identify_cast(
-                base, ollama_model, cast_refs, b64_images,
-            )
+            confirmed_cast = self._ollama_identify_cast(base, ollama_model, cast_refs, b64_images)
             if not confirmed_cast:
-                # No confirmed characters — caption generically instead
-                # of rejecting the clip.
                 confirmed_cast = None
 
-        # --- Step 1c: Location identification (soft — never rejects) ---
-        # When location refs are provided, ask Gemma which one the clip
-        # takes place in by visually comparing clip frames to the labeled
-        # reference images.  Returns a single matched label or None.
+        # --- Location identification ---
         identified_location: str | None = None
         if location_refs:
             import time as _t
             _loc_t0 = _t.time()
             logger.info(f"  Identifying location...")
-            identified_location = self._ollama_identify_location(
-                base, ollama_model, location_refs, b64_images,
-            )
-            logger.info(
-                f"  Location: {identified_location or 'NONE'} "
-                f"({_t.time() - _loc_t0:.1f}s)"
-            )
+            identified_location = self._ollama_identify_location(base, ollama_model, location_refs, b64_images)
+            logger.info(f"  Location: {identified_location or 'NONE'} ({_t.time() - _loc_t0:.1f}s)")
 
-        # Mark the start of the caption call so it's clear which step is
-        # the slow one.
-        import time as _t
-        _cap_t0 = _t.time()
-        logger.info(f"  Generating caption...")
-
-        # --- Step 2: Caption (clean, no reference image) ---
+        # --- Build user message + images for caption ---
         trigger_instruction = ""
         if lora_trigger:
             trigger_instruction = (
@@ -1821,106 +1928,11 @@ class RSLTXVPrepareDataset:
                 f" Start the caption with '{lora_trigger}'."
             )
 
-        _CAPTION_PROMPTS = {
-            "subject": (
-                "You are a video training caption generator for character/subject learning."
-                " Describe what you see in a single detailed paragraph."
-                " Describe in detail: lighting, color grading, background, environment, "
-                "camera angle, pose, expression, and clothing."
-                " Do NOT describe the subject's defining physical features (face shape, hair color/style, "
-                "skin tone, eye color, body type) — the trigger word handles identity."
-                " Be factual and specific. "
-                "Do not use poetic language or speculation. Do not start with 'The image shows' or "
-                "'In this frame'."
-            ),
-            "subject + style": (
-                "You are a video training caption generator for character + style learning."
-                " Describe what you see in a single detailed paragraph."
-                " Describe: background, environment, camera angle, pose, expression, and clothing."
-                " Do NOT describe the subject's defining physical features (face shape, hair color/style, "
-                "skin tone, eye color, body type) — the trigger word handles identity."
-                " Do NOT describe lighting, color grading, contrast, shadows, film grain, "
-                "depth of field, or visual mood — the LoRA should learn the visual style."
-                " If you recognize any other named characters in the scene besides the main subject, "
-                "refer to them by name (e.g. 'standing next to <name>'). Only name characters you are "
-                "confident about; do not guess."
-                " Be factual and specific. "
-                "Do not use poetic language or speculation. Do not start with 'The image shows' or "
-                "'In this frame'."
-            ),
-            "style": (
-                "You are a video training caption generator for visual style learning."
-                " Describe what you see in a single detailed paragraph."
-                " Describe the scene content: subjects, people, objects, actions, setting, "
-                "and composition."
-                " Do NOT describe the visual treatment — no lighting style, color grading, contrast, "
-                "shadows, highlights, film grain, texture, depth of field, or visual mood."
-                " The LoRA should learn all visual style characteristics."
-                " Be factual and specific. "
-                "Do not use poetic language or speculation. Do not start with 'The image shows' or "
-                "'In this frame'."
-            ),
-            "motion": (
-                "You are a video training caption generator for motion learning."
-                " Describe what you see in a single detailed paragraph."
-                " Describe: the subject's appearance, setting, lighting, and background."
-                " Do NOT describe camera movement (pan, tilt, dolly, zoom, tracking), "
-                "subject motion, speed, or direction of movement — the LoRA should learn motion."
-                " Be factual and specific. "
-                "Do not use poetic language or speculation. Do not start with 'The image shows' or "
-                "'In this frame'."
-            ),
-            "general": (
-                "You are a video training caption generator."
-                " Describe what you see in a single detailed paragraph."
-                " Give a balanced description covering: subjects, actions, setting, "
-                "lighting, composition, and camera angle. Be factual and specific. "
-                "Do not use poetic language or speculation. Do not start with 'The image shows' or "
-                "'In this frame'."
-            ),
-            "multi_character": (
-                "You are writing captions for LoRA training. The purpose of "
-                "these captions is to describe ONLY things the base video model "
-                "already understands — the LoRA will learn everything else from "
-                "the visual data directly. The base model already knows what "
-                "colors are, what objects are, what actions look like, what "
-                "environments look like. It does NOT know these specific "
-                "characters, this specific visual style, or this specific "
-                "lighting/cinematography.\n\n"
-                "Therefore:\n"
-                "- DO describe: background, environment, camera angle, poses, "
-                "interactions between characters, expressions, actions, "
-                "clothing (the model knows these concepts).\n"
-                "- DO refer to named characters strictly by their given name "
-                "— never by physical description.\n"
-                "- Do NOT describe any character's defining physical features "
-                "(face shape, hair, skin tone, eye color, body type) — the "
-                "character names handle identity and the LoRA learns appearance.\n"
-                "- Do NOT describe lighting, color grading, contrast, shadows, "
-                "film grain, depth of field, or visual mood — the LoRA should "
-                "learn the visual style.\n\n"
-                "Write a single detailed paragraph. Be factual and specific. "
-                "Do not use poetic language or speculation. Do not start with "
-                "'The image shows' or 'In this frame'."
-            ),
-        }
-
-        # When a cast list is provided (multi-character mode), force the
-        # multi_character prompt regardless of the user's selection, since
-        # none of the other styles instruct Gemma to use character names.
         effective_style = "multi_character" if confirmed_cast else caption_style
-        system_prompt = _CAPTION_PROMPTS.get(effective_style, _CAPTION_PROMPTS["subject"]) + trigger_instruction
+        system_prompt = self._CAPTION_PROMPTS.get(effective_style, self._CAPTION_PROMPTS["subject"]) + trigger_instruction
 
-        # Build the user message.  In multi-character mode, we tell Gemma
-        # ONLY about characters that were already confirmed visible by the
-        # identification step — not the full cast list — and we also send
-        # the confirmed characters' reference images alongside the clip
-        # frames so Gemma has visual ground truth for the names it's using
-        # (without having to juggle the entire cast).
         num_clip_frames = len(b64_images)
-        frame_listing = ", ".join(
-            f"Frame {i + 1}" for i in range(num_clip_frames)
-        )
+        frame_listing = ", ".join(f"Frame {i + 1}" for i in range(num_clip_frames))
         user_content = (
             f"You will see {num_clip_frames} frames sampled from a single "
             f"short video clip, in chronological order: {frame_listing}. "
@@ -1931,11 +1943,9 @@ class RSLTXVPrepareDataset:
             "Do NOT mention frame numbers in the caption — the labels are "
             "only for your reference to understand temporal order."
         )
-        # Image payload order: reference images (if any), then clip frames.
         images_payload: list[str] = list(b64_images)
+
         if confirmed_cast:
-            # Look up the reference image for each confirmed character from
-            # the cast_refs list passed into this call.
             ref_by_name = {n.lower(): b for n, b in (cast_refs or [])}
             confirmed_refs: list[tuple[str, str]] = []
             for name in confirmed_cast:
@@ -1944,8 +1954,6 @@ class RSLTXVPrepareDataset:
                     confirmed_refs.append((name, img))
 
             names_csv = ", ".join(confirmed_cast)
-            # Burn "REF: name" label onto each reference image so the
-            # model can visually distinguish refs from clip frames.
             confirmed_refs = [
                 (name, self._label_ref_image(b64, name))
                 for name, b64 in confirmed_refs
@@ -2002,13 +2010,8 @@ class RSLTXVPrepareDataset:
                 "4. Wrong names are worse than no names. When in doubt, "
                 "describe without naming."
             )
-            # Prepend reference images to the payload (before clip frames).
             images_payload = [b for _, b in confirmed_refs] + list(b64_images)
 
-        # If a location was identified, tell Gemma to use that exact name
-        # for the setting.  We intentionally do NOT send the location ref
-        # image into the caption call — just the name — so Gemma uses the
-        # known label instead of re-describing the set.
         if identified_location:
             user_content = (
                 f"The setting of this clip has been identified as "
@@ -2017,23 +2020,75 @@ class RSLTXVPrepareDataset:
                 + user_content
             )
 
-        # Stream the captioning call so we can show thinking + content
-        # tokens live as they arrive — otherwise the user is staring at a
-        # blank console for the whole thinking phase.
+        return {
+            "system_prompt": system_prompt,
+            "user_content": user_content,
+            "images_payload": images_payload,
+            "clip_name": clip_path.name,
+            "lora_trigger": lora_trigger,
+        }
+
+    def _caption_single_ollama(
+        self, prep: dict, ollama_url: str, ollama_model: str,
+        conversation_messages: list[dict] | None,
+    ) -> tuple[str, list[dict], float, int]:
+        """Caption a single clip, continuing a persistent multi-turn
+        conversation.  Previous turns keep their text (captions +
+        thinking context) but images are stripped so only the current
+        clip's frames are sent/processed.
+        Returns (caption, updated_messages, caption_only_time, token_count).
+        caption_only_time excludes thinking — only measures generation."""
+        import urllib.request
+        import urllib.error
+        import sys as _sys
+        import time as _t
+        import re
+
+        base = ollama_url.rstrip("/")
+        _cap_t0 = _t.time()
+        logger.info(f"  Generating caption for {prep['clip_name']}...")
+
+        # Start or continue conversation
+        if conversation_messages is None:
+            messages = [
+                {"role": "system", "content": prep["system_prompt"]},
+            ]
+            is_continuation = False
+        else:
+            messages = conversation_messages
+            is_continuation = True
+
+        content = prep["user_content"]
+        if is_continuation:
+            content = (
+                "--- NEXT CLIP ---\n"
+                "Apply the same captioning rules as before.\n\n"
+                + content
+            )
+
+        messages.append({
+            "role": "user",
+            "content": content,
+            "images": prep["images_payload"],
+        })
+
+        # Strip images from all previous turns — only the current
+        # (last) user message keeps its images. Text context
+        # (captions, thinking) carries forward for free.
+        send_messages = []
+        for msg in messages:
+            if "images" in msg and msg is not messages[-1]:
+                send_messages.append({k: v for k, v in msg.items() if k != "images"})
+            else:
+                send_messages.append(msg)
+
         payload = json.dumps({
             "model": ollama_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": user_content,
-                    "images": images_payload,
-                },
-            ],
+            "messages": send_messages,
             "stream": True,
             "think": True,
             "keep_alive": "10m",
-            "options": {"num_ctx": 262144},
+            "options": {"num_ctx": 131072},
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -2044,10 +2099,11 @@ class RSLTXVPrepareDataset:
         )
 
         try:
-            import sys as _sys
             thinking_started = False
             content_started = False
             caption_parts: list[str] = []
+            _caption_gen_t0 = 0.0  # set when first content chunk arrives
+            token_count = 0
             with urllib.request.urlopen(req, timeout=1800) as resp:
                 for raw_line in resp:
                     line = raw_line.decode("utf-8").strip()
@@ -2058,9 +2114,6 @@ class RSLTXVPrepareDataset:
                     except json.JSONDecodeError:
                         continue
                     msg = evt.get("message", {})
-                    # Newer Ollama versions split thinking into its own
-                    # field; older versions inline <think>...</think> in
-                    # content.  Handle both.
                     think_chunk = msg.get("thinking", "")
                     content_chunk = msg.get("content", "")
                     if think_chunk:
@@ -2074,6 +2127,8 @@ class RSLTXVPrepareDataset:
                             _sys.stderr.write("\n  [caption] ")
                         elif not content_started:
                             _sys.stderr.write("  [caption] ")
+                        if not content_started:
+                            _caption_gen_t0 = _t.time()
                         content_started = True
                         _sys.stderr.write(content_chunk)
                         _sys.stderr.flush()
@@ -2081,20 +2136,27 @@ class RSLTXVPrepareDataset:
                     if evt.get("done"):
                         _sys.stderr.write("\n")
                         _sys.stderr.flush()
+                        token_count = evt.get("prompt_eval_count", 0) + evt.get("eval_count", 0)
                         break
+
             caption = "".join(caption_parts).strip()
-            import re
-            # Belt-and-suspenders: strip any inline <think> tags too.
             caption = re.sub(r"<think>.*?</think>", "", caption, flags=re.DOTALL)
             caption = re.sub(r"<think>.*", "", caption, flags=re.DOTALL)
             caption = caption.strip()
-            if caption:
-                logger.info(f"  Caption done ({_t.time() - _cap_t0:.1f}s)")
-                return caption
-        except (urllib.error.URLError, urllib.error.HTTPError) as e:
-            logger.error(f"Ollama captioning failed for {clip_path.name}: {e}")
 
-        return f"{lora_trigger} {clip_path.stem}" if lora_trigger else clip_path.stem
+            if not caption:
+                caption = f"{prep.get('lora_trigger', '')} {prep['clip_name']}".strip()
+
+            caption_only_time = _t.time() - _caption_gen_t0 if _caption_gen_t0 else 0.0
+            logger.info(f"  Caption done ({_t.time() - _cap_t0:.1f}s total, {caption_only_time:.1f}s gen, {token_count} tokens)")
+            messages.append({"role": "assistant", "content": caption})
+            return caption, messages, caption_only_time, token_count
+
+        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+            logger.error(f"Ollama captioning failed for {prep['clip_name']}: {e}")
+            fallback = f"{prep.get('lora_trigger', '')} {prep['clip_name']}".strip()
+            messages.append({"role": "assistant", "content": fallback})
+            return fallback, messages, 0.0, 0
 
     @staticmethod
     def _label_ref_image(b64: str, label: str) -> str:
@@ -2208,7 +2270,7 @@ class RSLTXVPrepareDataset:
             "stream": False,
             "keep_alive": "10m",
             "think": True,
-            "options": {"num_ctx": 262144, "num_predict": 256},
+            "options": {"num_ctx": 131072, "num_predict": 256},
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -2346,7 +2408,7 @@ class RSLTXVPrepareDataset:
             "stream": False,
             "keep_alive": "10m",
             "think": False,
-            "options": {"num_ctx": 262144, "num_predict": 64},
+            "options": {"num_ctx": 131072, "num_predict": 64},
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -2421,7 +2483,7 @@ class RSLTXVPrepareDataset:
             "stream": False,
             "keep_alive": "10m",
             "think": False,
-            "options": {"num_ctx": 262144, "num_predict": 64},
+            "options": {"num_ctx": 131072, "num_predict": 64},
         }).encode("utf-8")
 
         req = urllib.request.Request(
