@@ -1758,12 +1758,20 @@ class RSLTXVPrepareDataset:
         # 512px JPEG preserves enough detail for character recognition
         # while keeping each frame small.
         b64_images: list[str] = []
-        for fr in frames:
+        for frame_idx, fr in enumerate(frames, start=1):
             h, w = fr.shape[:2]
             max_dim = 512
             if max(h, w) > max_dim:
                 scale = max_dim / max(h, w)
                 fr = cv2.resize(fr, (int(w * scale), int(h * scale)))
+            # Burn frame number into top-left corner so the model knows order
+            label = f"Frame {frame_idx}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.7
+            thickness = 2
+            (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+            cv2.rectangle(fr, (0, 0), (tw + 8, th + 10), (0, 0, 0), -1)
+            cv2.putText(fr, label, (4, th + 6), font, font_scale, (255, 255, 255), thickness)
             ok, buf = cv2.imencode(".jpg", fr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if ok:
                 b64_images.append(base64.b64encode(buf.tobytes()).decode("utf-8"))
@@ -1919,12 +1927,17 @@ class RSLTXVPrepareDataset:
         # the confirmed characters' reference images alongside the clip
         # frames so Gemma has visual ground truth for the names it's using
         # (without having to juggle the entire cast).
+        num_clip_frames = len(b64_images)
+        frame_listing = ", ".join(
+            f"Frame {i + 1}" for i in range(num_clip_frames)
+        )
         user_content = (
-            "These images are evenly-spaced frames sampled from a single "
-            "short video clip, shown in chronological order. Write ONE "
-            "caption that describes the whole clip as a single scene. "
-            "If the clip cuts between shots or characters, include what "
-            "appears across the different frames."
+            f"You will see {num_clip_frames} frames sampled from a single "
+            f"short video clip, in chronological order: {frame_listing}. "
+            "Frame 1 is the opening shot and the last frame is the end. "
+            "Write ONE caption that describes the whole clip as a single "
+            "scene. If the clip cuts between shots or characters, include "
+            "what appears across the different frames."
         )
         # Image payload order: reference images (if any), then clip frames.
         images_payload: list[str] = list(b64_images)
@@ -1954,8 +1967,9 @@ class RSLTXVPrepareDataset:
                         f"images, one per confirmed character:\n\n"
                         f"{ref_block}\n\n"
                         f"After the reference images, you will see "
-                        f"{num_frames} frames sampled from the clip, in "
-                        "chronological order.\n\n"
+                        f"{num_frames} frames from the clip in chronological "
+                        f"order (Frame 1 through Frame {num_frames}). "
+                        f"Frame 1 is the opening shot.\n\n"
                     ) if confirmed_refs else ""
                 )
                 + user_content
@@ -2425,9 +2439,8 @@ class RSLTXVPrepareDataset:
         if total <= num_frames:
             indices = list(range(total))
         else:
-            # Evenly spaced across the clip, inclusive of ends trimmed slightly
-            step = total / (num_frames + 1)
-            indices = [int(step * (i + 1)) for i in range(num_frames)]
+            # Evenly spaced across the clip, inclusive of first and last frames
+            indices = [int(i * (total - 1) / (num_frames - 1)) for i in range(num_frames)]
 
         frames: list[np.ndarray] = []
         for idx in indices:
