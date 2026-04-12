@@ -312,13 +312,14 @@ class RSLTXVPrepareDataset:
                 "caption_mode": (["ollama", "skip", "auto_filename"], {"default": "ollama", "tooltip": "ollama=vision model captions, skip=use filenames, auto_filename=clean filenames"}),
                 "caption_style": (["subject", "subject + style", "style", "motion", "general", "multi_character"], {"default": "subject", "tooltip": "Captioning focus: subject=person identity, subject+style=person+cinematography, style=visual aesthetics only, motion=movement/action, general=balanced, multi_character=name every recognized character equally (pairs with character_refs_folder)"}),
                 "ollama_url": ("STRING", {"default": "http://localhost:11434", "tooltip": "Ollama server URL (only used when caption_mode=ollama)"}),
-                "ollama_model": ("STRING", {"default": "gemma3:27b", "tooltip": "Ollama vision model for captioning (only used when caption_mode=ollama)"}),
+                "ollama_model": ("STRING", {"default": "gemma4:26b", "tooltip": "Ollama vision model for captioning (only used when caption_mode=ollama)"}),
                 "with_audio": ("BOOLEAN", {"default": False, "tooltip": "Extract and encode audio latents"}),
                 "load_text_encoder_in_8bit": ("BOOLEAN", {"default": True, "tooltip": "Load text encoder in 8-bit to save VRAM"}),
                 "crop_mode": (["face_crop", "full_frame"], {"default": "face_crop", "tooltip": "face_crop=crop around detected face, full_frame=scale entire frame to target resolution (aspect-preserving, letterboxed). Both modes use face detection for clip selection when enabled."}),
                 "face_detection": ("BOOLEAN", {"default": True, "tooltip": "Enable face detection: crop around faces, discard clips with no faces"}),
                 "target_face": ("IMAGE", {"tooltip": "Reference face image. When connected, only keeps clips matching this specific face."}),
                 "character_refs_folder": ("STRING", {"default": "", "tooltip": "Multi-character mode: path to a folder of reference face images. Filename (minus extension) is used as that character's trigger word. Clips are kept if ANY reference matches. All matched characters are named in captions."}),
+                "location_refs_folder": ("STRING", {"default": "", "tooltip": "Optional: path to a folder of reference images for distinct locations/sets (e.g. 'Main Room', 'Kitchen'). Filename (minus extension) is the location name. Gemma picks the best match per clip and uses it in the caption. Soft — clips with no location match are still captioned normally."}),
                 "skip_start_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 600.0, "step": 1.0, "tooltip": "Skip the first N seconds of every video (useful for cutting out repetitive intros)."}),
                 "skip_end_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 600.0, "step": 1.0, "tooltip": "Skip the last N seconds of every video (useful for cutting out end credits)."}),
                 "face_similarity": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Face match threshold (0-1). Higher = stricter matching. 0.40 is a good default."}),
@@ -351,13 +352,14 @@ class RSLTXVPrepareDataset:
         caption_mode: str = "ollama",
         caption_style: str = "subject",
         ollama_url: str = "http://localhost:11434",
-        ollama_model: str = "gemma3:27b",
+        ollama_model: str = "gemma4:26b",
         with_audio: bool = False,
         load_text_encoder_in_8bit: bool = True,
         crop_mode: str = "face_crop",
         face_detection: bool = True,
         target_face=None,
         character_refs_folder: str = "",
+        location_refs_folder: str = "",
         skip_start_seconds: float = 0.0,
         skip_end_seconds: float = 0.0,
         face_similarity: float = 0.40,
@@ -410,6 +412,19 @@ class RSLTXVPrepareDataset:
                     f"Multi-character mode: loaded {len(character_refs)} references "
                     f"({n_face} face, {n_clip} clip-vision) "
                     f"— {', '.join(sorted(character_refs.keys()))}"
+                )
+
+        # Location references: labeled images of distinct sets/locations.
+        # Gemma is shown these alongside the clip frames during captioning
+        # and picks the best match (if any).  Much simpler than character
+        # refs — just name + image, no embeddings.
+        location_refs: dict[str, str] = {}
+        if location_refs_folder:
+            location_refs = self._load_location_refs(location_refs_folder)
+            if location_refs:
+                logger.info(
+                    f"Location mode: loaded {len(location_refs)} location refs "
+                    f"— {', '.join(sorted(location_refs.keys()))}"
                 )
 
         output_dir = Path(folder_paths.get_output_directory()) / "ltxv_training" / output_name
@@ -603,12 +618,48 @@ class RSLTXVPrepareDataset:
             [(n, character_refs[n]["image_b64"]) for n in cast_names]
             if character_refs else []
         )
+        location_refs_list: list[tuple[str, str]] = (
+            [(n, location_refs[n]) for n in sorted(location_refs.keys())]
+            if location_refs else []
+        )
+
+        # Drop references to ComfyUI models BEFORE captioning so Ollama
+        # has the full GPU.  We've already extracted everything we need
+        # (image bytes for refs) into plain Python data above.  Without
+        # this, ComfyUI's CLIP Vision and the embedded face models stay
+        # resident in VRAM and ComfyUI's dynamic loader keeps shuffling
+        # them in and out, fighting Ollama for memory and slowing every
+        # vision call to a crawl.
+        character_refs = None  # noqa: F841
+        location_refs = None  # noqa: F841
+        clip_vision = None  # noqa: F841
+        try:
+            import comfy.model_management as mm
+            mm.unload_all_models()
+            if hasattr(mm, "cleanup_models"):
+                try:
+                    mm.cleanup_models(keep_clone_weights_loaded=False)
+                except TypeError:
+                    mm.cleanup_models()
+            if hasattr(mm, "current_loaded_models"):
+                try:
+                    mm.current_loaded_models.clear()
+                except Exception:
+                    pass
+            mm.soft_empty_cache()
+            import gc
+            gc.collect()
+            mm.free_memory(1e18, mm.get_torch_device())
+            logger.info("Cleared ComfyUI VRAM before Ollama captioning phase")
+        except Exception as e:
+            logger.warning(f"Could not fully free VRAM before captioning: {e}")
 
         self._caption_dataset_json(
             dataset_json_path, clip_paths, caption_mode, lora_trigger,
             ollama_url=ollama_url, ollama_model=ollama_model,
             target_face_b64=target_face_b64, caption_style=caption_style,
             cast_names=cast_names, cast_refs=cast_refs,
+            location_refs=location_refs_list,
         )
 
         # --- PHASE 3: Encode conditions and latents ---
@@ -1019,6 +1070,39 @@ class RSLTXVPrepareDataset:
                 "image_b64": image_b64,
             }
             logger.info(f"Loaded character reference (clip-vision): {trigger}")
+        return refs
+
+    def _load_location_refs(self, refs_folder: str) -> dict[str, str]:
+        """Load reference images for distinct locations/sets.  Filename
+        stem (underscores -> spaces) becomes the location label.  Returns
+        {label: base64_jpeg}."""
+        import base64 as _b64
+        refs: dict[str, str] = {}
+        folder = Path(refs_folder)
+        if not folder.exists() or not folder.is_dir():
+            logger.warning(f"Location refs folder not found: {refs_folder}")
+            return refs
+
+        for f in sorted(folder.iterdir()):
+            if f.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            frame = cv2.imread(str(f))
+            if frame is None:
+                logger.warning(f"Could not read location reference: {f.name}")
+                continue
+            label = f.stem.replace("_", " ").strip()
+            # Resize for payload sanity.
+            h, w = frame.shape[:2]
+            max_dim = 512
+            if max(h, w) > max_dim:
+                scale = max_dim / max(h, w)
+                frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not ok:
+                logger.warning(f"Could not encode location reference: {f.name}")
+                continue
+            refs[label] = _b64.b64encode(buf.tobytes()).decode("utf-8")
+            logger.info(f"Loaded location reference: {label}")
         return refs
 
     def _clip_vision_encode(self, clip_vision, frame: np.ndarray) -> np.ndarray | None:
@@ -1476,6 +1560,7 @@ class RSLTXVPrepareDataset:
         caption_style: str = "subject",
         cast_names: list[str] | None = None,
         cast_refs: list[tuple[str, str]] | None = None,
+        location_refs: list[tuple[str, str]] | None = None,
     ):
         """Caption entries in the dataset JSON. Reads existing JSON, skips
         already-captioned entries, saves incrementally after each new caption.
@@ -1492,6 +1577,12 @@ class RSLTXVPrepareDataset:
             return
 
         logger.info(f"{len(uncaptioned)} clips need captioning, {len(entries) - len(uncaptioned)} already done")
+
+        # Make sure the requested Ollama model is installed before we
+        # start the loop.  If it's not, pull it (streaming progress to
+        # the log).  Without this, every clip would 404 and get rejected.
+        if caption_mode == "ollama":
+            self._ensure_ollama_model(ollama_url, ollama_model)
 
         removed_count = 0
         i = 0
@@ -1511,6 +1602,7 @@ class RSLTXVPrepareDataset:
                     caption_style=caption_style,
                     cast_names=cast_names,
                     cast_refs=cast_refs,
+                    location_refs=location_refs,
                 )
 
                 # LLM QC: if it returned MISMATCH, remove this entry and track it
@@ -1563,11 +1655,83 @@ class RSLTXVPrepareDataset:
             logger.info(f"LLM QC removed {removed_count} mismatched clips")
         logger.info(f"Captioning complete for {len(entries)} entries")
 
+    def _ensure_ollama_model(self, base_url: str, model: str) -> None:
+        """Check whether the requested Ollama model is installed; if not,
+        pull it.  Streams pull progress to the logger so the user can
+        watch the download.  Raises RuntimeError on failure so the node
+        aborts cleanly instead of marking every clip as MISMATCH."""
+        import urllib.request
+        import urllib.error
+
+        base = base_url.rstrip("/")
+
+        # Check what's installed via /api/tags
+        try:
+            req = urllib.request.Request(
+                f"{base}/api/tags",
+                headers={"Content-Type": "application/json"},
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                tags = json.loads(resp.read().decode("utf-8"))
+            installed = {m.get("name", "") for m in tags.get("models", [])}
+            # Match either the bare name or with the :latest suffix.
+            if model in installed or f"{model}:latest" in installed or any(
+                n == model or n.startswith(f"{model}:") for n in installed
+            ):
+                logger.info(f"Ollama model '{model}' is installed")
+                return
+        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as e:
+            raise RuntimeError(
+                f"Could not query Ollama at {base}: {e}. "
+                "Make sure the Ollama server is running."
+            ) from e
+
+        logger.info(f"Ollama model '{model}' not found, pulling now...")
+        try:
+            pull_payload = json.dumps({"model": model, "stream": True}).encode("utf-8")
+            pull_req = urllib.request.Request(
+                f"{base}/api/pull",
+                data=pull_payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            last_status = ""
+            with urllib.request.urlopen(pull_req, timeout=3600) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    status = evt.get("status", "")
+                    total = evt.get("total")
+                    completed = evt.get("completed")
+                    if total and completed is not None:
+                        pct = (completed / total) * 100
+                        msg = f"  pulling {status}: {pct:.1f}% ({completed/1e9:.2f}/{total/1e9:.2f} GB)"
+                    else:
+                        msg = f"  {status}" if status else ""
+                    if msg and msg != last_status:
+                        logger.info(msg)
+                        last_status = msg
+                    if evt.get("error"):
+                        raise RuntimeError(f"Ollama pull error: {evt['error']}")
+            logger.info(f"Ollama model '{model}' pulled successfully")
+        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+            raise RuntimeError(
+                f"Failed to pull Ollama model '{model}': {e}. "
+                f"Check that the tag exists at https://ollama.com/library"
+            ) from e
+
     def _caption_with_ollama(
         self, clip_path: Path, ollama_url: str, ollama_model: str, lora_trigger: str,
         target_face_b64: str | None = None, caption_style: str = "subject",
         cast_names: list[str] | None = None,
         cast_refs: list[tuple[str, str]] | None = None,
+        location_refs: list[tuple[str, str]] | None = None,
     ) -> str:
         """Caption a clip frame via Ollama. If target_face_b64 is provided,
         first verifies the person matches (separate call), then captions clean.
@@ -1587,9 +1751,20 @@ class RSLTXVPrepareDataset:
                 return clip_path.stem
             frames = [single]
 
+        # Downscale and JPEG-encode clip frames.  Vision models tokenize
+        # images by patch — full-HD PNGs can push a single frame to 1500+
+        # tokens, and 5 frames + 9 reference images quickly overflow the
+        # context window, causing the model to return an empty response.
+        # 512px JPEG preserves enough detail for character recognition
+        # while keeping each frame small.
         b64_images: list[str] = []
         for fr in frames:
-            ok, buf = cv2.imencode(".png", fr)
+            h, w = fr.shape[:2]
+            max_dim = 512
+            if max(h, w) > max_dim:
+                scale = max_dim / max(h, w)
+                fr = cv2.resize(fr, (int(w * scale), int(h * scale)))
+            ok, buf = cv2.imencode(".jpg", fr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if ok:
                 b64_images.append(base64.b64encode(buf.tobytes()).decode("utf-8"))
         if not b64_images:
@@ -1622,6 +1797,29 @@ class RSLTXVPrepareDataset:
             )
             if not confirmed_cast:
                 return "MISMATCH"
+
+        # --- Step 1c: Location identification (soft — never rejects) ---
+        # When location refs are provided, ask Gemma which one the clip
+        # takes place in by visually comparing clip frames to the labeled
+        # reference images.  Returns a single matched label or None.
+        identified_location: str | None = None
+        if location_refs:
+            import time as _t
+            _loc_t0 = _t.time()
+            logger.info(f"  Identifying location...")
+            identified_location = self._ollama_identify_location(
+                base, ollama_model, location_refs, b64_images,
+            )
+            logger.info(
+                f"  Location: {identified_location or 'NONE'} "
+                f"({_t.time() - _loc_t0:.1f}s)"
+            )
+
+        # Mark the start of the caption call so it's clear which step is
+        # the slow one.
+        import time as _t
+        _cap_t0 = _t.time()
+        logger.info(f"  Generating caption...")
 
         # --- Step 2: Caption (clean, no reference image) ---
         trigger_instruction = ""
@@ -1781,6 +1979,21 @@ class RSLTXVPrepareDataset:
             # Prepend reference images to the payload (before clip frames).
             images_payload = [b for _, b in confirmed_refs] + list(b64_images)
 
+        # If a location was identified, tell Gemma to use that exact name
+        # for the setting.  We intentionally do NOT send the location ref
+        # image into the caption call — just the name — so Gemma uses the
+        # known label instead of re-describing the set.
+        if identified_location:
+            user_content = (
+                f"The setting of this clip has been identified as "
+                f"'{identified_location}'. When describing the environment "
+                f"or location, refer to it by that exact name.\n\n"
+                + user_content
+            )
+
+        # Stream the captioning call so we can show thinking + content
+        # tokens live as they arrive — otherwise the user is staring at a
+        # blank console for the whole thinking phase.
         payload = json.dumps({
             "model": ollama_model,
             "messages": [
@@ -1791,8 +2004,9 @@ class RSLTXVPrepareDataset:
                     "images": images_payload,
                 },
             ],
-            "stream": False,
+            "stream": True,
             "keep_alive": "10m",
+            "options": {"num_ctx": 8192},
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -1803,16 +2017,53 @@ class RSLTXVPrepareDataset:
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-                caption = result.get("message", {}).get("content", "").strip()
-                import re
-                caption = re.sub(r"<think>.*?</think>", "", caption, flags=re.DOTALL)
-                caption = re.sub(r"<think>.*", "", caption, flags=re.DOTALL)
-                caption = caption.strip()
-                if caption:
-                    logger.info(f"Caption: {caption[:100]}...")
-                    return caption
+            import sys as _sys
+            thinking_started = False
+            content_started = False
+            caption_parts: list[str] = []
+            with urllib.request.urlopen(req, timeout=1800) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = evt.get("message", {})
+                    # Newer Ollama versions split thinking into its own
+                    # field; older versions inline <think>...</think> in
+                    # content.  Handle both.
+                    think_chunk = msg.get("thinking", "")
+                    content_chunk = msg.get("content", "")
+                    if think_chunk:
+                        if not thinking_started:
+                            _sys.stderr.write("  [thinking] ")
+                            thinking_started = True
+                        _sys.stderr.write(think_chunk)
+                        _sys.stderr.flush()
+                    if content_chunk:
+                        if thinking_started and not content_started:
+                            _sys.stderr.write("\n  [caption] ")
+                        elif not content_started:
+                            _sys.stderr.write("  [caption] ")
+                        content_started = True
+                        _sys.stderr.write(content_chunk)
+                        _sys.stderr.flush()
+                        caption_parts.append(content_chunk)
+                    if evt.get("done"):
+                        _sys.stderr.write("\n")
+                        _sys.stderr.flush()
+                        break
+            caption = "".join(caption_parts).strip()
+            import re
+            # Belt-and-suspenders: strip any inline <think> tags too.
+            caption = re.sub(r"<think>.*?</think>", "", caption, flags=re.DOTALL)
+            caption = re.sub(r"<think>.*", "", caption, flags=re.DOTALL)
+            caption = caption.strip()
+            if caption:
+                logger.info(f"  Caption done ({_t.time() - _cap_t0:.1f}s)")
+                return caption
         except (urllib.error.URLError, urllib.error.HTTPError) as e:
             logger.error(f"Ollama captioning failed for {clip_path.name}: {e}")
 
@@ -1849,34 +2100,24 @@ class RSLTXVPrepareDataset:
         ref_block = "\n".join(ref_lines)
 
         user_text = (
-            f"You will first see {num_refs} reference images showing "
-            f"known characters, one per character:\n\n"
+            f"First, {num_refs} reference images of known characters:\n\n"
             f"{ref_block}\n\n"
-            f"After the reference images, you will see {num_frames} frames "
-            "sampled from a short video clip (in chronological order). "
-            "Your task: identify which of the referenced characters are "
-            "visibly PRESENT AND ACTING in the clip frames. Match the "
-            "characters in the clip to the reference images you were just "
-            "shown — use visual comparison, not guessing from the names.\n\n"
+            f"Then, {num_frames} frames from a video clip in chronological "
+            f"order.\n\n"
+            "TASK: Go through EVERY reference character one by one and "
+            "decide if they appear in the clip. List EVERY character you "
+            "are confident appears — not just the first or most prominent "
+            "one. A clip can contain many characters at once.\n\n"
             "Rules:\n"
-            "1. Include a character ONLY if you can visually match them to "
-            "one of the reference images with high confidence.\n"
-            "2. A character must be present as a live, acting subject "
-            "(standing, sitting, talking, moving, reacting). Do NOT count "
-            "statues, posters, signs, logos, name cards, photographs, "
-            "drawings, dolls, toys, action figures, title cards, or any "
-            "inanimate depiction. Do NOT count establishing shots or "
-            "miniatures where no performer is acting.\n"
-            "3. Any character in the clip frames who does NOT visually "
-            "match one of the reference images must be IGNORED — do not "
-            "assign them a name from the list. Guest stars, extras, and "
-            "unfamiliar faces are not on the reference list.\n"
-            "4. Be strict. When uncertain, leave the character out.\n\n"
-            "Respond with ONLY a comma-separated list of matching names, "
-            "spelled exactly as given in the labels above. If no "
-            "referenced characters are visibly present and acting in the "
-            "clip, respond with the single word NONE. No explanations, "
-            "no other text."
+            "- A character must appear as a live person/figure performing, "
+            "not as a poster, statue, photo, doll, costume on a rack, or "
+            "any inanimate depiction.\n"
+            "- Match by face or unique features, not by similar clothing.\n"
+            "- Ignore characters not in the reference list.\n"
+            "- When unsure about a character, leave them out.\n\n"
+            "Respond with a comma-separated list of ALL matching names, "
+            "spelled exactly as given. If none match, respond NONE. "
+            "No other text."
         )
 
         # Image order: references first, then clip frames.
@@ -1907,6 +2148,8 @@ class RSLTXVPrepareDataset:
             ],
             "stream": False,
             "keep_alive": "10m",
+            "think": False,
+            "options": {"num_ctx": 8192, "num_predict": 64},
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -1917,28 +2160,171 @@ class RSLTXVPrepareDataset:
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            with urllib.request.urlopen(req, timeout=1800) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                raw_answer = result.get("message", {}).get("content", "")
+                # If response is empty, log diagnostic fields from Ollama
+                # (done_reason, prompt_eval_count, etc.) so we can see why.
+                if not raw_answer.strip():
+                    diag = {
+                        k: result.get(k) for k in (
+                            "done", "done_reason", "total_duration",
+                            "prompt_eval_count", "eval_count", "error",
+                        ) if k in result
+                    }
+                    logger.warning(f"  Cast ID EMPTY response. Diag: {diag}")
+                answer = raw_answer.strip()
+                import re
+                # Strip common wrappers any model might add.
+                answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL)
+                answer = re.sub(r"<think>.*", "", answer, flags=re.DOTALL)
+                # Strip markdown formatting (**bold**, *italic*, `code`,
+                # _underscore_) so the token regex can match cleanly.
+                answer = re.sub(r"[*_`]+", "", answer)
+                # Strip JSON/list brackets so names inside arrays match.
+                answer = answer.replace("[", " ").replace("]", " ")
+                answer = answer.replace("{", " ").replace("}", " ")
+                answer = answer.replace('"', " ").replace("'", " ")
+                answer = answer.strip()
+                logger.info(f"  Cast ID raw response: {answer!r}")
+
+                # Universal "no match" detection: if the model explicitly
+                # says NONE or declares no match, return empty.
+                ans_upper = answer.upper()
+                if not answer or ans_upper == "NONE":
+                    return []
+                none_phrases = (
+                    "NONE OF THE", "NO CHARACTERS", "NOT PRESENT",
+                    "NOT VISIBLE", "CANNOT IDENTIFY", "UNABLE TO",
+                    "NO MATCH", "I DO NOT SEE", "I DON'T SEE",
+                )
+                if any(p in ans_upper for p in none_phrases):
+                    return []
+
+                # Parse the response: whole-word match each known cast
+                # name against the full response.  Works regardless of
+                # format — CSV, prose, bullet list, numbered list, JSON,
+                # yaml, markdown, or any mix.  Much more forgiving than
+                # splitting on commas.
+                answer_lower = answer.lower()
+                cast_lower = {n.lower(): n for n in cast_names}
+                confirmed: list[str] = []
+                for key, canonical in cast_lower.items():
+                    pattern = r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])"
+                    if re.search(pattern, answer_lower) and canonical not in confirmed:
+                        confirmed.append(canonical)
+                if not confirmed:
+                    logger.info(f"  No known cast names found in response")
+                return confirmed
+        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+            logger.warning(f"Cast identification failed: {e}, rejecting clip")
+            return []
+
+    def _ollama_identify_location(
+        self, base_url: str, model: str,
+        location_refs: list[tuple[str, str]],
+        clip_image_b64s: list[str],
+    ) -> str | None:
+        """Ask Gemma which labeled location the clip takes place in, by
+        visually comparing clip frames to the reference images.  Returns
+        the matched location name, or None if no confident match.  Soft
+        — never rejects a clip."""
+        import urllib.request
+        import urllib.error
+
+        loc_names = [n for n, _ in location_refs]
+        num_refs = len(location_refs)
+        num_frames = len(clip_image_b64s)
+
+        ref_lines = []
+        for i, (name, _) in enumerate(location_refs, start=1):
+            ref_lines.append(f"Reference image {i}: this is the {name}.")
+        ref_block = "\n".join(ref_lines)
+
+        user_text = (
+            f"First, {num_refs} reference images of known locations:\n\n"
+            f"{ref_block}\n\n"
+            f"Then, {num_frames} frames from a video clip.\n\n"
+            "Which ONE location does the clip take place in? Match by "
+            "walls, furniture, decor, layout. If the clip clearly takes "
+            "place in one of the reference locations, respond with that "
+            "name. Otherwise respond NONE.\n\n"
+            "Respond with the single name or NONE. No other text."
+        )
+
+        all_images = [b64 for _, b64 in location_refs] + list(clip_image_b64s)
+
+        payload = json.dumps({
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict visual location identification "
+                        "system. You will be shown labeled reference "
+                        "images of sets, followed by frames from a video "
+                        "clip. You must identify which of those specific "
+                        "reference locations the clip takes place in by "
+                        "visual comparison. Do not guess based on names "
+                        "alone — always compare to the reference images."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": user_text,
+                    "images": all_images,
+                },
+            ],
+            "stream": False,
+            "keep_alive": "10m",
+            "think": False,
+            "options": {"num_ctx": 8192, "num_predict": 64},
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            f"{base_url}/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=1800) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
                 answer = result.get("message", {}).get("content", "").strip()
                 import re
                 answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL)
                 answer = re.sub(r"<think>.*", "", answer, flags=re.DOTALL)
-                answer = answer.strip()
-                if not answer or answer.upper() == "NONE":
-                    return []
-                # Parse the response and intersect with cast_names (case-
-                # insensitive) so we only return valid names — anything the
-                # model hallucinated outside the list is dropped.
-                cast_lower = {n.lower(): n for n in cast_names}
-                confirmed: list[str] = []
-                for raw in answer.split(","):
-                    key = raw.strip().strip(".").strip().lower()
-                    if key in cast_lower and cast_lower[key] not in confirmed:
-                        confirmed.append(cast_lower[key])
-                return confirmed
+                answer = re.sub(r"[*_`]+", "", answer)
+                answer = answer.replace("[", " ").replace("]", " ")
+                answer = answer.replace("{", " ").replace("}", " ")
+                answer = answer.replace('"', " ").replace("'", " ")
+                answer = answer.strip().strip(".").strip()
+                logger.info(f"  Location ID raw response: {answer!r}")
+
+                ans_upper = answer.upper()
+                if not answer or ans_upper == "NONE":
+                    return None
+                none_phrases = (
+                    "NONE OF THE", "NO MATCH", "NOT A MATCH",
+                    "CANNOT IDENTIFY", "UNABLE TO", "I DO NOT",
+                    "I DON'T",
+                )
+                if any(p in ans_upper for p in none_phrases):
+                    return None
+
+                # Whole-word match each known location name against the
+                # response.  Format-agnostic: handles prose, bullets,
+                # JSON, or a single name.
+                answer_lower = answer.lower()
+                for name in loc_names:
+                    pattern = r"(?<![a-z0-9])" + re.escape(name.lower()) + r"(?![a-z0-9])"
+                    if re.search(pattern, answer_lower):
+                        return name
+                return None
         except (urllib.error.URLError, urllib.error.HTTPError) as e:
-            logger.warning(f"Cast identification failed: {e}, rejecting clip")
-            return []
+            logger.warning(f"Location identification failed: {e}, skipping")
+            return None
 
     def _ollama_verify_face(
         self, base_url: str, model: str, ref_b64: str, clip_b64: str,
@@ -1966,6 +2352,8 @@ class RSLTXVPrepareDataset:
             ],
             "stream": False,
             "keep_alive": "10m",
+            "think": False,
+            "options": {"num_ctx": 8192, "num_predict": 64},
         }).encode("utf-8")
 
         req = urllib.request.Request(
