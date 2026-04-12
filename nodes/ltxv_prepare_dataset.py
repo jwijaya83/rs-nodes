@@ -1025,16 +1025,9 @@ class RSLTXVPrepareDataset:
                 continue
             trigger = f.stem.lower().replace("_", "-")
 
-            # Encode the reference image once so Gemma can see it during
-            # identification. We resize to something reasonable to keep
-            # payloads small but still recognizable.
-            ref_frame = frame
-            h, w = ref_frame.shape[:2]
-            max_dim = 512
-            if max(h, w) > max_dim:
-                scale = max_dim / max(h, w)
-                ref_frame = cv2.resize(ref_frame, (int(w * scale), int(h * scale)))
-            ok, buf = cv2.imencode(".jpg", ref_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            # Encode the reference image at full resolution so Gemma can
+            # see fine details for identification.
+            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if not ok:
                 logger.warning(f"Could not encode reference image for {f.name}")
                 continue
@@ -1091,12 +1084,9 @@ class RSLTXVPrepareDataset:
                 logger.warning(f"Could not read location reference: {f.name}")
                 continue
             label = f.stem.replace("_", " ").strip()
-            # Resize for payload sanity.
-            h, w = frame.shape[:2]
-            max_dim = 512
-            if max(h, w) > max_dim:
-                scale = max_dim / max(h, w)
-                frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+            # Keep full resolution for location refs — small details like
+            # doors, furniture, and wall decorations matter for identification.
+            # Only JPEG-compress to reduce payload size.
             ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if not ok:
                 logger.warning(f"Could not encode location reference: {f.name}")
@@ -1755,15 +1745,10 @@ class RSLTXVPrepareDataset:
         # images by patch — full-HD PNGs can push a single frame to 1500+
         # tokens, and 5 frames + 9 reference images quickly overflow the
         # context window, causing the model to return an empty response.
-        # 512px JPEG preserves enough detail for character recognition
-        # while keeping each frame small.
+        # Full resolution clip frames — JPEG compression keeps payload
+        # manageable while preserving details for character/location ID.
         b64_images: list[str] = []
         for frame_idx, fr in enumerate(frames, start=1):
-            h, w = fr.shape[:2]
-            max_dim = 512
-            if max(h, w) > max_dim:
-                scale = max_dim / max(h, w)
-                fr = cv2.resize(fr, (int(w * scale), int(h * scale)))
             # Burn frame number into top-left corner so the model knows order
             label = f"Frame {frame_idx}"
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -2021,8 +2006,9 @@ class RSLTXVPrepareDataset:
                 },
             ],
             "stream": True,
+            "think": True,
             "keep_alive": "10m",
-            "options": {"num_ctx": 8192},
+            "options": {"num_ctx": 262144},
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -2165,7 +2151,7 @@ class RSLTXVPrepareDataset:
             "stream": False,
             "keep_alive": "10m",
             "think": False,
-            "options": {"num_ctx": 8192, "num_predict": 64},
+            "options": {"num_ctx": 262144, "num_predict": 64},
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -2261,10 +2247,13 @@ class RSLTXVPrepareDataset:
             f"First, {num_refs} reference images of known locations:\n\n"
             f"{ref_block}\n\n"
             f"Then, {num_frames} frames from a video clip.\n\n"
-            "Which ONE location does the clip take place in? Match by "
-            "walls, furniture, decor, layout. If the clip clearly takes "
-            "place in one of the reference locations, respond with that "
-            "name. Otherwise respond NONE.\n\n"
+            "Which ONE location does the clip take place in? Pay close "
+            "attention to distinguishing details: wall colors and patterns, "
+            "doors, windows, furniture, props, floor patterns, shelving, "
+            "and overall room layout. Compare these specific details against "
+            "the reference images. If the clip clearly matches one of the "
+            "reference locations, respond with that name. Otherwise respond "
+            "NONE.\n\n"
             "Respond with the single name or NONE. No other text."
         )
 
@@ -2294,7 +2283,7 @@ class RSLTXVPrepareDataset:
             "stream": False,
             "keep_alive": "10m",
             "think": False,
-            "options": {"num_ctx": 8192, "num_predict": 64},
+            "options": {"num_ctx": 262144, "num_predict": 64},
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -2369,7 +2358,7 @@ class RSLTXVPrepareDataset:
             "stream": False,
             "keep_alive": "10m",
             "think": False,
-            "options": {"num_ctx": 8192, "num_predict": 64},
+            "options": {"num_ctx": 262144, "num_predict": 64},
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -2429,6 +2418,10 @@ class RSLTXVPrepareDataset:
         """Extract N evenly-spaced frames from a clip for multi-frame captioning.
         This lets the LLM see shot changes and secondary characters that may only
         appear in part of the clip.  Returns an empty list on failure."""
+        # Handle image files directly
+        if clip_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff"):
+            frame = cv2.imread(str(clip_path))
+            return [frame] if frame is not None else []
         cap = cv2.VideoCapture(str(clip_path))
         if not cap.isOpened():
             return []
