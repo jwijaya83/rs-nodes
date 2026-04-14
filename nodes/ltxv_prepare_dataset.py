@@ -958,6 +958,11 @@ class RSLTXVPrepareDataset:
             if img is None:
                 continue
             h, w = img.shape[:2]
+            # Round down to nearest multiple of 32 (crop, don't resize)
+            w = (w // 32) * 32
+            h = (h // 32) * 32
+            if w == 0 or h == 0:
+                continue
             image_bucket = f"{w}x{h}x1"
             if image_bucket not in existing_buckets:
                 resolution_buckets = f"{resolution_buckets};{image_bucket}"
@@ -2334,9 +2339,9 @@ class RSLTXVPrepareDataset:
             "figurines, toys, dolls, posters, photos, costumes on racks, "
             "decorations, or any other inanimate representation do NOT "
             "count, even if they resemble a known character.\n"
-            "- Match by face or unique features, not by similar clothing "
-            "or color. A cowboy hat on a statue does not make it a cowboy "
-            "character.\n"
+            "- Match primarily by face. If you cannot confidently match a "
+            "face but the outfit is identical to a reference character, "
+            "assume it is that character.\n"
             "- Each name can only appear ONCE. Do not assign the same name "
             "to two different figures in the clip.\n"
             "- Ignore characters not in the reference list.\n"

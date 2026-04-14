@@ -261,8 +261,8 @@ class RSLTXVTrainLoRA:
         if not target_modules:
             raise ValueError("At least one module group must be enabled for LoRA training")
 
-        # Output directories
-        output_dir = data_root.parent / "training_output"
+        # Output directories — inside the model's own folder, not the shared parent
+        output_dir = data_root / "training_output"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Use the loras folder that already has files (extra_model_paths), fall back to first
