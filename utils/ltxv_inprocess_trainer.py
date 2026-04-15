@@ -130,6 +130,7 @@ class InProcessTrainer:
         node_id: str = "",
         diverge_detect_steps: int = 150,
         diverge_stop_steps: int = 300,
+        diverge_threshold: float = 0.0001,
         ffn_chunks: int = 0,
         auto_stop: bool = False,
     ):
@@ -186,9 +187,9 @@ class InProcessTrainer:
         # The schedule resets each epoch for proper per-epoch decay curves.
         self._step_epoch = len(dataset)
         self._ema_alpha = 0.02          # EMA decay (smooth over ~50 steps)
-        self._best_ema_loss = None      # Lowest EMA loss seen
-        self._best_ema_step = 0         # Step at which best EMA was recorded
-        self._diverge_detect_step = 0   # Step when upward trend first detected
+        self._diverge_threshold = diverge_threshold  # Minimum slope to trigger detection
+        self._ema_history: list[tuple[int, float]] = []  # (step, ema_loss) for slope computation
+        self._diverge_detect_step = 0   # Step when upward slope first detected
         self._diverge_monitoring = False # Currently in monitoring mode
         self._pre_diverge_ckpt = None   # Path to checkpoint saved at detection
         self._diverge_final_ckpt = None # Set when divergence stops training — used by _save_final_lora
@@ -517,10 +518,12 @@ class InProcessTrainer:
                     pass
 
             # --- Divergence detection ---
-            # Track EMA loss and detect sustained upward trends.
-            # Skip the first 25% of steps (warmup) — matches trendline's 75% window.
-            # If loss climbs for detect_steps: enter monitoring (checkpoint every 100).
-            # If no recovery within stop_steps: stop and keep pre-divergence checkpoint.
+            # Track EMA loss and detect divergence via trendline slope.
+            # Skip the first 25% of steps (warmup).
+            # Uses a sliding window linear regression (same as the JS graph trendline).
+            # If slope is positive (upward) for detect_steps: enter monitoring.
+            # If slope turns negative (downward) during monitoring: recovered, cancel.
+            # If slope stays positive for stop_steps: stop and keep pre-divergence checkpoint.
             warmup_end = start_step + max(50, int((self._total_steps - start_step) * 0.25))
             if self._ema_loss is None:
                 self._ema_loss = loss_val
@@ -528,53 +531,68 @@ class InProcessTrainer:
                 self._ema_loss = (1 - self._ema_alpha) * self._ema_loss + self._ema_alpha * loss_val
 
             if step >= warmup_end:
-                # Initialize best on first post-warmup step
-                if self._best_ema_loss is None:
-                    self._best_ema_loss = self._ema_loss
-                    self._best_ema_step = step
+                self._ema_history.append((step, self._ema_loss))
 
-                # Update best if we've improved
-                if self._ema_loss < self._best_ema_loss:
-                    prev_best = self._best_ema_loss
-                    self._best_ema_loss = self._ema_loss
-                    self._best_ema_step = step
-                    # Recovery — exit monitoring if active
-                    if self._diverge_monitoring:
-                        print(f"[divergence] Recovered at step {step} — EMA loss {self._ema_loss:.4f} < prev best {prev_best:.4f}")
-                        self._diverge_monitoring = False
+                # Compute slope over a trailing window (matching JS graph: 75% of history, min 50 pts)
+                min_pts = 50
+                if len(self._ema_history) >= min_pts:
+                    window_size = max(min_pts, int(len(self._ema_history) * 0.75))
+                    window = self._ema_history[-window_size:]
+                    n = len(window)
+                    sum_x = sum(s for s, _ in window)
+                    sum_y = sum(v for _, v in window)
+                    sum_xy = sum(s * v for s, v in window)
+                    sum_xx = sum(s * s for s, _ in window)
+                    denom = n * sum_xx - sum_x * sum_x
+                    slope = (n * sum_xy - sum_x * sum_y) / denom if denom != 0 else 0.0
+
+                    # Compute predicted % increase over the detection window
+                    # slope is loss/step, so slope * window_size = predicted loss change
+                    # Convert to percentage relative to current EMA loss
+                    predicted_change = slope * self._diverge_detect_steps
+                    pct_change = (predicted_change / self._ema_loss * 100) if self._ema_loss > 0 else 0.0
+
+                    # Only trigger if predicted increase exceeds threshold %
+                    if not self._diverge_monitoring and pct_change > self._diverge_threshold:
+                        # Count consecutive above-threshold steps
+                        if self._diverge_detect_step == 0:
+                            self._diverge_detect_step = step
+                        steps_positive = step - self._diverge_detect_step
+
+                        if steps_positive >= self._diverge_detect_steps:
+                            self._diverge_monitoring = True
+                            self._pre_diverge_ckpt = self._save_checkpoint(step)
+                            print(
+                                f"[divergence] Upward trend detected at step {step} — "
+                                f"predicted +{pct_change:.1f}% (threshold={self._diverge_threshold:.0f}%), EMA={self._ema_loss:.4f}. "
+                                f"Monitoring for {self._diverge_stop_steps} steps."
+                            )
+                    elif not self._diverge_monitoring and pct_change <= self._diverge_threshold:
+                        # Reset counter — trend is below threshold
                         self._diverge_detect_step = 0
-                        self._pre_diverge_ckpt = None
-                        # Resume normal checkpoint cleanup now that we've recovered
-                        self._cleanup_old_checkpoints()
 
-                # Check for sustained upward trend
-                steps_above_best = step - self._best_ema_step
-                if not self._diverge_monitoring and steps_above_best >= self._diverge_detect_steps:
-                    self._diverge_monitoring = True
-                    self._diverge_detect_step = step
-                    self._pre_diverge_ckpt = self._save_checkpoint(step)
-                    print(
-                        f"[divergence] Upward trend detected at step {step} — "
-                        f"EMA loss {self._ema_loss:.4f} vs best {self._best_ema_loss:.4f} "
-                        f"(best was at step {self._best_ema_step}). "
-                        f"Monitoring for {self._diverge_stop_steps} steps, checkpointing every 100."
-                    )
+                    # In monitoring mode
+                    if self._diverge_monitoring:
+                        if slope <= 0:
+                            # Slope turned negative — recovered
+                            print(f"[divergence] Recovered at step {step} — slope turned negative ({slope:.6f}), training continues")
+                            self._diverge_monitoring = False
+                            self._diverge_detect_step = 0
+                            self._pre_diverge_ckpt = None
+                            self._cleanup_old_checkpoints()
+                        else:
+                            steps_in_monitoring = step - self._diverge_detect_step
+                            if steps_in_monitoring > 0 and steps_in_monitoring % 100 == 0:
+                                self._save_checkpoint(step)
 
-                # In monitoring mode: checkpoint every 100 steps, stop after stop_steps
-                if self._diverge_monitoring:
-                    steps_in_monitoring = step - self._diverge_detect_step
-                    if steps_in_monitoring > 0 and steps_in_monitoring % 100 == 0:
-                        self._save_checkpoint(step)
-
-                    if steps_in_monitoring >= self._diverge_stop_steps:
-                        print(
-                            f"[divergence] No recovery after {self._diverge_stop_steps} steps — stopping training. "
-                            f"Best checkpoint was at step {self._best_ema_step}. "
-                            f"Rewinding to pre-divergence checkpoint: {self._pre_diverge_ckpt}"
-                        )
-                        # Flag so _save_final_lora uses the pre-divergence checkpoint
-                        self._diverge_final_ckpt = self._pre_diverge_ckpt
-                        break
+                            if steps_in_monitoring >= self._diverge_stop_steps:
+                                print(
+                                    f"[divergence] No recovery after {self._diverge_stop_steps} steps — stopping training. "
+                                    f"Slope still positive ({slope:.6f}). "
+                                    f"Rewinding to pre-divergence checkpoint: {self._pre_diverge_ckpt}"
+                                )
+                                self._diverge_final_ckpt = self._pre_diverge_ckpt
+                                break
 
             # Validation (save checkpoint first so progress is safe)
             if (

@@ -126,9 +126,10 @@ class RSPromptFormatter:
                 pass
             raise OllamaHTTPError(e.code, e.reason, body) from e
 
-        logger.info("Generating:")
+        import sys
+        sys.stderr.write("Generating: ")
+        sys.stderr.flush()
         full_text = []
-        in_think = False
         try:
             for line in resp:
                 try:
@@ -137,10 +138,13 @@ class RSPromptFormatter:
                     continue
                 token = chunk.get("message", {}).get("content", "")
                 if token:
-                    logger.info(token)
+                    sys.stderr.write(token)
+                    sys.stderr.flush()
                     full_text.append(token)
                 if chunk.get("done"):
                     break
+            sys.stderr.write("\n")
+            sys.stderr.flush()
         finally:
             resp.close()
 

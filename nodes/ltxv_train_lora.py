@@ -153,9 +153,11 @@ class RSLTXVTrainLoRA:
                                                   "tooltip": "-1 = keep all"}),
                 # Divergence detection
                 "diverge_detect_steps": ("INT", {"default": 150, "min": 10, "max": 5000, "step": 10,
-                                                 "tooltip": "Steps above best EMA loss before entering monitoring mode"}),
+                                                 "tooltip": "Steps with positive slope before entering monitoring mode"}),
                 "diverge_stop_steps":   ("INT", {"default": 300, "min": 10, "max": 5000, "step": 10,
-                                                 "tooltip": "Steps in monitoring without recovery before stopping training"}),
+                                                 "tooltip": "Steps in monitoring without slope recovery before stopping training"}),
+                "diverge_threshold":    ("FLOAT", {"default": 20.0, "min": 0.0, "max": 200.0, "step": 1.0,
+                                                   "tooltip": "Predicted % loss increase over detect window to trigger monitoring. 20 = start if trending toward 20% increase."}),
                 # Resume
                 "resume": ("BOOLEAN", {"default": False, "tooltip": "Resume from latest checkpoint in output directory"}),
                 # Debug
@@ -237,6 +239,7 @@ class RSLTXVTrainLoRA:
         keep_last_n: int = 2,
         diverge_detect_steps: int = 150,
         diverge_stop_steps: int = 300,
+        diverge_threshold: float = 0.0001,
         resume: bool = False,
         validation_only: bool = False,
         vae=None,
@@ -487,6 +490,7 @@ class RSLTXVTrainLoRA:
             checkpoint_interval=checkpoint_interval,
             diverge_detect_steps=diverge_detect_steps,
             diverge_stop_steps=diverge_stop_steps,
+            diverge_threshold=diverge_threshold,
             validation_config=validation_config,
             cached_validation_embeddings=cached_validation_embeddings,
             audio_vae_decoder=audio_vae_decoder,

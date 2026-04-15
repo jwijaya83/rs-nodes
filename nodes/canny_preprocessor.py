@@ -26,8 +26,8 @@ class RSCannyPreprocessor:
                 "image": ("IMAGE",),
             },
             "optional": {
-                "width":          ("INT", {"default": 768, "min": 128, "max": 8192, "step": 128}),
-                "height":         ("INT", {"default": 512, "min": 128, "max": 8192, "step": 128}),
+                "width":          ("INT", {"default": 768, "min": 32, "max": 8192, "step": 32}),
+                "height":         ("INT", {"default": 512, "min": 32, "max": 8192, "step": 32}),
                 "low_threshold":  ("INT", {"default": 100, "min": 0, "max": 255, "step": 1}),
                 "high_threshold": ("INT", {"default": 200, "min": 0, "max": 255, "step": 1}),
                 "clahe_clip":     ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.1,
@@ -51,8 +51,8 @@ class RSCannyPreprocessor:
         total_pixels = width * height
         target_h = int(math.sqrt(total_pixels / aspect))
         target_w = int(target_h * aspect)
-        target_w = max(128, round(target_w / 128) * 128)
-        target_h = max(128, round(target_h / 128) * 128)
+        target_w = max(32, round(target_w / 32) * 32)
+        target_h = max(32, round(target_h / 32) * 32)
 
         logger.info(f"{src_w}x{src_h} → {target_w}x{target_h}")
 
