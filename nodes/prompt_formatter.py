@@ -108,6 +108,7 @@ class RSPromptFormatter:
         """Send a streaming chat request and print tokens as they arrive."""
         url = f"{base_url}/api/chat"
         payload["stream"] = True
+        payload["think"] = True
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -126,33 +127,45 @@ class RSPromptFormatter:
                 pass
             raise OllamaHTTPError(e.code, e.reason, body) from e
 
-        import sys
-        sys.stderr.write("Generating: ")
-        sys.stderr.flush()
-        full_text = []
+        thinking_started = False
+        content_started = False
+        caption_parts = []
         try:
             for line in resp:
                 try:
                     chunk = json.loads(line.decode("utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
-                token = chunk.get("message", {}).get("content", "")
-                if token:
-                    sys.stderr.write(token)
+                msg = chunk.get("message", {})
+                think_chunk = msg.get("thinking", "")
+                content_chunk = msg.get("content", "")
+                if think_chunk:
+                    if not thinking_started:
+                        sys.stderr.write("[thinking] ")
+                        thinking_started = True
+                    sys.stderr.write(think_chunk)
                     sys.stderr.flush()
-                    full_text.append(token)
+                if content_chunk:
+                    if thinking_started and not content_started:
+                        sys.stderr.write("\nGenerating: ")
+                    elif not content_started:
+                        sys.stderr.write("Generating: ")
+                    content_started = True
+                    sys.stderr.write(content_chunk)
+                    sys.stderr.flush()
+                    caption_parts.append(content_chunk)
                 if chunk.get("done"):
+                    sys.stderr.write("\n")
+                    sys.stderr.flush()
                     break
-            sys.stderr.write("\n")
-            sys.stderr.flush()
         finally:
             resp.close()
 
-        raw = "".join(full_text)
-        # Strip <think>...</think> blocks (including partial/unclosed)
-        cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+        cleaned = "".join(caption_parts).strip()
+        # Safety: strip any <think> tags that leaked into content
+        cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL)
         cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL)
-        return cleaned
+        return cleaned.strip()
 
     def _resolve_cache_path(self, output_dir, cache_file):
         import folder_paths
