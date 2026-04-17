@@ -177,13 +177,27 @@ class RSPromptFormatter:
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, cache_file.strip())
 
-    def _encode_image(self, image_tensor):
-        """Convert an IMAGE tensor to base64 PNG string for Ollama."""
+    def _encode_image(self, image_tensor, label: str = ""):
+        """Convert an IMAGE tensor to a labeled, high-res base64 JPEG for Ollama.
+        Burns the label onto the image so the model can visually identify each frame."""
         frame = image_tensor[0]  # first frame [H, W, C]
         img_array = (frame.cpu().numpy() * 255).astype(np.uint8)
+
+        # Burn label onto image (same approach as data prepper)
+        if label:
+            import cv2
+            bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = max(0.7, bgr.shape[1] / 800)  # scale with image width
+            thickness = max(2, int(font_scale * 2.5))
+            (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+            cv2.rectangle(bgr, (0, 0), (tw + 8, th + 10), (0, 0, 0), -1)
+            cv2.putText(bgr, label, (4, th + 6), font, font_scale, (255, 255, 255), thickness)
+            img_array = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
         img = Image.fromarray(img_array)
         buf = io.BytesIO()
-        img.save(buf, format="PNG")
+        img.save(buf, format="JPEG", quality=90)
         return base64.b64encode(buf.getvalue()).decode("utf-8")
 
     def format_prompt(self, prompt: str, system_prompt: str, model: str, ollama_url: str,
@@ -218,14 +232,18 @@ class RSPromptFormatter:
 
         base = ollama_url.rstrip("/")
 
-        # Encode images and build prompt with labels
+        # Encode images with burned-in labels
         encoded_images = []
         if images:
-            label_text = "Reference images:\n"
             for label, img_tensor in images:
-                encoded_images.append(self._encode_image(img_tensor))
-                label_text += f"- {label}\n"
-            content = f"{label_text}\n{prompt}"
+                encoded_images.append(self._encode_image(img_tensor, label=label))
+            frame_listing = ", ".join(label for label, _ in images)
+            label_text = (
+                f"Attached are {len(images)} labeled reference frames from "
+                f"the video ({frame_listing}). Each frame has its label "
+                f"burned into the top-left corner.\n\n"
+            )
+            content = f"{label_text}{prompt}"
         else:
             content = prompt
 
