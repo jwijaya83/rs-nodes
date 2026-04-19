@@ -35,8 +35,8 @@ class RSVideoSave:
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("file_path",)
+    RETURN_TYPES = ("IMAGE", "AUDIO", "STRING")
+    RETURN_NAMES = ("images", "audio", "file_path")
     FUNCTION = "save_video"
     CATEGORY = "rs-nodes"
     OUTPUT_NODE = True
@@ -159,4 +159,4 @@ class RSVideoSave:
         file_size_mb = os.path.getsize(out_path) / (1024 * 1024)
         logger.info(f"Saved ProRes {profile} ({num_frames} frames, {fps}fps): {out_path} ({file_size_mb:.1f} MB)")
 
-        return (out_path,)
+        return (images, audio, out_path)
