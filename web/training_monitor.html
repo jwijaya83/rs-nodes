@@ -50,6 +50,14 @@ function connect() {
                 lossData[id] = { steps: [], losses: [], lrs: [], timestamps: [], totalSteps: 0 };
             }
             const ld = lossData[id];
+            // New training run started — reload history from server
+            if (ld.steps.length > 0 && d.step <= ld.steps[0]) {
+                ld.steps = [];
+                ld.losses = [];
+                ld.lrs = [];
+                ld.timestamps = [];
+                loadHistory();
+            }
             ld.totalSteps = d.total_steps;
             ld.emaLoss = d.ema_loss;
             ld.monitoring = d.monitoring;
