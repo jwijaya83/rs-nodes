@@ -27,6 +27,37 @@ from ..utils.ltxv_train_env import (
 
 logger = logging.getLogger(__name__)
 
+# PromptServer is used to push live status updates to the node's on-canvas
+# widget while the dataset builds. Guard the import so the node still loads
+# if the API moves around.
+try:
+    from server import PromptServer  # type: ignore
+except Exception:
+    PromptServer = None  # type: ignore
+
+
+def _emit_prepper_status(node_id, char_counts: dict[str, int], total_clips: int, max_samples: int) -> None:
+    """Send the current character counts + running total to the frontend so
+    the node UI can update live. No-op if PromptServer isn't available or
+    node_id wasn't provided."""
+    if PromptServer is None or node_id is None:
+        return
+    lines = []
+    for name in sorted(char_counts):
+        lines.append(f"  {name}: {char_counts[name]}")
+    if max_samples > 0:
+        lines.append(f"total: {total_clips}/{max_samples}")
+    else:
+        lines.append(f"total: {total_clips}")
+    try:
+        PromptServer.instance.send_sync("rs.prepper.status", {
+            "node_id": str(node_id),
+            "text": "\n".join(lines),
+        })
+    except Exception:
+        pass
+
+
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"}
 
@@ -500,6 +531,7 @@ class RSLTXVPrepareDataset:
                 "vae": ("VAE", {"tooltip": "VAE (from CheckpointLoaderSimple). When connected, encodes latents in-process instead of slow subprocess."}),
                 "clip_vision": ("CLIP_VISION", {"tooltip": "Optional CLIP Vision model (from CLIPVisionLoader). Enables matching of non-human characters (puppets, props, objects) in character_refs_folder. Human characters use face matching regardless."}),
             },
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = ("STRING", "STRING")
@@ -546,6 +578,7 @@ class RSLTXVPrepareDataset:
         clip_vision=None,
         target_fps: float = 0.0,
         max_samples: int = 0,
+        unique_id=None,
     ):
         validate_submodule()
         # Only validate/download text encoder if we'll need it for the subprocess
@@ -635,6 +668,19 @@ class RSLTXVPrepareDataset:
 
         # Track which source files are already in the JSON
         processed_sources = {e.get("source_file", "") for e in existing_entries}
+
+        def _emit_status() -> None:
+            """Compute per-character counts from existing_entries and push to
+            the node UI so the user sees progress live."""
+            counts: dict[str, int] = {}
+            for e in existing_entries:
+                for c in e.get("characters", []):
+                    counts[c] = counts.get(c, 0) + 1
+            _emit_prepper_status(unique_id, counts, len(existing_entries), max_samples)
+
+        # Show the starting state immediately so the widget isn't blank while
+        # the long setup runs.
+        _emit_status()
 
         # Load rejected clips so we don't re-process them
         rejected_path = output_dir / "rejected.json"
@@ -948,6 +994,7 @@ class RSLTXVPrepareDataset:
                                 clips_budget = max_samples - len(existing_entries)
                                 with open(dataset_json_path, "w") as f:
                                     json.dump(existing_entries, f, indent=2)
+                                _emit_status()
                                 logger.info(
                                     f"Rebalanced: removed {removed_for_balance} clips, "
                                     f"{clips_budget} slots now available"
@@ -1128,6 +1175,7 @@ class RSLTXVPrepareDataset:
                             clips_produced_this_pass += 1
                             total_clips_produced += 1
                             pbar.update_absolute(clips_produced_this_pass, max_samples - len(existing_entries) + clips_produced_this_pass)
+                            _emit_status()
 
                         # Save dataset.json after each chunk
                         with open(dataset_json_path, "w") as f:
@@ -1212,6 +1260,7 @@ class RSLTXVPrepareDataset:
                                             entry["reference_path"] = str(ref_file)
                                             break
                                 existing_entries.append(entry)
+                                _emit_status()
                         else:
                             results = self._process_video(
                                 item["path"], clips_dir, target_w, target_h, target_frames,
@@ -1247,6 +1296,7 @@ class RSLTXVPrepareDataset:
                                             entry["reference_path"] = str(ref_file)
                                             break
                                 existing_entries.append(entry)
+                                _emit_status()
 
                         # Record fully-rejected source files so they aren't reprocessed
                         if not produced_clips:

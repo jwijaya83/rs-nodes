@@ -160,12 +160,44 @@ function addSections(node, sections) {
 // Training monitor is now a standalone page: training_monitor.html
 // Open it in a separate browser tab for full-size, resizable charts.
 
+// Attach a read-only multi-line widget to a prepare-dataset node that the
+// backend can fill with live character counts + running total via the
+// "rs.prepper.status" event.
+function ensurePrepperStatusWidget(node) {
+    let w = node.widgets && node.widgets.find((w) => w.name === "status_display");
+    if (w) return w;
+    w = node.addWidget("text", "status_display", "(waiting for run...)", () => {}, {
+        multiline: true,
+        serialize: false,
+    });
+    // Make it visually a display, not an editable field.
+    if (w.inputEl) {
+        w.inputEl.readOnly = true;
+        w.inputEl.style.opacity = "0.85";
+    }
+    return w;
+}
+
+// Listen once per page load for status updates.
+api.addEventListener("rs.prepper.status", (event) => {
+    const detail = event.detail || {};
+    const { node_id, text } = detail;
+    if (node_id === undefined || node_id === null) return;
+    const target = app.graph.getNodeById(Number(node_id));
+    if (!target) return;
+    const widget = ensurePrepperStatusWidget(target);
+    widget.value = text || "";
+    if (widget.inputEl) widget.inputEl.value = widget.value;
+    target.setDirtyCanvas(true, true);
+});
+
 app.registerExtension({
     name: "rs-nodes.LTXVTrain",
 
     nodeCreated(node) {
         if (node.comfyClass === "RSLTXVPrepareDataset") {
             addSections(node, PREPARE_SECTIONS);
+            ensurePrepperStatusWidget(node);
         } else if (node.comfyClass === "RSLTXVTrainLoRA") {
             addSections(node, TRAIN_SECTIONS);
 
