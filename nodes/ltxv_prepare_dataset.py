@@ -2294,35 +2294,77 @@ class RSLTXVPrepareDataset:
             sample_positions = [p for p in sample_positions if start_frame <= p < end_frame]
 
             if face_detection and character_refs:
-                matched_names: set[str] = set()
-                face_anchor = None  # (frame, rect) for crop if we find one
-                # Character must appear in majority of sample positions
-                hits_per_pos = 0
-                for sp in sample_positions:
-                    sample = self._read_frame(video_path, sp)
-                    if sample is None:
-                        continue
-                    hits = self._match_characters_in_frame(
-                        sample, character_refs, face_similarity,
-                        clip_vision=clip_vision,
-                        first_match_only=True,
-                    )
-                    if hits:
-                        hits_per_pos += 1
-                        matched_names |= hits
-                        if face_anchor is None:
-                            face = _detect_face_dnn(sample)
-                            if face is not None:
-                                face_anchor = (sample, face)
-                # Require any named character visible in at least this fraction of
-                # sample positions (default 75% → e.g. 3 of 4, 6 of 8). Doesn't have
-                # to be the same character across positions — any mix of named refs
-                # counts. Floor of 1 so a 10% setting on a tiny sample_count still
-                # requires at least one hit.
+                # Parse the percentage setting once per chunk.
                 try:
                     _pct = int(str(char_positions_required).rstrip("%")) / 100.0
                 except ValueError:
                     _pct = 0.75
+
+                def _validate_at(_start: int, _end: int):
+                    """Run the full character+unknown-face validation at a
+                    given [start, end) range. Returns a dict with metrics."""
+                    n = max(2, sample_count)
+                    clen = _end - _start
+                    positions = [_start + i * clen // n for i in range(n)]
+                    positions = [p for p in positions if _start <= p < _end]
+                    matched: set[str] = set()
+                    hits = 0
+                    has_hit = [False] * len(positions)
+                    anchor = None
+                    # Gate pass — first_match_only for speed, and pick face anchor.
+                    for idx, sp in enumerate(positions):
+                        sample = self._read_frame(video_path, sp)
+                        if sample is None:
+                            continue
+                        h = self._match_characters_in_frame(
+                            sample, character_refs, face_similarity,
+                            clip_vision=clip_vision, first_match_only=True,
+                        )
+                        if h:
+                            hits += 1
+                            has_hit[idx] = True
+                            matched |= h
+                            if anchor is None:
+                                face = _detect_face_dnn(sample)
+                                if face is not None:
+                                    anchor = (sample, face)
+                    # Rescan — enumerate any additional characters and count
+                    # unknown faces.
+                    unknown = 0
+                    need_more = len(matched) < len(character_refs)
+                    for idx, sp in enumerate(positions):
+                        sample = self._read_frame(video_path, sp)
+                        if sample is None:
+                            continue
+                        if need_more:
+                            extra = self._match_characters_in_frame(
+                                sample, character_refs, face_similarity,
+                                clip_vision=clip_vision, first_match_only=False,
+                            )
+                            if extra:
+                                matched |= extra
+                                has_hit[idx] = True
+                                if len(matched) == len(character_refs):
+                                    need_more = False
+                        if _has_unknown_face(sample, character_refs, face_similarity):
+                            unknown += 1
+                    return {
+                        "sample_positions": positions,
+                        "matched_names": matched,
+                        "hits_per_pos": hits,
+                        "pos_has_hit": has_hit,
+                        "face_anchor": anchor,
+                        "unknown_face_positions": unknown,
+                    }
+
+                info = _validate_at(start_frame, end_frame)
+                sample_positions = info["sample_positions"]
+                matched_names = info["matched_names"]
+                hits_per_pos = info["hits_per_pos"]
+                face_anchor = info["face_anchor"]
+                unknown_face_positions = info["unknown_face_positions"]
+                pos_has_hit = info["pos_has_hit"]
+
                 min_hits = max(1, int(round(_pct * len(sample_positions))))
                 chunk_file = f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
                 if hits_per_pos < min_hits:
@@ -2338,28 +2380,57 @@ class RSLTXVPrepareDataset:
                     start_frame = end_frame
                     chunk_idx += 1
                     continue
-                # Gate passed — single pass over sample positions that both
-                # enumerates additional known characters (first_match_only=False)
-                # and counts positions containing any unknown face. User wants
-                # clips containing ONLY named characters; small amounts of noise
-                # are tolerated, so we reject only when 2 or more sample positions
-                # show an unknown face.
-                unknown_face_positions = 0
-                need_more_chars = len(matched_names) < len(character_refs)
-                for sp in sample_positions:
-                    sample = self._read_frame(video_path, sp)
-                    if sample is None:
-                        continue
-                    if need_more_chars:
-                        matched_names |= self._match_characters_in_frame(
-                            sample, character_refs, face_similarity,
-                            clip_vision=clip_vision,
-                            first_match_only=False,
-                        )
-                        if len(matched_names) == len(character_refs):
-                            need_more_chars = False
-                    if _has_unknown_face(sample, character_refs, face_similarity):
-                        unknown_face_positions += 1
+
+                # Expand-to-fit: if every detected character position is in
+                # one half of the chunk, the character's on-screen window
+                # probably extends just beyond that end. Shift the chunk in
+                # the appropriate direction by chunk_length/2 (snapped to a
+                # multiple of 8 for VAE alignment), re-validate, and use the
+                # new position if it passes both gates and is better-balanced.
+                # Only enabled in rolling/targeted mode (target_chunk_idx >= 0)
+                # where each call handles one chunk — in sequential mode the
+                # mutated start/end_frame would cause overlap with the next
+                # chunk in the loop.
+                hit_indices = [i for i, h in enumerate(pos_has_hit) if h]
+                n_pos = len(sample_positions)
+                if target_chunk_idx >= 0 and hit_indices and n_pos >= 2:
+                    half = n_pos / 2
+                    all_front = all(i < half for i in hit_indices)
+                    all_back = all(i >= half for i in hit_indices)
+                    _shift = 0
+                    _chunk_len = end_frame - start_frame
+                    _snap8 = lambda x: (x // 8) * 8
+                    if all_front:
+                        _shift = -_snap8(_chunk_len // 2)
+                    elif all_back:
+                        _shift = _snap8(_chunk_len // 2)
+                    if _shift != 0:
+                        _ns, _ne = start_frame + _shift, end_frame + _shift
+                        if _ns >= first_frame and _ne <= last_frame:
+                            alt = _validate_at(_ns, _ne)
+                            _alt_hits = [i for i, h in enumerate(alt["pos_has_hit"]) if h]
+                            _alt_balanced = (
+                                bool(_alt_hits)
+                                and not all(i < half for i in _alt_hits)
+                                and not all(i >= half for i in _alt_hits)
+                            )
+                            if (
+                                alt["hits_per_pos"] >= min_hits
+                                and alt["unknown_face_positions"] <= allow_unknown_faces_in
+                                and _alt_balanced
+                            ):
+                                logger.info(
+                                    f"Chunk {chunk_idx}: shifted {_shift:+d} frames "
+                                    f"to better capture character window"
+                                )
+                                start_frame, end_frame = _ns, _ne
+                                sample_positions = alt["sample_positions"]
+                                matched_names = alt["matched_names"]
+                                hits_per_pos = alt["hits_per_pos"]
+                                face_anchor = alt["face_anchor"]
+                                unknown_face_positions = alt["unknown_face_positions"]
+                                pos_has_hit = alt["pos_has_hit"]
+
                 if unknown_face_positions > allow_unknown_faces_in:
                     logger.info(
                         f"Chunk {chunk_idx}: rejected — unknown faces in "

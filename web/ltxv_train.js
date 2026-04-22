@@ -160,21 +160,53 @@ function addSections(node, sections) {
 // Training monitor is now a standalone page: training_monitor.html
 // Open it in a separate browser tab for full-size, resizable charts.
 
-// Attach a read-only multi-line widget to a prepare-dataset node that the
-// backend can fill with live character counts + running total via the
-// "rs.prepper.status" event.
+// Attach a canvas-drawn stats panel to a prepare-dataset node. The backend
+// pushes live counts via the "rs.prepper.status" event; we just set the
+// widget value and repaint. Not an input field — purely a readout.
 function ensurePrepperStatusWidget(node) {
     let w = node.widgets && node.widgets.find((w) => w.name === "status_display");
     if (w) return w;
-    w = node.addWidget("text", "status_display", "(waiting for run...)", () => {}, {
-        multiline: true,
+    const LINE_H = 14;
+    const PAD = 6;
+    w = {
+        name: "status_display",
+        type: "custom",
+        value: "(waiting for run...)",
         serialize: false,
-    });
-    // Make it visually a display, not an editable field.
-    if (w.inputEl) {
-        w.inputEl.readOnly = true;
-        w.inputEl.style.opacity = "0.85";
-    }
+        options: { serialize: false },
+        draw(ctx, graphNode, width, posY, _slotH) {
+            const lines = (this.value || "").split("\n");
+            const boxH = Math.max(LINE_H + PAD * 2, lines.length * LINE_H + PAD * 2);
+            const x = PAD;
+            const w_ = width - PAD * 2;
+            ctx.fillStyle = "#1a1a1a";
+            ctx.strokeStyle = "#3a3a3a";
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            if (ctx.roundRect) {
+                ctx.roundRect(x, posY, w_, boxH, 4);
+            } else {
+                ctx.rect(x, posY, w_, boxH);
+            }
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle = "#d8d8d8";
+            ctx.font = "12px ui-monospace, 'Cascadia Code', 'Consolas', monospace";
+            ctx.textAlign = "left";
+            ctx.textBaseline = "top";
+            let y = posY + PAD;
+            for (const line of lines) {
+                ctx.fillText(line, x + PAD, y);
+                y += LINE_H;
+            }
+            this.computedHeight = boxH;
+        },
+        computeSize(width) {
+            const lines = (this.value || "").split("\n");
+            return [width, Math.max(LINE_H + PAD * 2, lines.length * LINE_H + PAD * 2)];
+        },
+    };
+    node.addCustomWidget(w);
     return w;
 }
 
@@ -187,7 +219,7 @@ api.addEventListener("rs.prepper.status", (event) => {
     if (!target) return;
     const widget = ensurePrepperStatusWidget(target);
     widget.value = text || "";
-    if (widget.inputEl) widget.inputEl.value = widget.value;
+    target.setSize(target.computeSize());
     target.setDirtyCanvas(true, true);
 });
 
