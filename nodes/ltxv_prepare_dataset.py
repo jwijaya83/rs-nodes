@@ -41,14 +41,17 @@ def _emit_prepper_status(
     char_counts: dict[str, int],
     total_clips: int,
     max_samples: int,
+    pool_remaining: int = 0,
+    pool_total: int = 0,
 ) -> None:
     """Send the current character counts + running total to the frontend so
     the node UI can update live. No-op if PromptServer isn't available or
     node_id wasn't provided.
 
     `total` on the panel tracks APPEARANCES (sum of per-character counts),
-    not clip count — that's what max_samples caps. `clips` is shown on a
-    separate line so the operator can see both numbers at once."""
+    not clip count — that's what max_samples caps. `clips` and
+    `chunk pool` show separately so the operator can see capacity usage,
+    dataset size, and how much of the source pool remains to search."""
     if PromptServer is None or node_id is None:
         return
     lines = []
@@ -59,7 +62,12 @@ def _emit_prepper_status(
         lines.append(f"total: {total_appearances}/{max_samples}")
     else:
         lines.append(f"total: {total_appearances}")
+    # Blank line visually separates the per-char + total block from the
+    # dataset/pool counters below.
+    lines.append("")
     lines.append(f"clips: {total_clips}")
+    if pool_total > 0:
+        lines.append(f"chunk pool: {pool_remaining}/{pool_total}")
     try:
         PromptServer.instance.send_sync("rs.prepper.status", {
             "node_id": str(node_id),
@@ -680,6 +688,10 @@ class RSLTXVPrepareDataset:
         # Track which source files are already in the JSON
         processed_sources = {e.get("source_file", "") for e in existing_entries}
 
+        # Mutable container so the closure and the pool-building code can
+        # share state without nonlocal boilerplate.
+        pool_state = {"remaining": 0, "total": 0}
+
         def _emit_status() -> None:
             """Compute per-character counts from existing_entries and push to
             the node UI so the user sees progress live."""
@@ -687,7 +699,11 @@ class RSLTXVPrepareDataset:
             for e in existing_entries:
                 for c in e.get("characters", []):
                     counts[c] = counts.get(c, 0) + 1
-            _emit_prepper_status(unique_id, counts, len(existing_entries), max_samples)
+            _emit_prepper_status(
+                unique_id, counts, len(existing_entries), max_samples,
+                pool_remaining=pool_state["remaining"],
+                pool_total=pool_state["total"],
+            )
 
         # Show the starting state immediately so the widget isn't blank while
         # the long setup runs.
@@ -1126,6 +1142,12 @@ class RSLTXVPrepareDataset:
                         random.shuffle(chunk_pool)
                         logger.info(f"Chunk pool: {len(chunk_pool)} available chunks across {len(incomplete)} videos")
 
+                    # Publish the pool's initial size so the live panel can
+                    # show progress through the pool.
+                    pool_state["total"] = len(chunk_pool)
+                    pool_state["remaining"] = len(chunk_pool)
+                    _emit_status()
+
                     def _save_pool() -> None:
                         try:
                             with open(pool_path, "w") as pf:
@@ -1151,6 +1173,7 @@ class RSLTXVPrepareDataset:
                     while chunk_pool and _any_under_quota():
                         item, ci = chunk_pool.pop()
                         _save_pool()
+                        pool_state["remaining"] = len(chunk_pool)
                         # Skip chunks that a previous shifted extraction in this
                         # pass has already absorbed — their frames are largely
                         # covered by an earlier clip so re-extracting would
