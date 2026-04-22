@@ -2501,16 +2501,18 @@ class RSLTXVPrepareDataset:
                     """Run full character + unknown-face validation at a
                     given [start, end) range.
 
-                    Hit counting is target-aware: `hits`/`pos_has_hit` only
-                    count positions where a target character was detected
-                    (i.e. one we still need more of). Over-quota characters
-                    still appear in `matched_names` for the final caption
-                    and the quota accounting, but they don't drive the gate
-                    or the shift logic — we don't waste effort rescuing
-                    chunks for characters we already have enough of.
+                    Target-aware counting: `hits`/`pos_has_hit` only count
+                    positions where a TARGET character was detected (one
+                    we still need more of). Over-quota characters still
+                    appear in `matched_names` for the final caption and
+                    still count as KNOWN (so they don't inflate the
+                    unknown-face count) — they're just not what the seek
+                    is chasing. Which character eventually rolls in along
+                    with the target is handled later by the subset-swap
+                    intake filter.
 
-                    When target_chars is None (classic / single-target mode),
-                    every detected reference character counts as a hit."""
+                    When target_chars is None (classic / single-target
+                    mode), every reference character counts as a hit."""
                     n = max(2, sample_count)
                     clen = _end - _start
                     positions = [_start + i * clen // n for i in range(n)]
@@ -2524,9 +2526,6 @@ class RSLTXVPrepareDataset:
                         sample = self._read_frame(video_path, sp)
                         if sample is None:
                             continue
-                        # Enumerate ALL detected characters per frame so
-                        # target detection isn't defeated when a non-target
-                        # character's face dominates.
                         found = self._match_characters_in_frame(
                             sample, character_refs, face_similarity,
                             clip_vision=clip_vision, first_match_only=False,
@@ -2545,6 +2544,9 @@ class RSLTXVPrepareDataset:
                                     face = _detect_face_dnn(sample)
                                     if face is not None:
                                         anchor = (sample, face)
+                        # Full character_refs used for unknown detection —
+                        # any KNOWN character (target or over-quota) is
+                        # still "known" and doesn't count as unknown.
                         if _has_unknown_face(sample, character_refs, face_similarity):
                             unknown_at.append(idx)
                     return {
