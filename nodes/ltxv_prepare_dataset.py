@@ -1126,6 +1126,15 @@ class RSLTXVPrepareDataset:
                             continue
                         source_path = str(item["path"])
 
+                        # Target characters are those still below their quota.
+                        # Characters at quota are identified (for captioning /
+                        # accounting) but don't drive the gate or shift logic,
+                        # so we stop wasting time rescuing clips for them.
+                        _target_chars = (
+                            {n for n in char_names if char_counts.get(n, 0) < per_char_quota.get(n, 0)}
+                            if per_char_quota else None
+                        )
+
                         results = self._process_video(
                             item["path"], clips_dir, target_w, target_h, target_frames,
                             face_detection,
@@ -1142,6 +1151,7 @@ class RSLTXVPrepareDataset:
                             sample_count=sample_count,
                             char_positions_required=char_positions_required,
                             allow_unknown_faces_in=allow_unknown_faces_in,
+                            target_chars=_target_chars,
                         )
                         # Persist any content-level rejections recorded by
                         # _process_video, and fold any absorbed-neighbor chunks
@@ -2161,6 +2171,7 @@ class RSLTXVPrepareDataset:
         sample_count: int = 4,
         char_positions_required: str = "75%",
         allow_unknown_faces_in: int = 1,
+        target_chars: set[str] | None = None,
     ) -> list[Path]:
         """Split a video into chunks, detect faces, crop or scale.
         Returns list of output clip paths (skips chunks with no face when face_detection is on).
@@ -2331,8 +2342,19 @@ class RSLTXVPrepareDataset:
                     _pct = 0.75
 
                 def _validate_at(_start: int, _end: int):
-                    """Run the full character+unknown-face validation at a
-                    given [start, end) range. Returns a dict with metrics."""
+                    """Run full character + unknown-face validation at a
+                    given [start, end) range.
+
+                    Hit counting is target-aware: `hits`/`pos_has_hit` only
+                    count positions where a target character was detected
+                    (i.e. one we still need more of). Over-quota characters
+                    still appear in `matched_names` for the final caption
+                    and the quota accounting, but they don't drive the gate
+                    or the shift logic — we don't waste effort rescuing
+                    chunks for characters we already have enough of.
+
+                    When target_chars is None (classic / single-target mode),
+                    every detected reference character counts as a hit."""
                     n = max(2, sample_count)
                     clen = _end - _start
                     positions = [_start + i * clen // n for i in range(n)]
@@ -2341,41 +2363,32 @@ class RSLTXVPrepareDataset:
                     hits = 0
                     has_hit = [False] * len(positions)
                     anchor = None
-                    # Gate pass — first_match_only for speed, and pick face anchor.
-                    for idx, sp in enumerate(positions):
-                        sample = self._read_frame(video_path, sp)
-                        if sample is None:
-                            continue
-                        h = self._match_characters_in_frame(
-                            sample, character_refs, face_similarity,
-                            clip_vision=clip_vision, first_match_only=True,
-                        )
-                        if h:
-                            hits += 1
-                            has_hit[idx] = True
-                            matched |= h
-                            if anchor is None:
-                                face = _detect_face_dnn(sample)
-                                if face is not None:
-                                    anchor = (sample, face)
-                    # Rescan — enumerate any additional characters and track
-                    # which sample positions contain unknown faces.
                     unknown_at: list[int] = []
-                    need_more = len(matched) < len(character_refs)
                     for idx, sp in enumerate(positions):
                         sample = self._read_frame(video_path, sp)
                         if sample is None:
                             continue
-                        if need_more:
-                            extra = self._match_characters_in_frame(
-                                sample, character_refs, face_similarity,
-                                clip_vision=clip_vision, first_match_only=False,
+                        # Enumerate ALL detected characters per frame so
+                        # target detection isn't defeated when a non-target
+                        # character's face dominates.
+                        found = self._match_characters_in_frame(
+                            sample, character_refs, face_similarity,
+                            clip_vision=clip_vision, first_match_only=False,
+                        )
+                        if found:
+                            matched |= found
+                            is_target_hit = (
+                                bool(found & target_chars)
+                                if target_chars is not None
+                                else True
                             )
-                            if extra:
-                                matched |= extra
+                            if is_target_hit:
+                                hits += 1
                                 has_hit[idx] = True
-                                if len(matched) == len(character_refs):
-                                    need_more = False
+                                if anchor is None:
+                                    face = _detect_face_dnn(sample)
+                                    if face is not None:
+                                        anchor = (sample, face)
                         if _has_unknown_face(sample, character_refs, face_similarity):
                             unknown_at.append(idx)
                     return {
@@ -2400,16 +2413,28 @@ class RSLTXVPrepareDataset:
                 min_hits = max(1, int(round(_pct * len(sample_positions))))
                 chunk_file = f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
 
-                # Early reject only if we found NO character at all — no
-                # direction clue for a rescue shift.
+                # Early reject only if we found NO target character at all.
+                # If matched_names has entries they're all over-quota — we're
+                # not going to chase them. No direction clue for rescue.
                 if hits_per_pos == 0:
-                    logger.info(f"No known characters in chunk {chunk_idx} of {video_path.name}, skipping")
-                    self._rejected_chunks.append({
-                        "source_file": str(video_path),
-                        "media_path": str(clips_dir / chunk_file),
-                        "chunk_file": chunk_file,
-                        "reason": "no_known_character",
-                    })
+                    if matched_names:
+                        # Only over-quota chars here. Skip in-memory only so
+                        # quota changes between runs can revisit the chunk.
+                        logger.info(
+                            f"Chunk {chunk_idx} of {video_path.name}: "
+                            f"only over-quota chars ({sorted(matched_names)}), skipping"
+                        )
+                        self._consumed_chunks.append(chunk_file)
+                    else:
+                        # Truly no known character — persist so future runs
+                        # don't retry.
+                        logger.info(f"No known characters in chunk {chunk_idx} of {video_path.name}, skipping")
+                        self._rejected_chunks.append({
+                            "source_file": str(video_path),
+                            "media_path": str(clips_dir / chunk_file),
+                            "chunk_file": chunk_file,
+                            "reason": "no_known_character",
+                        })
                     if target_chunk_idx >= 0:
                         break
                     start_frame = end_frame
