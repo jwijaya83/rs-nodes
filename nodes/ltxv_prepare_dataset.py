@@ -1113,6 +1113,17 @@ class RSLTXVPrepareDataset:
                     while clips_budget > 0 and chunk_pool:
                         item, ci = chunk_pool.pop()
                         _save_pool()
+                        # Skip chunks that a previous shifted extraction in this
+                        # pass has already absorbed — their frames are largely
+                        # covered by an earlier clip so re-extracting would
+                        # produce mostly-duplicate content.
+                        _popped_file = f"{item['path'].stem}_chunk{ci:04d}.mp4"
+                        if _popped_file in rejected_chunk_files:
+                            logger.info(
+                                f"Skipping pool entry {_popped_file} — absorbed "
+                                f"by a previous shifted extraction"
+                            )
+                            continue
                         source_path = str(item["path"])
 
                         results = self._process_video(
@@ -1132,8 +1143,11 @@ class RSLTXVPrepareDataset:
                             char_positions_required=char_positions_required,
                             allow_unknown_faces_in=allow_unknown_faces_in,
                         )
-                        # Persist any content-level rejections recorded by _process_video
+                        # Persist any content-level rejections recorded by
+                        # _process_video, and fold any absorbed-neighbor chunks
+                        # into rejected_chunk_files for the rest of this pass.
                         self._flush_rejected_chunks(rejected_path, rejected_chunk_files)
+                        self._flush_consumed_chunks(rejected_chunk_files)
 
                         for result_path, result_transcript in results:
                             if str(result_path) in known_paths:
@@ -2090,6 +2104,16 @@ class RSLTXVPrepareDataset:
         logger.info(f"Processed image: {img_path.name} -> {out_path.name}")
         return out_path
 
+    def _flush_consumed_chunks(self, rejected_chunk_files: set) -> None:
+        """Drain self._consumed_chunks (chunks absorbed by a shifted
+        extraction) into the in-memory rejected_chunk_files set so they're
+        skipped at pop time. Not persisted to rejected.json — these aren't
+        rejected content, just already-covered-by-another-extraction."""
+        pending = getattr(self, "_consumed_chunks", [])
+        for cf in pending:
+            rejected_chunk_files.add(cf)
+        self._consumed_chunks = []
+
     def _flush_rejected_chunks(
         self,
         rejected_path: Path,
@@ -2166,6 +2190,12 @@ class RSLTXVPrepareDataset:
         # media_path, source_file, reason, chunk_file.
         if not hasattr(self, "_rejected_chunks"):
             self._rejected_chunks = []
+        # Chunk filenames absorbed into a shifted extraction (the shifted
+        # chunk's frames overlap with these chunks' territory, so re-extracting
+        # them would produce mostly-duplicate content). Drained by the caller
+        # into rejected_chunk_files after each _process_video call.
+        if not hasattr(self, "_consumed_chunks"):
+            self._consumed_chunks = []
 
         # Apply intro / outro skip ranges (useful for cutting show intros and
         # end credits that would otherwise be duplicated across every episode).
@@ -2367,7 +2397,10 @@ class RSLTXVPrepareDataset:
 
                 min_hits = max(1, int(round(_pct * len(sample_positions))))
                 chunk_file = f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
-                if hits_per_pos < min_hits:
+
+                # Early reject only if we found NO character at all — no
+                # direction clue for a rescue shift.
+                if hits_per_pos == 0:
                     logger.info(f"No known characters in chunk {chunk_idx} of {video_path.name}, skipping")
                     self._rejected_chunks.append({
                         "source_file": str(video_path),
@@ -2376,47 +2409,70 @@ class RSLTXVPrepareDataset:
                         "reason": "no_known_character",
                     })
                     if target_chunk_idx >= 0:
-                        break  # targeted mode — don't search forward
+                        break
                     start_frame = end_frame
                     chunk_idx += 1
                     continue
 
-                # Expand-to-fit: if every detected character position is in
-                # one half of the chunk, the character's on-screen window
-                # probably extends just beyond that end. Shift the chunk in
-                # the appropriate direction by chunk_length/2 (snapped to a
-                # multiple of 8 for VAE alignment), re-validate, and use the
-                # new position if it passes both gates and is better-balanced.
-                # Only enabled in rolling/targeted mode (target_chunk_idx >= 0)
-                # where each call handles one chunk — in sequential mode the
-                # mutated start/end_frame would cause overlap with the next
-                # chunk in the loop.
+                # Unified shift logic — covers two cases in rolling/targeted
+                # mode (sequential mode can't mutate start/end without
+                # cascading):
+                #   1. Rescue: original gate fails (hits below min or too many
+                #      unknowns) but at least one character was detected.
+                #      Search before and after for a position where the
+                #      character is better captured.
+                #   2. Balance: original gate passes but hits are concentrated
+                #      in one half. Shift in that direction to center the
+                #      character's on-screen window.
+                # First shift (across all tried fractions and directions) that
+                # lands in a passing + balanced position wins. Progressive
+                # fractions (25/50/75/100%) handle short character windows
+                # that need only a small shift as well as long ones that need
+                # a full chunk move.
+                original_passes = (
+                    hits_per_pos >= min_hits
+                    and unknown_face_positions <= allow_unknown_faces_in
+                )
                 hit_indices = [i for i, h in enumerate(pos_has_hit) if h]
                 n_pos = len(sample_positions)
+                half = n_pos / 2
+                all_front = hit_indices and all(i < half for i in hit_indices)
+                all_back = hit_indices and all(i >= half for i in hit_indices)
+                shift_directions: list[int] = []
                 if target_chunk_idx >= 0 and hit_indices and n_pos >= 2:
-                    half = n_pos / 2
-                    all_front = all(i < half for i in hit_indices)
-                    all_back = all(i >= half for i in hit_indices)
-                    _shift = 0
+                    if not original_passes:
+                        # Rescue: try both directions
+                        shift_directions = [-1, 1]
+                    elif all_front:
+                        shift_directions = [-1]
+                    elif all_back:
+                        shift_directions = [1]
+
+                if shift_directions:
+                    _reason = "rescue" if not original_passes else "balance"
+                    logger.info(
+                        f"Chunk {chunk_idx}: {_reason} — hits at positions "
+                        f"{hit_indices}/{n_pos} — trying expand-to-fit shifts"
+                    )
                     _chunk_len = end_frame - start_frame
                     _snap8 = lambda x: (x // 8) * 8
-                    if all_front:
-                        _shift = -_snap8(_chunk_len // 2)
-                    elif all_back:
-                        _shift = _snap8(_chunk_len // 2)
-                    if _shift != 0:
-                        _where = "front" if all_front else "back"
-                        logger.info(
-                            f"Chunk {chunk_idx}: hits concentrated in {_where} half "
-                            f"(positions {hit_indices}/{n_pos}) — attempting expand-to-fit shift {_shift:+d}"
-                        )
-                        _ns, _ne = start_frame + _shift, end_frame + _shift
-                        if _ns < first_frame or _ne > last_frame:
-                            logger.info(
-                                f"Chunk {chunk_idx}: shift aborted — new range [{_ns}, {_ne}) "
-                                f"would cross video bounds [{first_frame}, {last_frame})"
-                            )
-                        else:
+                    _accepted_shift = 0
+                    for _sign in shift_directions:
+                        if _accepted_shift:
+                            break
+                        for _frac in (0.25, 0.5, 0.75, 1.0):
+                            _shift = _sign * _snap8(int(_chunk_len * _frac))
+                            if _shift == 0:
+                                continue
+                            _ns, _ne = start_frame + _shift, end_frame + _shift
+                            if _ns < first_frame or _ne > last_frame:
+                                logger.info(
+                                    f"Chunk {chunk_idx}: shift {_shift:+d} "
+                                    f"({int(_frac * 100)}%) aborted — new range "
+                                    f"[{_ns}, {_ne}) crosses video bounds "
+                                    f"[{first_frame}, {last_frame})"
+                                )
+                                continue
                             alt = _validate_at(_ns, _ne)
                             _alt_hits = [i for i, h in enumerate(alt["pos_has_hit"]) if h]
                             _alt_balanced = (
@@ -2424,14 +2480,22 @@ class RSLTXVPrepareDataset:
                                 and not all(i < half for i in _alt_hits)
                                 and not all(i >= half for i in _alt_hits)
                             )
-                            if (
+                            _alt_passes = (
                                 alt["hits_per_pos"] >= min_hits
                                 and alt["unknown_face_positions"] <= allow_unknown_faces_in
-                                and _alt_balanced
-                            ):
+                            )
+                            # In balance mode we insist on a better-balanced
+                            # outcome; in rescue mode we accept any position
+                            # that meets both gates.
+                            if original_passes:
+                                accept = _alt_passes and _alt_balanced
+                            else:
+                                accept = _alt_passes
+                            if accept:
                                 logger.info(
-                                    f"Chunk {chunk_idx}: shift accepted {_shift:+d} — "
-                                    f"hits {alt['hits_per_pos']}/{n_pos} at positions {_alt_hits}, "
+                                    f"Chunk {chunk_idx}: shift accepted {_shift:+d} "
+                                    f"({int(_frac * 100)}%) — hits {alt['hits_per_pos']}/{n_pos} "
+                                    f"at positions {_alt_hits}, "
                                     f"unknown faces {alt['unknown_face_positions']}/{n_pos}, "
                                     f"chars {sorted(alt['matched_names'])}"
                                 )
@@ -2442,25 +2506,56 @@ class RSLTXVPrepareDataset:
                                 face_anchor = alt["face_anchor"]
                                 unknown_face_positions = alt["unknown_face_positions"]
                                 pos_has_hit = alt["pos_has_hit"]
-                            else:
-                                _reasons = []
-                                if alt["hits_per_pos"] < min_hits:
-                                    _reasons.append(
-                                        f"hits {alt['hits_per_pos']}<{min_hits}"
+                                _accepted_shift = _shift
+                                # Mark the adjacent chunk in the shift
+                                # direction as consumed so we don't re-extract
+                                # mostly-duplicate content when the pool pops
+                                # it later. Only consume when the shift
+                                # actually crosses into neighbor territory
+                                # (i.e. shift magnitude > 0).
+                                _adj_ci = chunk_idx + (1 if _shift > 0 else -1)
+                                if _adj_ci >= 0:
+                                    self._consumed_chunks.append(
+                                        f"{video_path.stem}_chunk{_adj_ci:04d}.mp4"
                                     )
-                                if alt["unknown_face_positions"] > allow_unknown_faces_in:
-                                    _reasons.append(
-                                        f"unknown {alt['unknown_face_positions']}>{allow_unknown_faces_in}"
-                                    )
-                                if not _alt_balanced:
-                                    _reasons.append(
-                                        f"still imbalanced (positions {_alt_hits})"
-                                    )
-                                logger.info(
-                                    f"Chunk {chunk_idx}: shift rejected — {', '.join(_reasons)}; "
-                                    f"keeping original position"
+                                break
+                            _reasons = []
+                            if alt["hits_per_pos"] < min_hits:
+                                _reasons.append(f"hits {alt['hits_per_pos']}<{min_hits}")
+                            if alt["unknown_face_positions"] > allow_unknown_faces_in:
+                                _reasons.append(
+                                    f"unknown {alt['unknown_face_positions']}>{allow_unknown_faces_in}"
                                 )
+                            if original_passes and not _alt_balanced:
+                                _reasons.append(
+                                    f"still imbalanced (positions {_alt_hits})"
+                                )
+                            logger.info(
+                                f"Chunk {chunk_idx}: shift {_shift:+d} "
+                                f"({int(_frac * 100)}%) rejected — {', '.join(_reasons)}"
+                            )
+                    if not _accepted_shift:
+                        logger.info(
+                            f"Chunk {chunk_idx}: no shift worked; keeping original position"
+                        )
 
+                # Final gate checks (may have been satisfied by a shift).
+                if hits_per_pos < min_hits:
+                    logger.info(
+                        f"Chunk {chunk_idx}: rejected — {hits_per_pos}/{len(sample_positions)} "
+                        f"hits below required {min_hits}"
+                    )
+                    self._rejected_chunks.append({
+                        "source_file": str(video_path),
+                        "media_path": str(clips_dir / chunk_file),
+                        "chunk_file": chunk_file,
+                        "reason": "insufficient_character_presence",
+                    })
+                    if target_chunk_idx >= 0:
+                        break
+                    start_frame = end_frame
+                    chunk_idx += 1
+                    continue
                 if unknown_face_positions > allow_unknown_faces_in:
                     logger.info(
                         f"Chunk {chunk_idx}: rejected — unknown faces in "
