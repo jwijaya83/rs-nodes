@@ -282,6 +282,19 @@ _face_app = None
 _face_app_checked = False
 _FACE_PADDING = 0.6  # 60% padding around detected face for head+shoulders context
 _FACE_MATCH_THRESHOLD = 0.40  # Cosine similarity threshold for face matching (lower = stricter)
+# Two-level confidence thresholds:
+#   * _FACE_DET_MIN_CONFIDENCE: minimum score for a detection to be kept
+#     at all. We match these against character refs — a known character
+#     face might score as low as 0.5 at an odd angle, so this has to be
+#     permissive.
+#   * _FACE_UNKNOWN_MIN_CONFIDENCE: minimum score for an UNMATCHED face
+#     to count as an unknown human extra. Tiki masks, cactus faces,
+#     posters, painted props typically score in the 0.5-0.8 range. Real
+#     human faces almost always score 0.85+. Being strict here avoids
+#     false-positive "unknown faces" from a prop-heavy set like Pee-wee's
+#     Playhouse where real extras are rare.
+_FACE_DET_MIN_CONFIDENCE = 0.5
+_FACE_UNKNOWN_MIN_CONFIDENCE = 0.85
 
 _last_analysis_frame_id: int | None = None
 _last_analysis_faces: list = []
@@ -320,7 +333,9 @@ def _get_face_app():
 
 
 def _analyze_frame(frame: np.ndarray) -> list:
-    """Run InsightFace on frame; memoize by id(frame) so repeat calls are free."""
+    """Run InsightFace on frame; memoize by id(frame) so repeat calls are
+    free. Drops low-confidence detections (cactus/tiki/poster/cartoon
+    patterns) so they don't pollute hit counts or unknown-face counts."""
     global _last_analysis_frame_id, _last_analysis_faces
     app = _get_face_app()
     if app is None:
@@ -329,7 +344,13 @@ def _analyze_frame(frame: np.ndarray) -> list:
         return []
     if id(frame) == _last_analysis_frame_id:
         return _last_analysis_faces
-    faces = app.get(frame)
+    raw = app.get(frame)
+    # Filter by detector confidence — non-human face-like patterns
+    # typically score below _FACE_DET_MIN_CONFIDENCE.
+    faces = [
+        f for f in raw
+        if float(getattr(f, "det_score", 1.0)) >= _FACE_DET_MIN_CONFIDENCE
+    ]
     _last_analysis_frame_id = id(frame)
     _last_analysis_faces = faces
     return faces
@@ -394,19 +415,25 @@ def _has_unknown_face(
     character_refs: dict[str, dict],
     threshold: float,
 ) -> bool:
-    """True if any face detected in the frame fails to match any known face-ref
-    at or above `threshold`. Returns False when there are no face-refs to check
-    against (can't adjudicate), or when no faces are detected."""
+    """True if the frame contains at least one face that (a) scores at or
+    above _FACE_UNKNOWN_MIN_CONFIDENCE — meaning it's very likely a real
+    human face, not a decorative face-like prop — AND (b) does not match
+    any known face-ref at or above `threshold`. Returns False when there
+    are no face-refs to adjudicate against or when no qualifying faces
+    are detected."""
     face_refs = [r["embedding"] for r in character_refs.values() if r["type"] == "face"]
     if not face_refs:
         return False
-    faces = _detect_all_faces_dnn(frame)
-    if not faces:
-        return False
-    for rect in faces:
-        emb = _get_face_embedding(frame, rect)
+    for f in _analyze_frame(frame):
+        score = float(getattr(f, "det_score", 1.0))
+        if score < _FACE_UNKNOWN_MIN_CONFIDENCE:
+            # Low-confidence face-like pattern (prop/mask/poster/cartoon).
+            # Don't flag as an unknown human extra.
+            continue
+        emb = getattr(f, "normed_embedding", None)
         if emb is None:
             continue
+        emb = np.asarray(emb, dtype=np.float32)
         best_sim = max(_match_face(emb, ref) for ref in face_refs)
         if best_sim < threshold:
             return True
