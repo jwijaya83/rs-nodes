@@ -210,6 +210,32 @@ function ensurePrepperStatusWidget(node) {
     return w;
 }
 
+// The stats panel is only relevant when the user has defined a character
+// reference folder — otherwise there are no per-character counts to show.
+function charRefsFolderValue(node) {
+    const w = node.widgets && node.widgets.find((w) => w.name === "character_refs_folder");
+    return w && w.value ? String(w.value).trim() : "";
+}
+
+function removePrepperStatusWidget(node) {
+    if (!node.widgets) return;
+    const idx = node.widgets.findIndex((w) => w.name === "status_display");
+    if (idx >= 0) {
+        node.widgets.splice(idx, 1);
+        node.setSize(node.computeSize());
+        node.setDirtyCanvas(true, true);
+    }
+}
+
+function syncPrepperStatusVisibility(node) {
+    const hasRefs = charRefsFolderValue(node).length > 0;
+    if (hasRefs) {
+        ensurePrepperStatusWidget(node);
+    } else {
+        removePrepperStatusWidget(node);
+    }
+}
+
 // Listen once per page load for status updates.
 api.addEventListener("rs.prepper.status", (event) => {
     const detail = event.detail || {};
@@ -217,6 +243,8 @@ api.addEventListener("rs.prepper.status", (event) => {
     if (node_id === undefined || node_id === null) return;
     const target = app.graph.getNodeById(Number(node_id));
     if (!target) return;
+    // Only show stats if the user has a character folder configured.
+    if (charRefsFolderValue(target).length === 0) return;
     const widget = ensurePrepperStatusWidget(target);
     widget.value = text || "";
     target.setSize(target.computeSize());
@@ -229,7 +257,18 @@ app.registerExtension({
     nodeCreated(node) {
         if (node.comfyClass === "RSLTXVPrepareDataset") {
             addSections(node, PREPARE_SECTIONS);
-            ensurePrepperStatusWidget(node);
+            // Show / hide the live stats panel based on whether the user
+            // has a character refs folder defined. Hook the widget so
+            // toggling the folder value later adds or removes the panel.
+            syncPrepperStatusVisibility(node);
+            const refsWidget = node.widgets.find((w) => w.name === "character_refs_folder");
+            if (refsWidget) {
+                const orig = refsWidget.callback;
+                refsWidget.callback = function (value) {
+                    if (orig) orig.call(this, value);
+                    syncPrepperStatusVisibility(node);
+                };
+            }
         } else if (node.comfyClass === "RSLTXVTrainLoRA") {
             addSections(node, TRAIN_SECTIONS);
 
