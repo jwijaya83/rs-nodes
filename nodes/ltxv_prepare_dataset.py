@@ -544,7 +544,7 @@ class RSLTXVPrepareDataset:
                 "face_padding": ("FLOAT", {"default": 0.6, "min": 0.1, "max": 2.0, "step": 0.1, "tooltip": "Padding around detected face (0.6 = 60% extra for head+shoulders)"}),
                 "sample_count": ("INT", {"default": 4, "min": 2, "max": 16, "step": 1, "tooltip": "Number of evenly-spaced sample positions per chunk for character detection. Higher = less likely to miss a character who appears briefly between samples (e.g. at 10% and 40%), but slower. Positions are laid out as 0%, 1/N, 2/N, ..., (N-1)/N."}),
                 "char_positions_required": (["10%", "25%", "50%", "75%", "100%"], {"default": "75%", "tooltip": "Fraction of sample positions that must contain ANY named character. Scales with sample_count (e.g. 75% of 4 = 3, 75% of 8 = 6). Any mix of named characters across positions counts — they don't need to be the same character."}),
-                "allow_unknown_faces_in": ("INT", {"default": 1, "min": 0, "max": 16, "step": 1, "tooltip": "Tolerate unknown (non-reference) faces in up to this many sample positions. 0 = reject any extras, 1 = tolerate a single detection blip (default), higher = progressively allow background extras. Capped at sample_count."}),
+                "allow_unknown_faces_in": (["0%", "10%", "25%", "50%", "75%", "100%"], {"default": "25%", "tooltip": "Fraction of sample positions allowed to contain unknown (non-reference) faces. Scales with sample_count (e.g. 25% of 4 = 1 position, 25% of 8 = 2). 0% = reject any extras at all, 100% = allow extras anywhere. 25% (default) tolerates one detection blip in a 4-sample chunk."}),
                 "conditioning_folder": ("STRING", {"default": "", "tooltip": "IC-LoRA: folder of conditioning input videos (depth maps, edge maps, poses). Matched to media_folder by filename. Media folder is the ground truth output."}),
                 "clip": ("CLIP", {"tooltip": "Text encoder (from CheckpointLoaderSimple). When connected, encodes captions in-process instead of slow subprocess."}),
                 "vae": ("VAE", {"tooltip": "VAE (from CheckpointLoaderSimple). When connected, encodes latents in-process instead of slow subprocess."}),
@@ -590,7 +590,7 @@ class RSLTXVPrepareDataset:
         face_padding: float = 0.6,
         sample_count: int = 4,
         char_positions_required: str = "75%",
-        allow_unknown_faces_in: int = 1,
+        allow_unknown_faces_in: str = "25%",
         conditioning_folder: str = "",
         clip=None,
         vae=None,
@@ -2322,7 +2322,7 @@ class RSLTXVPrepareDataset:
         target_chunk_idx: int = -1,
         sample_count: int = 4,
         char_positions_required: str = "75%",
-        allow_unknown_faces_in: int = 1,
+        allow_unknown_faces_in: str = "25%",
         target_chars: set[str] | None = None,
     ) -> list[Path]:
         """Split a video into chunks, detect faces, crop or scale.
@@ -2487,11 +2487,15 @@ class RSLTXVPrepareDataset:
             sample_positions = [p for p in sample_positions if start_frame <= p < end_frame]
 
             if face_detection and character_refs:
-                # Parse the percentage setting once per chunk.
+                # Parse the percentage settings once per chunk.
                 try:
                     _pct = int(str(char_positions_required).rstrip("%")) / 100.0
                 except ValueError:
                     _pct = 0.75
+                try:
+                    _unknown_pct = int(str(allow_unknown_faces_in).rstrip("%")) / 100.0
+                except ValueError:
+                    _unknown_pct = 0.25
 
                 def _validate_at(_start: int, _end: int):
                     """Run full character + unknown-face validation at a
@@ -2563,6 +2567,9 @@ class RSLTXVPrepareDataset:
                 unknown_at = info["unknown_at"]
 
                 min_hits = max(1, int(round(_pct * len(sample_positions))))
+                # Unknown-face tolerance converts from a percentage of sample
+                # positions. 0% = no extras tolerated; 100% = extras anywhere.
+                unknown_tol = int(round(_unknown_pct * len(sample_positions)))
                 chunk_file = f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
 
                 # Early reject only if we found NO target character at all.
@@ -2610,7 +2617,7 @@ class RSLTXVPrepareDataset:
                 # a full chunk move.
                 original_passes = (
                     hits_per_pos >= min_hits
-                    and unknown_face_positions <= allow_unknown_faces_in
+                    and unknown_face_positions <= unknown_tol
                 )
                 hit_indices = [i for i, h in enumerate(pos_has_hit) if h]
                 n_pos = len(sample_positions)
@@ -2684,7 +2691,7 @@ class RSLTXVPrepareDataset:
                             )
                             _alt_passes = (
                                 alt["hits_per_pos"] >= min_hits
-                                and alt["unknown_face_positions"] <= allow_unknown_faces_in
+                                and alt["unknown_face_positions"] <= unknown_tol
                             )
                             # Accept criteria by mode:
                             #   rescue: any position that meets both gates
@@ -2730,9 +2737,9 @@ class RSLTXVPrepareDataset:
                             _reasons = []
                             if alt["hits_per_pos"] < min_hits:
                                 _reasons.append(f"hits {alt['hits_per_pos']}<{min_hits}")
-                            if alt["unknown_face_positions"] > allow_unknown_faces_in:
+                            if alt["unknown_face_positions"] > unknown_tol:
                                 _reasons.append(
-                                    f"unknown {alt['unknown_face_positions']}>{allow_unknown_faces_in}"
+                                    f"unknown {alt['unknown_face_positions']}>{unknown_tol}"
                                 )
                             if _reason == "balance" and not _alt_balanced:
                                 _reasons.append(
@@ -2772,11 +2779,11 @@ class RSLTXVPrepareDataset:
                     start_frame = end_frame
                     chunk_idx += 1
                     continue
-                if unknown_face_positions > allow_unknown_faces_in:
+                if unknown_face_positions > unknown_tol:
                     logger.info(
                         f"Chunk {chunk_idx}: rejected — unknown faces in "
                         f"{unknown_face_positions}/{len(sample_positions)} sample positions "
-                        f"(tolerance: {allow_unknown_faces_in})"
+                        f"(tolerance: {unknown_tol} / {allow_unknown_faces_in})"
                     )
                     self._rejected_chunks.append({
                         "source_file": str(video_path),
