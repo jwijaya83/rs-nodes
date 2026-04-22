@@ -2405,8 +2405,18 @@ class RSLTXVPrepareDataset:
                     elif all_back:
                         _shift = _snap8(_chunk_len // 2)
                     if _shift != 0:
+                        _where = "front" if all_front else "back"
+                        logger.info(
+                            f"Chunk {chunk_idx}: hits concentrated in {_where} half "
+                            f"(positions {hit_indices}/{n_pos}) — attempting expand-to-fit shift {_shift:+d}"
+                        )
                         _ns, _ne = start_frame + _shift, end_frame + _shift
-                        if _ns >= first_frame and _ne <= last_frame:
+                        if _ns < first_frame or _ne > last_frame:
+                            logger.info(
+                                f"Chunk {chunk_idx}: shift aborted — new range [{_ns}, {_ne}) "
+                                f"would cross video bounds [{first_frame}, {last_frame})"
+                            )
+                        else:
                             alt = _validate_at(_ns, _ne)
                             _alt_hits = [i for i, h in enumerate(alt["pos_has_hit"]) if h]
                             _alt_balanced = (
@@ -2420,8 +2430,10 @@ class RSLTXVPrepareDataset:
                                 and _alt_balanced
                             ):
                                 logger.info(
-                                    f"Chunk {chunk_idx}: shifted {_shift:+d} frames "
-                                    f"to better capture character window"
+                                    f"Chunk {chunk_idx}: shift accepted {_shift:+d} — "
+                                    f"hits {alt['hits_per_pos']}/{n_pos} at positions {_alt_hits}, "
+                                    f"unknown faces {alt['unknown_face_positions']}/{n_pos}, "
+                                    f"chars {sorted(alt['matched_names'])}"
                                 )
                                 start_frame, end_frame = _ns, _ne
                                 sample_positions = alt["sample_positions"]
@@ -2430,6 +2442,24 @@ class RSLTXVPrepareDataset:
                                 face_anchor = alt["face_anchor"]
                                 unknown_face_positions = alt["unknown_face_positions"]
                                 pos_has_hit = alt["pos_has_hit"]
+                            else:
+                                _reasons = []
+                                if alt["hits_per_pos"] < min_hits:
+                                    _reasons.append(
+                                        f"hits {alt['hits_per_pos']}<{min_hits}"
+                                    )
+                                if alt["unknown_face_positions"] > allow_unknown_faces_in:
+                                    _reasons.append(
+                                        f"unknown {alt['unknown_face_positions']}>{allow_unknown_faces_in}"
+                                    )
+                                if not _alt_balanced:
+                                    _reasons.append(
+                                        f"still imbalanced (positions {_alt_hits})"
+                                    )
+                                logger.info(
+                                    f"Chunk {chunk_idx}: shift rejected — {', '.join(_reasons)}; "
+                                    f"keeping original position"
+                                )
 
                 if unknown_face_positions > allow_unknown_faces_in:
                     logger.info(
