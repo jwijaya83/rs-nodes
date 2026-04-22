@@ -709,20 +709,31 @@ class RSLTXVPrepareDataset:
         # the long setup runs.
         _emit_status()
 
-        # Load rejected clips so we don't re-process them
+        # Load rejected clips so we don't re-process them. Two kinds of
+        # rejection coexist in rejected.json:
+        #   * Chunk-level: the entry has media_path AND source_file. We
+        #     want to skip THIS chunk but still allow the rest of that
+        #     video to be drawn from — so only the clip path / filename
+        #     goes into rejection sets, NEVER the source_file.
+        #   * Video-level (classic mode, "all chunks rejected"): entry has
+        #     only source_file. The whole video is skipped.
         rejected_path = output_dir / "rejected.json"
-        rejected_clips = set()       # source_file and media_path strings
+        rejected_clips = set()       # paths (videos or clips) to blacklist whole
         rejected_chunk_files = set()  # specific clip filenames to exclude from chunk pool
         if rejected_path.exists():
             try:
                 with open(rejected_path) as rf:
                     for r in json.load(rf):
-                        rejected_clips.add(r.get("media_path", ""))
-                        rejected_clips.add(r.get("source_file", ""))
-                        # Track specific clip filenames for chunk-level rejection
                         mp = r.get("media_path", "")
+                        sf = r.get("source_file", "")
                         if mp:
+                            # Chunk-level rejection — don't blacklist the
+                            # parent video, just the chunk.
+                            rejected_clips.add(mp)
                             rejected_chunk_files.add(Path(mp).name)
+                        elif sf:
+                            # Video-level rejection — blacklist the video.
+                            rejected_clips.add(sf)
             except (json.JSONDecodeError, KeyError):
                 pass
 
@@ -1174,6 +1185,10 @@ class RSLTXVPrepareDataset:
                         item, ci = chunk_pool.pop()
                         _save_pool()
                         pool_state["remaining"] = len(chunk_pool)
+                        # Push an update on every pop so the panel's chunk-pool
+                        # counter ticks down even when chunks get rejected and
+                        # never reach the add-entry path.
+                        _emit_status()
                         # Skip chunks that a previous shifted extraction in this
                         # pass has already absorbed — their frames are largely
                         # covered by an earlier clip so re-extracting would
