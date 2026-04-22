@@ -160,10 +160,42 @@ function addSections(node, sections) {
 // Training monitor is now a standalone page: training_monitor.html
 // Open it in a separate browser tab for full-size, resizable charts.
 
+// Thin horizontal rule that visually separates the stats panel from the
+// rest of the node's inputs.
+function ensurePrepperDividerWidget(node) {
+    let w = node.widgets && node.widgets.find((w) => w.name === "status_divider");
+    if (w) return w;
+    const HEIGHT = 10;
+    w = {
+        name: "status_divider",
+        type: "custom",
+        value: null,
+        serialize: false,
+        options: { serialize: false },
+        draw(ctx, graphNode, width, posY, _slotH) {
+            const pad = 6;
+            const y = posY + HEIGHT / 2;
+            ctx.strokeStyle = "#555";
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(pad, y);
+            ctx.lineTo(width - pad, y);
+            ctx.stroke();
+            this.computedHeight = HEIGHT;
+        },
+        computeSize(width) {
+            return [width, HEIGHT];
+        },
+    };
+    node.addCustomWidget(w);
+    return w;
+}
+
 // Attach a canvas-drawn stats panel to a prepare-dataset node. The backend
 // pushes live counts via the "rs.prepper.status" event; we just set the
 // widget value and repaint. Not an input field — purely a readout.
 function ensurePrepperStatusWidget(node) {
+    ensurePrepperDividerWidget(node);
     let w = node.widgets && node.widgets.find((w) => w.name === "status_display");
     if (w) return w;
     const LINE_H = 14;
@@ -219,9 +251,15 @@ function charRefsFolderValue(node) {
 
 function removePrepperStatusWidget(node) {
     if (!node.widgets) return;
-    const idx = node.widgets.findIndex((w) => w.name === "status_display");
-    if (idx >= 0) {
-        node.widgets.splice(idx, 1);
+    let removed = false;
+    for (const name of ["status_divider", "status_display"]) {
+        const idx = node.widgets.findIndex((w) => w.name === name);
+        if (idx >= 0) {
+            node.widgets.splice(idx, 1);
+            removed = true;
+        }
+    }
+    if (removed) {
         node.setSize(node.computeSize());
         node.setDirtyCanvas(true, true);
     }
