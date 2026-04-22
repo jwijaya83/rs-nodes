@@ -36,19 +36,30 @@ except Exception:
     PromptServer = None  # type: ignore
 
 
-def _emit_prepper_status(node_id, char_counts: dict[str, int], total_clips: int, max_samples: int) -> None:
+def _emit_prepper_status(
+    node_id,
+    char_counts: dict[str, int],
+    total_clips: int,
+    max_samples: int,
+) -> None:
     """Send the current character counts + running total to the frontend so
     the node UI can update live. No-op if PromptServer isn't available or
-    node_id wasn't provided."""
+    node_id wasn't provided.
+
+    `total` on the panel tracks APPEARANCES (sum of per-character counts),
+    not clip count — that's what max_samples caps. `clips` is shown on a
+    separate line so the operator can see both numbers at once."""
     if PromptServer is None or node_id is None:
         return
     lines = []
     for name in sorted(char_counts):
         lines.append(f"{name}: {char_counts[name]}")
+    total_appearances = sum(char_counts.values())
     if max_samples > 0:
-        lines.append(f"total: {total_clips}/{max_samples}")
+        lines.append(f"total: {total_appearances}/{max_samples}")
     else:
-        lines.append(f"total: {total_clips}")
+        lines.append(f"total: {total_appearances}")
+    lines.append(f"clips: {total_clips}")
     try:
         PromptServer.instance.send_sync("rs.prepper.status", {
             "node_id": str(node_id),
