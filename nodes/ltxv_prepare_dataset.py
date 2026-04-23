@@ -1258,8 +1258,15 @@ class RSLTXVPrepareDataset:
                             if item is None:
                                 continue  # video no longer in incomplete set
                             clip_file = clips_dir / f"{item['path'].stem}_chunk{ci:04d}.mp4"
-                            if clip_file.exists() or clip_file.name in rejected_chunk_files:
-                                continue  # already extracted or rejected
+                            # Skip if already extracted (on disk OR recorded in
+                            # dataset.json), rejected in a prior run, or
+                            # absorbed by a shifted extraction.
+                            if clip_file.exists():
+                                continue
+                            if str(clip_file) in known_paths:
+                                continue
+                            if clip_file.name in rejected_chunk_files:
+                                continue
                             chunk_pool.append((item, ci))
                         if chunk_pool:
                             logger.info(
@@ -1268,6 +1275,7 @@ class RSLTXVPrepareDataset:
                             )
 
                     if not chunk_pool:
+                        _skipped_known = 0
                         for item in incomplete:
                             cap = cv2.VideoCapture(str(item["path"]))
                             if not cap.isOpened():
@@ -1290,11 +1298,26 @@ class RSLTXVPrepareDataset:
 
                             for ci in range(n_chunks):
                                 clip_file = clips_dir / f"{item['path'].stem}_chunk{ci:04d}.mp4"
-                                if not clip_file.exists() and clip_file.name not in rejected_chunk_files:
-                                    chunk_pool.append((item, ci))
+                                # Existing dataset entries point at files like
+                                # `/full/path/.../clips/name_chunkNNNN.mp4`.
+                                # Filter those out so a run with an existing
+                                # dataset.json but no chunk_pool.json doesn't
+                                # re-process every already-extracted chunk.
+                                if clip_file.exists():
+                                    continue
+                                if str(clip_file) in known_paths:
+                                    _skipped_known += 1
+                                    continue
+                                if clip_file.name in rejected_chunk_files:
+                                    continue
+                                chunk_pool.append((item, ci))
 
                         random.shuffle(chunk_pool)
-                        logger.info(f"Chunk pool: {len(chunk_pool)} available chunks across {len(incomplete)} videos")
+                        _extra = f", {_skipped_known} already in dataset.json" if _skipped_known else ""
+                        logger.info(
+                            f"Chunk pool: {len(chunk_pool)} available chunks across "
+                            f"{len(incomplete)} videos{_extra}"
+                        )
 
                     # Publish the pool's initial size so the live panel can
                     # show progress through the pool.
