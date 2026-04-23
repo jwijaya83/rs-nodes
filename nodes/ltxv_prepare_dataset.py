@@ -907,30 +907,36 @@ class RSLTXVPrepareDataset:
         # clip_check: re-scan EVERY existing clip and rewrite its
         # characters field. Useful when the user has added a new
         # reference character and wants existing clips updated to reflect
-        # it. Samples 4 evenly-spaced positions per clip (same pattern
-        # as the main gate) and unions matches across them so a character
-        # who only appears in part of the clip still gets recorded.
+        # it. Uses the same sample_count as the main gate so the scan
+        # is as thorough as extraction itself — a character who only
+        # appears briefly is still caught.
         if character_refs and clip_check:
-            logger.info(f"clip_check: re-scanning {len(existing_entries)} clips...")
+            n_check = max(2, sample_count)
+            total_clips = len(existing_entries)
+            logger.info(
+                f"clip_check: re-scanning {total_clips} clips at {n_check} sample positions each..."
+            )
             changed = 0
             added_by_char: dict[str, int] = {}
             removed_by_char: dict[str, int] = {}
-            for entry in existing_entries:
+            for idx, entry in enumerate(existing_entries, start=1):
                 clip_file = Path(entry["media_path"])
                 if not clip_file.exists():
+                    logger.info(f"  [{idx}/{total_clips}] {clip_file.name}: missing file, skipping")
                     continue
                 cap = cv2.VideoCapture(str(clip_file))
                 if not cap.isOpened():
+                    logger.info(f"  [{idx}/{total_clips}] {clip_file.name}: couldn't open, skipping")
                     continue
                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 cap.release()
                 if total <= 0:
+                    logger.info(f"  [{idx}/{total_clips}] {clip_file.name}: 0-frame clip, skipping")
                     continue
-                # 4 sample positions at 0/25/50/75% — enough to catch
-                # characters who are only on-screen briefly.
+                # Evenly-spaced sample positions: 0, 1/N, 2/N, ..., (N-1)/N
                 found_chars: set[str] = set()
-                for frac in (0.0, 0.25, 0.5, 0.75):
-                    frame = self._read_frame(clip_file, int(total * frac))
+                for i in range(n_check):
+                    frame = self._read_frame(clip_file, (total * i) // n_check)
                     if frame is None:
                         continue
                     found_chars |= self._match_characters_in_frame(
@@ -940,25 +946,45 @@ class RSLTXVPrepareDataset:
                     )
                 prev_chars = set(entry.get("characters") or [])
                 if found_chars != prev_chars:
-                    for c in found_chars - prev_chars:
+                    added = found_chars - prev_chars
+                    removed = prev_chars - found_chars
+                    for c in added:
                         added_by_char[c] = added_by_char.get(c, 0) + 1
-                    for c in prev_chars - found_chars:
+                    for c in removed:
                         removed_by_char[c] = removed_by_char.get(c, 0) + 1
                     if found_chars:
                         entry["characters"] = sorted(found_chars)
                     elif "characters" in entry:
                         del entry["characters"]
                     changed += 1
+                    change_parts = []
+                    if added:
+                        change_parts.append(f"+{sorted(added)}")
+                    if removed:
+                        change_parts.append(f"-{sorted(removed)}")
+                    logger.info(
+                        f"  [{idx}/{total_clips}] {clip_file.name}: "
+                        f"{sorted(prev_chars)} -> {sorted(found_chars)} "
+                        f"({' '.join(change_parts)})"
+                    )
+                    # Persist after every change so a crash mid-scan
+                    # doesn't lose the work already done.
+                    with open(dataset_json_path, "w") as f:
+                        json.dump(existing_entries, f, indent=2)
+                    _emit_status()
+                else:
+                    logger.info(
+                        f"  [{idx}/{total_clips}] {clip_file.name}: "
+                        f"{sorted(prev_chars) if prev_chars else 'no chars'} (unchanged)"
+                    )
             if changed:
-                with open(dataset_json_path, "w") as f:
-                    json.dump(existing_entries, f, indent=2)
                 logger.info(
-                    f"clip_check: updated {changed} clip entries. "
+                    f"clip_check: updated {changed}/{total_clips} entries. "
                     f"Added: {dict(sorted(added_by_char.items()))}. "
                     f"Removed: {dict(sorted(removed_by_char.items()))}."
                 )
             else:
-                logger.info("clip_check: no entries needed updating")
+                logger.info(f"clip_check: no entries needed updating ({total_clips} scanned)")
 
         if transcribe_speech:
             backfilled = 0
