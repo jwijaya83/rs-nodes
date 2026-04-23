@@ -2690,6 +2690,12 @@ class RSLTXVPrepareDataset:
                 unknown_tol = int(round(_unknown_pct * len(sample_positions)))
                 chunk_file = f"{video_path.stem}_chunk{chunk_idx:04d}.mp4"
 
+                # Pre-compute shift helpers so both the main search and the
+                # extension block can use them, even when the main search
+                # is skipped (e.g. original already at 100% coverage).
+                _chunk_len = end_frame - start_frame
+                _snap8 = lambda x: (x // 8) * 8
+
                 # Early reject only if we found NO target character at all.
                 # If matched_names has entries they're all over-quota — we're
                 # not going to chase them. No direction clue for rescue.
@@ -2789,8 +2795,7 @@ class RSLTXVPrepareDataset:
                         f"original hits {hits_per_pos}/{n_pos} at positions "
                         f"{hit_indices}, unknowns at {unknown_at}/{n_pos}"
                     )
-                    _chunk_len = end_frame - start_frame
-                    _snap8 = lambda x: (x // 8) * 8
+                    # _chunk_len and _snap8 already defined above.
                     # Seek up to 2 full chunk lengths in either direction —
                     # enough to catch a character whose on-screen window
                     # spans multiple chunk slots, but not so wide that we're
