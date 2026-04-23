@@ -536,6 +536,26 @@ class RSLTXVPrepareDataset:
     """Scan a folder of videos/images, detect faces, crop around them,
     generate dataset JSON, and run process_dataset.py to precompute latents."""
 
+    # A character only counts as present in a clip if they appear in at
+    # least this fraction of the MOST-SEEN character's positions. Prevents
+    # brief cameos (1-2 frames at the edge of another character's shot)
+    # from inflating the clip's `characters` list and confusing quota
+    # accounting. Tuned relative to the dominant character so a short
+    # clip of pee-wee alone (e.g. 2/8 positions with nothing else
+    # detected) still labels him correctly.
+    _CHAR_DOMINANCE_RATIO = 0.5
+
+    @classmethod
+    def _filter_dominant_chars(cls, char_position_counts: dict) -> set:
+        """Keep only characters whose position count is at least
+        _CHAR_DOMINANCE_RATIO * max(counts). When only one character is
+        detected, that character always passes. Empty input -> empty set."""
+        if not char_position_counts:
+            return set()
+        max_count = max(char_position_counts.values())
+        threshold = max_count * cls._CHAR_DOMINANCE_RATIO
+        return {c for c, n in char_position_counts.items() if n >= threshold}
+
     @classmethod
     def INPUT_TYPES(cls):
         checkpoints = folder_paths.get_filename_list("checkpoints")
@@ -938,17 +958,24 @@ class RSLTXVPrepareDataset:
                 if total <= 0:
                     logger.info(f"  [{idx}/{total_clips}] {clip_file.name}: 0-frame clip, skipping")
                     continue
-                # Evenly-spaced sample positions: 0, 1/N, 2/N, ..., (N-1)/N
-                found_chars: set[str] = set()
+                # Evenly-spaced sample positions: 0, 1/N, 2/N, ..., (N-1)/N.
+                # Track per-character position counts so we can apply the
+                # same dominance filter the scanner uses when recording
+                # characters — a character seen in only 1-2 positions of
+                # an 8-position scan won't be labeled as "in" the clip.
+                char_position_counts: dict[str, int] = {}
                 for i in range(n_check):
                     frame = self._read_frame(clip_file, (total * i) // n_check)
                     if frame is None:
                         continue
-                    found_chars |= self._match_characters_in_frame(
+                    found = self._match_characters_in_frame(
                         frame, character_refs, face_similarity,
                         clip_vision=clip_vision,
                         first_match_only=False,
                     )
+                    for c in found:
+                        char_position_counts[c] = char_position_counts.get(c, 0) + 1
+                found_chars = self._filter_dominant_chars(char_position_counts)
                 prev_chars = set(entry.get("characters") or [])
                 if found_chars != prev_chars:
                     added = found_chars - prev_chars
@@ -2633,7 +2660,7 @@ class RSLTXVPrepareDataset:
                     clen = _end - _start
                     positions = [_start + i * clen // n for i in range(n)]
                     positions = [p for p in positions if _start <= p < _end]
-                    matched: set[str] = set()
+                    char_position_counts: dict[str, int] = {}
                     hits = 0
                     has_hit = [False] * len(positions)
                     anchor = None
@@ -2647,7 +2674,8 @@ class RSLTXVPrepareDataset:
                             clip_vision=clip_vision, first_match_only=False,
                         )
                         if found:
-                            matched |= found
+                            for c in found:
+                                char_position_counts[c] = char_position_counts.get(c, 0) + 1
                             is_target_hit = (
                                 bool(found & target_chars)
                                 if target_chars is not None
@@ -2665,6 +2693,12 @@ class RSLTXVPrepareDataset:
                         # still "known" and doesn't count as unknown.
                         if _has_unknown_face(sample, character_refs, face_similarity):
                             unknown_at.append(idx)
+                    # Dominance filter: a character is only recorded as
+                    # present if they were seen in at least
+                    # _CHAR_DOMINANCE_RATIO * max_count positions. Cameos
+                    # at the fringe of another character's shot are
+                    # filtered out of the recorded label.
+                    matched = self._filter_dominant_chars(char_position_counts)
                     return {
                         "sample_positions": positions,
                         "matched_names": matched,
@@ -2673,6 +2707,7 @@ class RSLTXVPrepareDataset:
                         "face_anchor": anchor,
                         "unknown_face_positions": len(unknown_at),
                         "unknown_at": unknown_at,
+                        "char_position_counts": char_position_counts,
                     }
 
                 info = _validate_at(start_frame, end_frame)
