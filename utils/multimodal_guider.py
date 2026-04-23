@@ -27,6 +27,7 @@ import comfy.nested_tensor
 import comfy.patcher_extension
 import comfy.sample
 import comfy.samplers
+import comfy.sd
 import comfy.utils
 
 logger = logging.getLogger(__name__)
@@ -1069,7 +1070,6 @@ class ICLoRAGuider(MultimodalGuider):
             # Apply distilled LoRA when running distilled sigmas
             distilled_lora = getattr(self, '_distilled_lora', None)
             if distilled_lora is not None:
-                import comfy.sd
                 lora_data, lora_strength, lora_name = distilled_lora
                 self.model_patcher, _ = comfy.sd.load_lora_for_models(
                     self.model_patcher, None, lora_data, lora_strength, 0
