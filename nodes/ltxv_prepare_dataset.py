@@ -572,6 +572,7 @@ class RSLTXVPrepareDataset:
                 "sample_count": ("INT", {"default": 4, "min": 2, "max": 16, "step": 1, "tooltip": "Number of evenly-spaced sample positions per chunk for character detection. Higher = less likely to miss a character who appears briefly between samples (e.g. at 10% and 40%), but slower. Positions are laid out as 0%, 1/N, 2/N, ..., (N-1)/N."}),
                 "char_positions_required": (["10%", "25%", "50%", "75%", "100%"], {"default": "75%", "tooltip": "Fraction of sample positions that must contain ANY named character. Scales with sample_count (e.g. 75% of 4 = 3, 75% of 8 = 6). Any mix of named characters across positions counts — they don't need to be the same character."}),
                 "allow_unknown_faces_in": (["0%", "10%", "25%", "50%", "75%", "100%"], {"default": "25%", "tooltip": "Fraction of sample positions allowed to contain unknown (non-reference) faces. Scales with sample_count (e.g. 25% of 4 = 1 position, 25% of 8 = 2). 0% = reject any extras at all, 100% = allow extras anywhere. 25% (default) tolerates one detection blip in a 4-sample chunk."}),
+                "clip_check": ("BOOLEAN", {"default": False, "tooltip": "When ON, re-scan every existing clip in the dataset and rewrite its `characters` field based on current character refs. Useful when you've added a new reference character after the dataset was already partly built — existing clips that contain the new character get their characters list updated. Runs once at the start of the run; leave OFF for subsequent runs."}),
                 "conditioning_folder": ("STRING", {"default": "", "tooltip": "IC-LoRA: folder of conditioning input videos (depth maps, edge maps, poses). Matched to media_folder by filename. Media folder is the ground truth output."}),
                 "clip": ("CLIP", {"tooltip": "Text encoder (from CheckpointLoaderSimple). When connected, encodes captions in-process instead of slow subprocess."}),
                 "vae": ("VAE", {"tooltip": "VAE (from CheckpointLoaderSimple). When connected, encodes latents in-process instead of slow subprocess."}),
@@ -618,6 +619,7 @@ class RSLTXVPrepareDataset:
         sample_count: int = 4,
         char_positions_required: str = "75%",
         allow_unknown_faces_in: str = "25%",
+        clip_check: bool = False,
         conditioning_folder: str = "",
         clip=None,
         vae=None,
@@ -901,6 +903,62 @@ class RSLTXVPrepareDataset:
                 with open(dataset_json_path, "w") as f:
                     json.dump(existing_entries, f, indent=2)
                 logger.info(f"Backfilled characters for {chars_backfilled} entries")
+
+        # clip_check: re-scan EVERY existing clip and rewrite its
+        # characters field. Useful when the user has added a new
+        # reference character and wants existing clips updated to reflect
+        # it. Samples 4 evenly-spaced positions per clip (same pattern
+        # as the main gate) and unions matches across them so a character
+        # who only appears in part of the clip still gets recorded.
+        if character_refs and clip_check:
+            logger.info(f"clip_check: re-scanning {len(existing_entries)} clips...")
+            changed = 0
+            added_by_char: dict[str, int] = {}
+            removed_by_char: dict[str, int] = {}
+            for entry in existing_entries:
+                clip_file = Path(entry["media_path"])
+                if not clip_file.exists():
+                    continue
+                cap = cv2.VideoCapture(str(clip_file))
+                if not cap.isOpened():
+                    continue
+                total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                cap.release()
+                if total <= 0:
+                    continue
+                # 4 sample positions at 0/25/50/75% — enough to catch
+                # characters who are only on-screen briefly.
+                found_chars: set[str] = set()
+                for frac in (0.0, 0.25, 0.5, 0.75):
+                    frame = self._read_frame(clip_file, int(total * frac))
+                    if frame is None:
+                        continue
+                    found_chars |= self._match_characters_in_frame(
+                        frame, character_refs, face_similarity,
+                        clip_vision=clip_vision,
+                        first_match_only=False,
+                    )
+                prev_chars = set(entry.get("characters") or [])
+                if found_chars != prev_chars:
+                    for c in found_chars - prev_chars:
+                        added_by_char[c] = added_by_char.get(c, 0) + 1
+                    for c in prev_chars - found_chars:
+                        removed_by_char[c] = removed_by_char.get(c, 0) + 1
+                    if found_chars:
+                        entry["characters"] = sorted(found_chars)
+                    elif "characters" in entry:
+                        del entry["characters"]
+                    changed += 1
+            if changed:
+                with open(dataset_json_path, "w") as f:
+                    json.dump(existing_entries, f, indent=2)
+                logger.info(
+                    f"clip_check: updated {changed} clip entries. "
+                    f"Added: {dict(sorted(added_by_char.items()))}. "
+                    f"Removed: {dict(sorted(removed_by_char.items()))}."
+                )
+            else:
+                logger.info("clip_check: no entries needed updating")
 
         if transcribe_speech:
             backfilled = 0
