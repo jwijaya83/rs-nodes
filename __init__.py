@@ -21,6 +21,7 @@ from .nodes.ltxv_prepare_dataset import RSLTXVPrepareDataset
 from .nodes.ltxv_train_lora import RSLTXVTrainLoRA
 from .nodes.sigma_scheduler import RSSigmaScheduler
 from .nodes.video_save import RSVideoSave
+from .nodes.exr_sequence_save import RSEXRSequenceSave
 
 WEB_DIRECTORY = "./web"
 
@@ -48,6 +49,7 @@ NODE_CLASS_MAPPINGS = {
     "RSLTXVTrainLoRA": RSLTXVTrainLoRA,
     "RSSigmaScheduler": RSSigmaScheduler,
     "RSVideoSave": RSVideoSave,
+    "RSEXRSequenceSave": RSEXRSequenceSave,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -74,6 +76,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSLTXVTrainLoRA": "RS LTXV Train LoRA",
     "RSSigmaScheduler": "RS Sigma Scheduler",
     "RSVideoSave": "RS Video Save (ProRes)",
+    "RSEXRSequenceSave": "RS EXR Sequence Save",
 }
 
 # MOSS-TTS nodes — only available if dependencies (transformers, huggingface_hub) are installed
