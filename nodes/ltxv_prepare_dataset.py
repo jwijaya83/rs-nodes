@@ -4392,9 +4392,29 @@ class RSLTXVPrepareDataset:
             logger.warning(f"Face verification failed: {e}, assuming match")
             return "MATCH"
 
+    # Captioner frame extraction pulls in from each edge by this many
+    # frames before sampling. The seek-and-shift extractor produces
+    # clean takes but can leave a frame or two of neighbouring-scene
+    # content at the extreme head / tail. The LLM will happily describe
+    # whatever it sees even if it only exists for one frame; skipping
+    # the edges keeps the caption tied to the main on-screen content.
+    # Clamped at 25% of the clip length so short clips still have a
+    # usable sample range.
+    _CAPTION_EDGE_MARGIN = 10
+
+    @classmethod
+    def _caption_frame_range(cls, total: int) -> tuple[int, int]:
+        """Return (lo, hi) inclusive frame indices to sample for captions."""
+        safe = min(cls._CAPTION_EDGE_MARGIN, max(0, (total - 1) // 4))
+        lo = safe
+        hi = max(lo, total - 1 - safe)
+        return lo, hi
+
     def _extract_caption_frame(self, clip_path: Path) -> np.ndarray | None:
         """Extract the best frame from a clip for captioning.
-        Tries middle frame first, then samples others looking for a face."""
+        Tries middle frame first, then samples others looking for a face.
+        Skips the first/last _CAPTION_EDGE_MARGIN frames so transition
+        artifacts at the clip edges don't end up in the caption."""
         cap = cv2.VideoCapture(str(clip_path))
         if not cap.isOpened():
             return None
@@ -4403,8 +4423,12 @@ class RSLTXVPrepareDataset:
             cap.release()
             return None
 
-        # Sample positions: middle, 1/4, 3/4, start, end
-        candidates = [total // 2, total // 4, (total * 3) // 4, 0, max(0, total - 1)]
+        lo, hi = self._caption_frame_range(total)
+        mid = (lo + hi) // 2
+        q1 = (lo + mid) // 2
+        q3 = (mid + hi) // 2
+        # Sample positions: middle, 1/4 in, 3/4 in, safe start, safe end
+        candidates = [mid, q1, q3, lo, hi]
 
         for idx in candidates:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -4418,7 +4442,7 @@ class RSLTXVPrepareDataset:
                 return frame
 
         # Fallback: return middle frame even without a face
-        cap.set(cv2.CAP_PROP_POS_FRAMES, total // 2)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, mid)
         ret, frame = cap.read()
         cap.release()
         return frame if ret else None
@@ -4426,7 +4450,10 @@ class RSLTXVPrepareDataset:
     def _extract_caption_frames(self, clip_path: Path, num_frames: int = 5) -> list[np.ndarray]:
         """Extract N evenly-spaced frames from a clip for multi-frame captioning.
         This lets the LLM see shot changes and secondary characters that may only
-        appear in part of the clip.  Returns an empty list on failure."""
+        appear in part of the clip. Sample range is inset from each end by
+        _CAPTION_EDGE_MARGIN frames so neighbouring-scene transitions at the
+        clip boundaries don't leak into the caption. Returns an empty list on
+        failure."""
         # Handle image files directly
         if clip_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff"):
             frame = cv2.imread(str(clip_path))
@@ -4440,11 +4467,15 @@ class RSLTXVPrepareDataset:
             return []
 
         num_frames = max(1, num_frames)
-        if total <= num_frames:
-            indices = list(range(total))
+        lo, hi = self._caption_frame_range(total)
+        span = hi - lo + 1
+        if span <= num_frames:
+            indices = list(range(lo, hi + 1))
+        elif num_frames == 1:
+            indices = [(lo + hi) // 2]
         else:
-            # Evenly spaced across the clip, inclusive of first and last frames
-            indices = [int(i * (total - 1) / (num_frames - 1)) for i in range(num_frames)]
+            # Evenly spaced across the SAFE range, inclusive of lo and hi.
+            indices = [lo + int(i * (hi - lo) / (num_frames - 1)) for i in range(num_frames)]
 
         frames: list[np.ndarray] = []
         for idx in indices:
