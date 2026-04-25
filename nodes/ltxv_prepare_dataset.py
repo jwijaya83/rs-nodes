@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import random
 import shutil
@@ -1316,7 +1317,10 @@ class RSLTXVPrepareDataset:
                             ff = max(0, skip_s)
                             lf = max(ff, vid_total - skip_e)
                             if target_fps > 0 and abs(vid_fps - target_fps) > 0.5:
-                                vid_chunk_frames = int(round(target_frames * (vid_fps / target_fps)))
+                                # Always overshoot — fps filter rounds DOWN, undershoot kills clips
+                                # at the bucket frame minimum.  Buffer of +2 source frames ensures
+                                # we never come up short after fps conversion.
+                                vid_chunk_frames = math.ceil(target_frames * (vid_fps / target_fps)) + 2
                             else:
                                 vid_chunk_frames = target_frames
                             n_chunks = (lf - ff) // vid_chunk_frames
@@ -2570,8 +2574,11 @@ class RSLTXVPrepareDataset:
         # at 30fps to cover the same duration.
         use_fps_conversion = target_fps > 0 and abs(fps - target_fps) > 0.5
         if use_fps_conversion:
-            # Source frames needed per chunk to yield target_frames at target_fps
-            source_chunk_frames = int(round(target_frames * (fps / target_fps)))
+            # Always overshoot: fps filter rounds DOWN, undershoot drops clips at
+            # the bucket frame minimum.  Buffer of +2 source frames ensures we
+            # never come up short after fps conversion; the output is then
+            # capped to exactly target_frames via -frames:v.
+            source_chunk_frames = math.ceil(target_frames * (fps / target_fps)) + 2
             logger.info(
                 f"{video_path.name}: fps conversion {fps:.3f} -> {target_fps:.3f} "
                 f"({source_chunk_frames} source frames per {target_frames}-frame output chunk)"
@@ -3296,9 +3303,19 @@ class RSLTXVPrepareDataset:
                     "-c:v", "libx264",
                     "-pix_fmt", "yuv420p",
                 ]
+                # Force exactly target_frames in output to defeat fps-filter
+                # rounding drift — source duration is padded above so this
+                # always trims rather than coming up short.
+                if use_fps_conversion:
+                    cmd += ["-frames:v", str(target_frames)]
                 if with_audio:
+                    # Audio duration matches the exact video output length.
+                    audio_duration = (
+                        target_frames / target_fps if use_fps_conversion
+                        else num_source_frames / fps
+                    )
                     cmd += [
-                        "-t", f"{clip_duration:.4f}",
+                        "-t", f"{audio_duration:.4f}",
                         "-c:a", "aac",
                         "-b:a", "128k",
                     ]
@@ -3377,8 +3394,15 @@ class RSLTXVPrepareDataset:
                                 if vf_parts_re:
                                     re_cmd += ["-vf", ",".join(vf_parts_re)]
                                 re_cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p"]
+                                # Same overshoot-then-trim safeguard as the main extraction.
+                                if use_fps_conversion:
+                                    re_cmd += ["-frames:v", str(target_frames)]
                                 if with_audio:
-                                    re_cmd += ["-t", f"{source_chunk_frames / fps:.4f}", "-c:a", "aac", "-b:a", "128k"]
+                                    re_audio_duration = (
+                                        target_frames / target_fps if use_fps_conversion
+                                        else source_chunk_frames / fps
+                                    )
+                                    re_cmd += ["-t", f"{re_audio_duration:.4f}", "-c:a", "aac", "-b:a", "128k"]
                                 else:
                                     re_cmd += ["-an"]
                                 re_cmd += [str(out_path)]
