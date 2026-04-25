@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -906,8 +907,10 @@ class RSLTXVPrepareDataset:
                         if chars:
                             entry["characters"] = sorted(chars)
                             logger.info(f"  Detected {', '.join(sorted(chars))} in {clip_file.name}")
-                # Transcribe if speech transcription is enabled
-                if transcribe_speech and not entry.get("transcript"):
+                # Transcribe if speech transcription is enabled.
+                # Use key existence so silent clips (transcript=="") don't
+                # trigger another transcription pass on subsequent runs.
+                if transcribe_speech and "transcript" not in entry:
                     tr = _transcribe_clip(clip_file)
                     if tr and tr.get("hallucination"):
                         logger.info(f"  No usable speech, deleting orphan: {clip_file.name}")
@@ -921,6 +924,9 @@ class RSLTXVPrepareDataset:
                     if tr and tr["text"]:
                         entry["transcript"] = tr["text"]
                         logger.info(f"  Transcribed {clip_file.name}: {tr['text'][:80]}{'...' if len(tr['text']) > 80 else ''}")
+                    else:
+                        # Silent clip — record the attempt so we don't re-load whisper.
+                        entry["transcript"] = ""
             with open(dataset_json_path, "w") as f:
                 json.dump(existing_entries, f, indent=2)
             if orphans_added > 0:
@@ -1044,15 +1050,27 @@ class RSLTXVPrepareDataset:
             else:
                 logger.info(f"clip_check: no entries needed updating ({total_clips} scanned)")
 
-        if transcribe_speech:
+        # Pre-check: only enter the transcription path if there's actually work
+        # to do.  The lazy whisper/demucs load fires on the first _transcribe_clip
+        # call — if every existing entry has been transcribed (or has no clip
+        # on disk), we want zero model loads, not one model load + 168 no-op
+        # iterations.  Use key existence (not truthiness) so silent clips with
+        # an empty transcript don't get re-attempted on every run.
+        backfill_targets = (
+            [e for e in existing_entries
+             if "transcript" not in e and Path(e["media_path"]).exists()]
+            if transcribe_speech else []
+        )
+        if transcribe_speech and not backfill_targets:
+            logger.info("Transcript backfill: nothing to do (skipping whisper/demucs load)")
+
+        if backfill_targets:
+            logger.info(f"Transcript backfill: {len(backfill_targets)} clip(s) need transcripts")
             backfilled = 0
+            silent_marked = 0
             hallucination_purge = []
-            for entry in existing_entries:
-                if entry.get("transcript"):
-                    continue
+            for entry in backfill_targets:
                 clip_file = Path(entry["media_path"])
-                if not clip_file.exists():
-                    continue
                 tr = _transcribe_clip(clip_file)
                 if tr and tr.get("hallucination"):
                     logger.info(f"  No usable speech, deleting: {clip_file.name}")
@@ -1066,13 +1084,20 @@ class RSLTXVPrepareDataset:
                     entry["transcript"] = tr["text"]
                     backfilled += 1
                     logger.info(f"  Backfill transcript {clip_file.name}: {tr['text'][:80]}{'...' if len(tr['text']) > 80 else ''}")
+                else:
+                    # Silent clip — mark as attempted with empty string so we
+                    # don't re-load whisper for it on every subsequent run.
+                    entry["transcript"] = ""
+                    silent_marked += 1
             for entry in hallucination_purge:
                 existing_entries.remove(entry)
-            if backfilled or hallucination_purge:
+            if backfilled or hallucination_purge or silent_marked:
                 with open(dataset_json_path, "w") as f:
                     json.dump(existing_entries, f, indent=2)
                 if backfilled:
                     logger.info(f"Backfilled {backfilled} missing transcripts")
+                if silent_marked:
+                    logger.info(f"Marked {silent_marked} silent clip(s) as no-dialogue")
                 if hallucination_purge:
                     logger.info(f"Purged {len(hallucination_purge)} clips with no usable speech")
 
@@ -1524,8 +1549,11 @@ class RSLTXVPrepareDataset:
                                 "media_path": str(result_path),
                                 "source_file": source_path,
                             }
-                            if result_transcript:
-                                entry["transcript"] = result_transcript
+                            if transcribe_speech:
+                                # Always record the transcript field (even "")
+                                # so silent clips don't trigger re-transcription
+                                # on subsequent runs.
+                                entry["transcript"] = result_transcript or ""
                             if clip_chars:
                                 entry["characters"] = clip_chars
                             if ref_folder and ref_folder.exists():
@@ -1655,8 +1683,10 @@ class RSLTXVPrepareDataset:
                                 if max_samples > 0 and len(existing_entries) >= max_samples:
                                     break
                                 entry = {"caption": "", "media_path": str(result_path), "source_file": source_path}
-                                if result_transcript:
-                                    entry["transcript"] = result_transcript
+                                if transcribe_speech:
+                                    # Always record the transcript field (even "")
+                                    # so silent clips don't trigger re-transcription.
+                                    entry["transcript"] = result_transcript or ""
                                 clip_chars = getattr(self, "_clip_characters", {}).get(str(result_path), [])
                                 if clip_chars:
                                     entry["characters"] = clip_chars
@@ -1864,7 +1894,10 @@ class RSLTXVPrepareDataset:
 
         # Phase 3a: Text encoding
         if clip is not None:
-            self._encode_conditions_inprocess(clip, dataset_json_path, conditions_dir)
+            self._encode_conditions_inprocess(
+                clip, dataset_json_path, conditions_dir,
+                character_names=list(character_refs.keys()) if character_refs else None,
+            )
         else:
             need_subprocess = True
 
@@ -1922,9 +1955,104 @@ class RSLTXVPrepareDataset:
             with open(dataset_json_path, "w") as f:
                 json.dump(existing_entries, f, indent=2)
 
+        # Final unload — drop everything prep loaded so unattended training that
+        # follows in the same workflow starts with a clean VRAM slate.
+        self._unload_all_prepper_models()
+
         return (str(output_dir), str(dataset_json_path))
 
-    def _encode_conditions_inprocess(self, clip, dataset_json_path: Path, conditions_dir: Path):
+    @staticmethod
+    def _unload_all_prepper_models():
+        """Free everything the prepper holds: InsightFace, Whisper, Demucs,
+        memoization caches, and ComfyUI's currently-loaded models. Safe to
+        call even if nothing was loaded — each unload is guarded.
+        """
+        global _whisper_model, _demucs_model, _demucs_device
+        global _face_app, _face_app_checked
+        global _last_analysis_frame_id, _last_analysis_faces
+
+        freed = []
+        if _whisper_model is not None:
+            del _whisper_model
+            _whisper_model = None
+            freed.append("Whisper")
+        if _demucs_model is not None:
+            del _demucs_model
+            _demucs_model = None
+            _demucs_device = None
+            freed.append("Demucs")
+        if _face_app is not None:
+            try:
+                del _face_app
+            except Exception:
+                pass
+            _face_app = None
+            _face_app_checked = False
+            freed.append("InsightFace")
+
+        # Drop frame memoization (holds a reference to the most recent frame)
+        _last_analysis_frame_id = None
+        _last_analysis_faces = []
+
+        import gc
+        gc.collect()
+        try:
+            import comfy.model_management as mm
+            mm.unload_all_models()
+            mm.soft_empty_cache()
+        except Exception as e:
+            logger.warning(f"Final unload: ComfyUI model_management cleanup failed: {e}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if freed:
+            logger.info(f"Final unload: dropped {' + '.join(freed)} + ComfyUI loaded models")
+        else:
+            logger.info("Final unload: dropped ComfyUI loaded models (no prepper models were resident)")
+
+    # Strip ' / ' / ' that quote words but keep apostrophes inside words.
+    # 'pee-wee' → pee-wee, 'subject' → subject, said 'no'. → said no.
+    # it's / Pee-wee's / don't all stay intact.
+    _QUOTE_STRIP_RE = re.compile(r"(?<![A-Za-z])['‘’]|['‘’](?![A-Za-z])")
+
+    @staticmethod
+    def _titlecase_name(name: str) -> str:
+        """Capitalize the first letter of each space-separated token; leave
+        hyphenated forms with single capitalization (pee-wee → Pee-wee, not
+        Pee-Wee).  miss yvonne → Miss Yvonne; cowboy curtis → Cowboy Curtis."""
+        return " ".join(w[:1].upper() + w[1:] for w in name.split(" ") if w)
+
+    @classmethod
+    def _normalize_caption_for_encode(cls, caption: str, character_names=None) -> str:
+        """Caption preprocessing applied at text-encode time only — leaves
+        dataset.json untouched.
+
+        - Strips word-wrapping quotes so trigger words don't bind to a quoted
+          form (e.g. 'pee-wee' would train differently from pee-wee).
+        - Capitalizes known character names (case-insensitive match) so the
+          training tokens for character triggers are stable proper nouns
+          regardless of how Gemma rendered them in any individual caption.
+        """
+        if not caption:
+            return caption
+        caption = cls._QUOTE_STRIP_RE.sub("", caption)
+        if character_names:
+            # Longest-first so multi-word names (miss yvonne) win against
+            # single-word substrings (yvonne) inside the same scan.
+            for name in sorted(character_names, key=len, reverse=True):
+                if not name:
+                    continue
+                pattern = r"\b" + re.escape(name) + r"\b"
+                caption = re.sub(
+                    pattern,
+                    cls._titlecase_name(name),
+                    caption,
+                    flags=re.IGNORECASE,
+                )
+        return caption
+
+    def _encode_conditions_inprocess(self, clip, dataset_json_path: Path, conditions_dir: Path,
+                                       character_names=None):
         """Encode captions in-process using ComfyUI's already-loaded CLIP text encoder.
 
         ComfyUI's LTX CLIP runs Gemma + feature extractor (blocks 1+2 of the text
@@ -1964,6 +2092,7 @@ class RSLTXVPrepareDataset:
 
         for i, (entry, output_file) in enumerate(to_encode):
             caption = entry.get("caption", "")
+            caption = self._normalize_caption_for_encode(caption, character_names)
 
             tokens = clip.tokenize(caption)
             result = clip.encode_from_tokens(tokens, return_dict=True)
