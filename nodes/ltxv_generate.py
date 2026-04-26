@@ -2086,51 +2086,115 @@ class RSLTXVGenerate:
 
     @staticmethod
     def _install_prompt_relay(model_clone, pr_meta):
-        """Wrap diffusion_model.forward to inject the Prompt Relay cross-attention
-        penalty (arXiv 2604.10030).
+        """Install Prompt Relay (arXiv 2604.10030) cross-attention penalties.
 
-        The wrapper replaces `attention_mask` with a float [B, 1, Q, K] additive
-        mask before delegating to the original forward — LTX's _prepare_attention_mask
-        passes float-typed masks through unchanged, so the penalty reaches every
-        cross-attention block at every step (paper-faithful)."""
+        Builds a [B, 1, Q, K] additive mask per stream (video, optionally audio
+        for AV models) and threads them through transformer_options. Each block's
+        text cross-attention forward is patched to consume the right mask.
+
+        For non-AV LTX models the audio mask is omitted; only attn2 is patched.
+        For AV (LTXVAVTransformer) both attn2 and audio_attn2 are patched per
+        block so audio events route to their assigned segments too."""
         from ..utils.prompt_relay import build_relay_mask
+
+        diffusion_model = model_clone.model.diffusion_model
+        blocks = getattr(diffusion_model, "transformer_blocks", None)
+        if blocks is None or len(blocks) == 0:
+            logger.warning("Prompt Relay: no transformer_blocks found, skipping install")
+            return
+
+        is_av = any(hasattr(b, "audio_attn2") for b in blocks)
 
         # Compute expected K so we can sanity-check this is the cond we encoded
         # (and skip the mask build for unrelated conditioning, e.g. negatives).
         segs = pr_meta.get("segments", [])
         expected_K = max((s["end_token"] for s in segs), default=pr_meta.get("global_len", 0))
 
-        original_forward = model_clone.model.diffusion_model.forward
+        # Top-level forward wrapper: build per-stream masks, stash via transformer_options.
+        original_forward = diffusion_model.forward
 
         def wrapped_forward(x, timestep, context, attention_mask=None,
-                            frame_rate=25, transformer_options={},
+                            frame_rate=25, transformer_options=None,
                             keyframe_idxs=None, denoise_mask=None, **kwargs):
-            xs = x[0] if isinstance(x, list) else x
+            xs_v = x[0] if isinstance(x, list) else x
+            xs_a = x[1] if (isinstance(x, list) and len(x) > 1) else None
+
+            new_to = dict(transformer_options) if transformer_options else {}
+
             if (context is not None and context.ndim >= 2
                     and context.shape[1] == expected_K and expected_K > 0):
-                attention_mask = build_relay_mask(
+                v_mask = build_relay_mask(
                     "video",
-                    B=xs.shape[0],
+                    B=int(xs_v.shape[0]),
                     K_total=int(context.shape[1]),
                     pr=pr_meta,
                     base_mask=attention_mask,
-                    dtype=xs.dtype,
-                    device=xs.device,
-                    T_lat=int(xs.shape[2]),
-                    H_lat=int(xs.shape[3]),
-                    W_lat=int(xs.shape[4]),
+                    dtype=xs_v.dtype,
+                    device=xs_v.device,
+                    T_lat=int(xs_v.shape[2]),
+                    H_lat=int(xs_v.shape[3]),
+                    W_lat=int(xs_v.shape[4]),
                     frame_rate=float(frame_rate),
                 )
+                a_mask = None
+                if is_av and xs_a is not None and xs_a.numel() > 0 and xs_a.ndim >= 3:
+                    a_mask = build_relay_mask(
+                        "audio",
+                        B=int(xs_a.shape[0]),
+                        K_total=int(context.shape[1]),
+                        pr=pr_meta,
+                        base_mask=attention_mask,
+                        dtype=xs_v.dtype,
+                        device=xs_v.device,
+                        audio_T_lat=int(xs_a.shape[2]),
+                    )
+                new_to["_rs_relay_masks"] = {"video": v_mask, "audio": a_mask}
+                # Masks now flow via transformer_options; clear the standard channel
+                # so _prepare_attention_mask doesn't fight us.
+                attention_mask = None
+
             return original_forward(
                 x, timestep, context, attention_mask,
                 frame_rate=frame_rate,
-                transformer_options=transformer_options,
+                transformer_options=new_to,
                 keyframe_idxs=keyframe_idxs,
                 denoise_mask=denoise_mask,
                 **kwargs,
             )
 
         model_clone.add_object_patch("diffusion_model.forward", wrapped_forward)
+
+        # Per-block cross-attention wrappers: pick up the right mask at attn time.
+        def make_attn_wrapper(stream, original_attn_forward):
+            def wrapped(x, context=None, mask=None, pe=None, k_pe=None,
+                        transformer_options=None, **kw):
+                relay = (transformer_options or {}).get("_rs_relay_masks")
+                if relay is not None:
+                    m = relay.get(stream)
+                    if m is not None:
+                        mask = m
+                return original_attn_forward(
+                    x, context=context, mask=mask, pe=pe, k_pe=k_pe,
+                    transformer_options=transformer_options, **kw,
+                )
+            return wrapped
+
+        for i, block in enumerate(blocks):
+            if hasattr(block, "attn2"):
+                model_clone.add_object_patch(
+                    f"diffusion_model.transformer_blocks.{i}.attn2.forward",
+                    make_attn_wrapper("video", block.attn2.forward),
+                )
+            if hasattr(block, "audio_attn2"):
+                model_clone.add_object_patch(
+                    f"diffusion_model.transformer_blocks.{i}.audio_attn2.forward",
+                    make_attn_wrapper("audio", block.audio_attn2.forward),
+                )
+
+        logger.info(
+            f"Prompt Relay installed: {len(blocks)} block(s), "
+            f"{'AV (video+audio)' if is_av else 'video-only'}"
+        )
 
     @staticmethod
     def _apply_ffn_chunking(model_clone, num_chunks):
