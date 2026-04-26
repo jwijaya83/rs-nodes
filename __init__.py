@@ -24,6 +24,7 @@ from .nodes.video_save import RSVideoSave
 from .nodes.exr_sequence_save import RSEXRSequenceSave
 from .nodes.logc3_decode import RSLogC3Decode
 from .nodes.prompt_relay_encode import RSPromptRelayEncode
+from .nodes.prompt_relay_timeline import RSPromptRelayTimeline
 
 WEB_DIRECTORY = "./web"
 
@@ -54,6 +55,7 @@ NODE_CLASS_MAPPINGS = {
     "RSEXRSequenceSave": RSEXRSequenceSave,
     "RSLogC3Decode": RSLogC3Decode,
     "RSPromptRelayEncode": RSPromptRelayEncode,
+    "RSPromptRelayTimeline": RSPromptRelayTimeline,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -83,6 +85,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSEXRSequenceSave": "RS EXR Sequence Save",
     "RSLogC3Decode": "RS LogC3 HDR Decode",
     "RSPromptRelayEncode": "RS Prompt Relay Encode",
+    "RSPromptRelayTimeline": "RS Prompt Relay Timeline",
 }
 
 # MOSS-TTS nodes — only available if dependencies (transformers, huggingface_hub) are installed
