@@ -2362,10 +2362,10 @@ class RSLTXVPrepareDataset:
         else:
             logger.info("Final unload: dropped ComfyUI loaded models (no prepper models were resident)")
 
-    # Strip ' / ' / ' that quote words but keep apostrophes inside words.
-    # 'pee-wee' → pee-wee, 'subject' → subject, said 'no'. → said no.
-    # it's / Pee-wee's / don't all stay intact.
-    _QUOTE_STRIP_RE = re.compile(r"(?<![A-Za-z])['‘’]|['‘’](?![A-Za-z])")
+    # Strip ' / ' / ' / ` that quote words but keep apostrophes inside words.
+    # 'pee-wee' → pee-wee, `pee-wee` → pee-wee, said 'no'. → said no.
+    # it's / Pee-wee's / don't all stay intact (apostrophe between letters).
+    _QUOTE_STRIP_RE = re.compile(r"(?<![A-Za-z])['‘’`]|['‘’`](?![A-Za-z])")
 
     @staticmethod
     def _titlecase_name(name: str) -> str:
