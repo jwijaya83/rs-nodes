@@ -294,14 +294,6 @@ class RSLTXVGenerate:
         if ffn_chunks > 0:
             self._apply_ffn_chunking(m, ffn_chunks)
 
-        # Prompt Relay (auto-enabled when conditioning carries metadata)
-        pr_meta = self._extract_prompt_relay(positive)
-        if pr_meta is not None:
-            n_seg = len(pr_meta.get("segments", []))
-            logger.info(f"Prompt Relay active: {n_seg} segment(s), "
-                        f"global_len={pr_meta.get('global_len')}, ε={pr_meta.get('epsilon')}")
-            self._install_prompt_relay(m, pr_meta)
-
         # When audio is provided, derive video length from audio duration
         if audio is not None and audio_vae is not None:
             waveform = audio["waveform"]
@@ -328,6 +320,19 @@ class RSLTXVGenerate:
             gen_width = (width // 2 + 63) // 64 * 64
             gen_height = (height // 2 + 63) // 64 * 64
             logger.info(f"Upscale enabled: generating at {gen_width}x{gen_height}, target {width}x{height}")
+
+        # Prompt Relay (auto-enabled when conditioning carries metadata).
+        # Installed AFTER gen_height/gen_width are finalised so the hook can
+        # self-disable on the upscale re-diffusion (which clones this same
+        # patcher and runs at higher latent dims).
+        pr_meta = self._extract_prompt_relay(positive)
+        if pr_meta is not None:
+            n_seg = len(pr_meta.get("segments", []))
+            logger.info(f"Prompt Relay active: {n_seg} segment(s), "
+                        f"global_len={pr_meta.get('global_len')}, ε={pr_meta.get('epsilon')}")
+            self._install_prompt_relay(m, pr_meta,
+                                        first_pass_H_lat=gen_height // 32,
+                                        first_pass_W_lat=gen_width // 32)
 
         # T2V first-frame bootstrap: generate a short clip at full resolution,
         # decode the first frame, and use it as I2V guidance for the main generation.
@@ -2085,7 +2090,8 @@ class RSLTXVGenerate:
         return None
 
     @staticmethod
-    def _install_prompt_relay(model_clone, pr_meta):
+    def _install_prompt_relay(model_clone, pr_meta,
+                              first_pass_H_lat=None, first_pass_W_lat=None):
         """Install Prompt Relay (arXiv 2604.10030) cross-attention penalties.
 
         Builds a [B, 1, Q, K] additive mask per stream (video, optionally audio
@@ -2094,7 +2100,13 @@ class RSLTXVGenerate:
 
         For non-AV LTX models the audio mask is omitted; only attn2 is patched.
         For AV (LTXVAVTransformer) both attn2 and audio_attn2 are patched per
-        block so audio events route to their assigned segments too."""
+        block so audio events route to their assigned segments too.
+
+        If `first_pass_H_lat` and `first_pass_W_lat` are provided, the hook
+        self-disables when called with a larger latent — i.e. during the
+        upscale re-diffusion pass — so the upscale gets full-prompt cross-
+        attention without segment routing (which produces refinement
+        artifacts at higher resolution)."""
         from ..utils.prompt_relay import build_relay_mask
 
         diffusion_model = model_clone.model.diffusion_model
@@ -2119,9 +2131,20 @@ class RSLTXVGenerate:
             xs_v = x[0] if isinstance(x, list) else x
             xs_a = x[1] if (isinstance(x, list) and len(x) > 1) else None
 
+            # Self-disable on upscale re-diffusion: the patcher carries forward
+            # to the clone used for upscale, but segment routing hurts
+            # refinement at higher resolution. Detected by latent dims growing.
+            is_upscale = (
+                first_pass_H_lat is not None and first_pass_W_lat is not None
+                and xs_v.ndim >= 5
+                and (xs_v.shape[3] > first_pass_H_lat
+                     or xs_v.shape[4] > first_pass_W_lat)
+            )
+
             new_to = dict(transformer_options) if transformer_options else {}
 
-            if (context is not None and context.ndim >= 2
+            if (not is_upscale
+                    and context is not None and context.ndim >= 2
                     and context.shape[1] == expected_K and expected_K > 0):
                 v_mask = build_relay_mask(
                     "video",
