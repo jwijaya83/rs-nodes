@@ -64,12 +64,38 @@ function addSections(node, sections) {
     }
 }
 
+function hookSeedWriteback(node) {
+    // Backend returns {"ui": {"noise_seed": [seed]}} after generation.
+    // Write the resolved seed back into the widget so the user can see / reuse
+    // what was actually used (random, increment, decrement modes resolve at
+    // runtime).
+    const origOnExecuted = node.onExecuted;
+    node.onExecuted = function (message) {
+        origOnExecuted?.apply(this, arguments);
+        const v = message?.noise_seed;
+        if (v && v.length) {
+            const seedWidget = this.widgets?.find((w) => w.name === "noise_seed");
+            if (seedWidget) {
+                const num = Number(v[0]);
+                if (Number.isFinite(num) && seedWidget.value !== num) {
+                    seedWidget.value = num;
+                    if (typeof seedWidget.callback === "function") {
+                        try { seedWidget.callback(num); } catch {}
+                    }
+                    this.setDirtyCanvas?.(true, true);
+                }
+            }
+        }
+    };
+}
+
 app.registerExtension({
     name: "rs-nodes.LTXVGenerate",
 
     nodeCreated(node) {
         if (node.comfyClass === "RSLTXVGenerate") {
             addSections(node, GENERATE_SECTIONS);
+            hookSeedWriteback(node);
         } else if (node.comfyClass === "RSLTXVExtend") {
             addSections(node, EXTEND_SECTIONS);
         }

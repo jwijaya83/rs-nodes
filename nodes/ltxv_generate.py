@@ -41,7 +41,7 @@ class RSLTXVGenerate:
                 "num_frames": ("INT",   {"default": 97,   "min": 9,   "max": 8192, "step": 8}),
                 "steps":      ("INT",   {"default": 20,   "min": 1,   "max": 10000}),
                 "cfg":        ("FLOAT", {"default": 3.0,  "min": 0.0, "max": 100.0, "step": 0.1}),
-                "noise_seed": ("INT",   {"default": 0,    "min": 0,   "max": 0xffffffffffffffff}),
+                "noise_seed": ("INT",   {"default": 0,    "min": 0,   "max": 0xffffffffffffffff, "control_after_generate": False}),
                 "seed_mode":  (["random", "fixed", "increment", "decrement"],),
                 "frame_rate": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
                 # Frame injection
@@ -210,6 +210,15 @@ class RSLTXVGenerate:
             seed = (self._last_seed - 1) % (0xffffffffffffffff + 1)
         self._last_seed = seed
         logger.info(f"Starting generation (seed={seed}, mode={seed_mode})")
+        # Save guider.model_patcher so we can restore it after _generate_impl
+        # mutates it for FFN-chunking / attention-override propagation. Without
+        # this, the IC-LoRA guider node's patcher accumulates patches across
+        # runs (and distilled-LoRA wrapping stacks).
+        _orig_guider_patcher = (
+            guider.model_patcher
+            if (guider is not None and hasattr(guider, 'model_patcher'))
+            else None
+        )
         try:
             result = self._generate_impl(
                 model, positive, negative, vae,
@@ -253,6 +262,8 @@ class RSLTXVGenerate:
             logger.info("Error during generation, cleaning up VRAM")
             raise
         finally:
+            if _orig_guider_patcher is not None:
+                guider.model_patcher = _orig_guider_patcher
             self._free_vram()
 
     def _generate_impl(
@@ -279,6 +290,19 @@ class RSLTXVGenerate:
         # ----------------------------------------------------------------
 
         m = model.clone()
+
+        # When an external guider is connected (e.g. RSLTXVICLoRAGuider), its
+        # own model_patcher is what `guider.sample()` uses -- our local `m`
+        # would otherwise be silently bypassed and gen-node-level setup
+        # (FFN chunking, attention_mode override, Prompt Relay hook) would
+        # never reach the first-pass model. Use the guider's patcher as the
+        # cloning base (preserves any LoRA / shift the guider already applied)
+        # and install the patched `m` back into the guider before sampling.
+        # The outer generate() restores guider.model_patcher in finally.
+        if guider is not None and hasattr(guider, 'model_patcher'):
+            m = guider.model_patcher.clone()
+            guider.model_patcher = m
+            logger.info("External guider detected: gen-node setup will propagate to its model_patcher")
 
         # Attention override
         attn_func = None
@@ -621,8 +645,8 @@ class RSLTXVGenerate:
                 logger.info("Creating empty audio latents for generation")
                 audio_samples = torch.zeros(
                     (1, audio_vae.latent_channels,
-                     audio_vae.num_of_latents_from_frames(num_frames, frame_rate),
-                     audio_vae.latent_frequency_bins),
+                     audio_vae.first_stage_model.num_of_latents_from_frames(num_frames, frame_rate),
+                     audio_vae.first_stage_model.latent_frequency_bins),
                     device=mm.intermediate_device(),
                 )
 
