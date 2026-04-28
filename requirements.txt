@@ -20,3 +20,6 @@ onnxruntime-gpu
 # Audio: vocal isolation (Demucs) + speaker embedding (speechbrain ECAPA-TDNN)
 demucs
 speechbrain>=1.0
+# Attention: SageAttention for ~1.5-2x speedup on supported GPUs (auto mode in
+# RSLTXVGenerate / RSLTXVICLoRAGuider falls back to default SDPA without it)
+sageattention
