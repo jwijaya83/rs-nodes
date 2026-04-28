@@ -21,5 +21,9 @@ onnxruntime-gpu
 demucs
 speechbrain>=1.0
 # Attention: SageAttention for ~1.5-2x speedup on supported GPUs (auto mode in
-# RSLTXVGenerate / RSLTXVICLoRAGuider falls back to default SDPA without it)
+# RSLTXVGenerate / RSLTXVICLoRAGuider falls back to default SDPA without it).
+# Triton is a hard dependency of sageattention -- official `triton` has no
+# Windows wheels, so use the community `triton-windows` fork there.
 sageattention
+triton-windows; sys_platform == 'win32'
+triton; sys_platform != 'win32'
