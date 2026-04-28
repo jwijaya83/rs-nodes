@@ -33,6 +33,7 @@ class RSLTXVGenerate:
                 "positive":   ("CONDITIONING",),
                 "negative":   ("CONDITIONING",),
                 "vae":        ("VAE",),
+                "audio_vae":  ("VAE",),
             },
             "optional": {
                 # Generation
@@ -59,8 +60,7 @@ class RSLTXVGenerate:
                 "crf":               ("INT",   {"default": 35,   "min": 0,   "max": 100}),
                 # Audio
                 "audio":             ("AUDIO",),
-                "audio_vae":         ("VAE",),
-                # Multimodal guidance (used when audio_vae is connected)
+                # Multimodal guidance
                 "audio_cfg":         ("FLOAT", {"default": 7.0,  "min": 0.0, "max": 100.0, "step": 0.1}),
                 "stg_scale":         ("FLOAT", {"default": 0.0,  "min": 0.0, "max": 10.0,  "step": 0.1}),
                 "stg_perturbation":  ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -1959,7 +1959,7 @@ class RSLTXVGenerate:
                 decoded_audio = audio_vae.decode(audio_latent_out).to(audio_latent_out.device)
                 audio_output = {
                     "waveform": decoded_audio,
-                    "sample_rate": int(audio_vae.output_sample_rate),
+                    "sample_rate": int(audio_vae.audio_sample_rate_output),
                 }
 
         # Build audio latent output
