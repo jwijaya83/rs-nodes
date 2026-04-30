@@ -66,9 +66,9 @@ function addSections(node, sections) {
 
 function hookSeedWriteback(node) {
     // Backend returns {"ui": {"noise_seed": [seed]}} after generation.
-    // Write the resolved seed back into the widget so the user can see / reuse
-    // what was actually used (random, increment, decrement modes resolve at
-    // runtime).
+    // Mirror the value back into the widget as a safety net (in case the
+    // backend ever resolves a seed itself); also keeps the displayed value
+    // truthful when the widget was set by preRollSeed below.
     const origOnExecuted = node.onExecuted;
     node.onExecuted = function (message) {
         origOnExecuted?.apply(this, arguments);
@@ -88,6 +88,52 @@ function hookSeedWriteback(node) {
         }
     };
 }
+
+function preRollSeed(node) {
+    // Resolve seed_mode in the frontend BEFORE prompt submission so the
+    // rolled noise_seed lands in the serialized workflow JSON. That way the
+    // seed embedded in the output file's metadata matches the seed actually
+    // used -- so dragging the file back in restores the original seed and
+    // re-running with seed_mode='fixed' reproduces the exact output.
+    const seedWidget = node.widgets?.find((w) => w.name === "noise_seed");
+    const modeWidget = node.widgets?.find((w) => w.name === "seed_mode");
+    if (!seedWidget || !modeWidget) return;
+    const mode = modeWidget.value;
+    let next = seedWidget.value;
+    if (mode === "random") {
+        // 53-bit safe-int range. Backend max is uint64 but JS Number can't
+        // represent that without precision loss; 53 bits is plenty of entropy.
+        next = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+    } else if (mode === "increment") {
+        next = (Number(seedWidget.value) + 1) % Number.MAX_SAFE_INTEGER;
+    } else if (mode === "decrement") {
+        next = Number(seedWidget.value) - 1;
+        if (next < 0) next = Number.MAX_SAFE_INTEGER - 1;
+    }
+    if (next !== seedWidget.value) {
+        seedWidget.value = next;
+        if (typeof seedWidget.callback === "function") {
+            try { seedWidget.callback(next); } catch {}
+        }
+    }
+}
+
+// Wrap app.queuePrompt once so every queue submission gets a fresh seed roll
+// for any RSLTXVGenerate node on the graph. Bound + closure-saved original
+// so chained extensions still work.
+const _origQueuePrompt = app.queuePrompt.bind(app);
+app.queuePrompt = async function (...args) {
+    try {
+        for (const node of (app.graph?._nodes || [])) {
+            if (node.comfyClass === "RSLTXVGenerate") {
+                preRollSeed(node);
+            }
+        }
+    } catch (e) {
+        console.warn("rs-nodes preRollSeed failed:", e);
+    }
+    return _origQueuePrompt(...args);
+};
 
 app.registerExtension({
     name: "rs-nodes.LTXVGenerate",

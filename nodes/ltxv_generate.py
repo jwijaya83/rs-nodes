@@ -33,7 +33,6 @@ class RSLTXVGenerate:
                 "positive":   ("CONDITIONING",),
                 "negative":   ("CONDITIONING",),
                 "vae":        ("VAE",),
-                "audio_vae":  ("VAE",),
             },
             "optional": {
                 # Generation
@@ -42,7 +41,7 @@ class RSLTXVGenerate:
                 "num_frames": ("INT",   {"default": 97,   "min": 9,   "max": 8192, "step": 8}),
                 "steps":      ("INT",   {"default": 20,   "min": 1,   "max": 10000}),
                 "cfg":        ("FLOAT", {"default": 3.0,  "min": 0.0, "max": 100.0, "step": 0.1}),
-                "noise_seed": ("INT",   {"default": 0,    "min": 0,   "max": 0xffffffffffffffff, "control_after_generate": False}),
+                "noise_seed": ("INT",   {"default": 0,    "min": 0,   "max": 0xffffffffffffffff}),
                 "seed_mode":  (["random", "fixed", "increment", "decrement"],),
                 "frame_rate": ("FLOAT", {"default": 25.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
                 # Frame injection
@@ -60,7 +59,8 @@ class RSLTXVGenerate:
                 "crf":               ("INT",   {"default": 35,   "min": 0,   "max": 100}),
                 # Audio
                 "audio":             ("AUDIO",),
-                # Multimodal guidance
+                "audio_vae":         ("VAE",),
+                # Multimodal guidance (used when audio_vae is connected)
                 "audio_cfg":         ("FLOAT", {"default": 7.0,  "min": 0.0, "max": 100.0, "step": 0.1}),
                 "stg_scale":         ("FLOAT", {"default": 0.0,  "min": 0.0, "max": 10.0,  "step": 0.1}),
                 "stg_perturbation":  ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -200,25 +200,12 @@ class RSLTXVGenerate:
         base_shift=0.95,
         **kwargs,
     ):
-        # Resolve seed based on mode (replaces broken control_after_generate)
+        # The frontend (web/ltxv_generate.js) resolves seed_mode before queue
+        # submission so the rolled seed lives in the workflow JSON / embedded
+        # output metadata. Backend just trusts noise_seed as-is.
         seed = noise_seed
-        if seed_mode == "random":
-            seed = random.randint(0, 0xffffffffffffffff)
-        elif seed_mode == "increment" and self._last_seed is not None:
-            seed = (self._last_seed + 1) % (0xffffffffffffffff + 1)
-        elif seed_mode == "decrement" and self._last_seed is not None:
-            seed = (self._last_seed - 1) % (0xffffffffffffffff + 1)
         self._last_seed = seed
         logger.info(f"Starting generation (seed={seed}, mode={seed_mode})")
-        # Save guider.model_patcher so we can restore it after _generate_impl
-        # mutates it for FFN-chunking / attention-override propagation. Without
-        # this, the IC-LoRA guider node's patcher accumulates patches across
-        # runs (and distilled-LoRA wrapping stacks).
-        _orig_guider_patcher = (
-            guider.model_patcher
-            if (guider is not None and hasattr(guider, 'model_patcher'))
-            else None
-        )
         try:
             result = self._generate_impl(
                 model, positive, negative, vae,
@@ -262,8 +249,6 @@ class RSLTXVGenerate:
             logger.info("Error during generation, cleaning up VRAM")
             raise
         finally:
-            if _orig_guider_patcher is not None:
-                guider.model_patcher = _orig_guider_patcher
             self._free_vram()
 
     def _generate_impl(
@@ -290,19 +275,6 @@ class RSLTXVGenerate:
         # ----------------------------------------------------------------
 
         m = model.clone()
-
-        # When an external guider is connected (e.g. RSLTXVICLoRAGuider), its
-        # own model_patcher is what `guider.sample()` uses -- our local `m`
-        # would otherwise be silently bypassed and gen-node-level setup
-        # (FFN chunking, attention_mode override, Prompt Relay hook) would
-        # never reach the first-pass model. Use the guider's patcher as the
-        # cloning base (preserves any LoRA / shift the guider already applied)
-        # and install the patched `m` back into the guider before sampling.
-        # The outer generate() restores guider.model_patcher in finally.
-        if guider is not None and hasattr(guider, 'model_patcher'):
-            m = guider.model_patcher.clone()
-            guider.model_patcher = m
-            logger.info("External guider detected: gen-node setup will propagate to its model_patcher")
 
         # Attention override
         attn_func = None
@@ -1228,6 +1200,7 @@ class RSLTXVGenerate:
                                 up_model, positive, negative, vae,
                                 _iclora_info, upscale_cfg,
                                 latent_h=up_lh, latent_w=up_lw, latent_t=up_lt,
+                                propagate_distilled_lora=False,
                             )
                             up_guider._current_rediff_pass = _rediff_i
                             up_guider._total_rediff_passes = _rediff_passes
@@ -1687,6 +1660,7 @@ class RSLTXVGenerate:
                             p2_model, positive, negative, vae,
                             _iclora_info, upscale_cfg,
                             latent_h=p2_lh2, latent_w=p2_lw2, latent_t=p2_lt,
+                            propagate_distilled_lora=False,
                         )
                     else:
                         from ..utils.multimodal_guider import MultimodalGuider
@@ -1956,7 +1930,7 @@ class RSLTXVGenerate:
                 audio_output = audio
             else:
                 logger.info("Decoding generated audio latents")
-                decoded_audio = audio_vae.decode(audio_latent_out).to(audio_latent_out.device)
+                decoded_audio = audio_vae.decode(audio_latent_out).movedim(-1, 1).to(audio_latent_out.device)
                 audio_output = {
                     "waveform": decoded_audio,
                     "sample_rate": int(audio_vae.audio_sample_rate_output),
@@ -1977,12 +1951,18 @@ class RSLTXVGenerate:
     @staticmethod
     def _rebuild_iclora_guider(up_model, positive, negative, vae,
                                control_info, upscale_cfg, latent_h, latent_w,
-                               latent_t):
+                               latent_t, propagate_distilled_lora=True):
         """Rebuild an ICLoRAGuider at upscaled resolution.
 
         Uses ICLoRAGuider with deferred encoding — the control image is
         stored and re-encoded at sample() time at the actual upscaled
         latent dimensions, following the official LTXVAddGuide approach.
+
+        propagate_distilled_lora: when True (default) the rebuilt guider
+        carries the original distilled LoRA so distilled-cfg passes apply
+        it. Set False on upscale rediffusion paths so the upscale model
+        runs without the distilled LoRA, while IC-LoRA's own
+        rediffusion_passes (same-resolution refinement) still get it.
         """
         from ..utils.multimodal_guider import ICLoRAGuider
         from comfy_extras.nodes_lt import preprocess as ltxv_preprocess
@@ -2068,13 +2048,17 @@ class RSLTXVGenerate:
         up_guider.control_info = ci
         up_guider.ic_lora_sampler = ci.get("_ic_lora_sampler", None)
 
-        # Propagate distilled LoRA for distilled sigma passes
-        dl_name = ci.get("_distilled_lora", "none")
-        dl_strength = ci.get("_distilled_lora_strength", 1.0)
-        if dl_name and dl_name != "none" and dl_strength != 0:
-            dl_path = folder_paths.get_full_path_or_raise("loras", dl_name)
-            dl_data = comfy.utils.load_torch_file(dl_path, safe_load=True)
-            up_guider._distilled_lora = (dl_data, dl_strength, dl_name)
+        # Propagate distilled LoRA for distilled sigma passes (gated so the
+        # upscale rediffusion can opt out -- distilled LoRA is desired for
+        # IC-LoRA's same-resolution rediffusion_passes refinement, not for
+        # the higher-resolution upscale pass).
+        if propagate_distilled_lora:
+            dl_name = ci.get("_distilled_lora", "none")
+            dl_strength = ci.get("_distilled_lora_strength", 1.0)
+            if dl_name and dl_name != "none" and dl_strength != 0:
+                dl_path = folder_paths.get_full_path_or_raise("loras", dl_name)
+                dl_data = comfy.utils.load_torch_file(dl_path, safe_load=True)
+                up_guider._distilled_lora = (dl_data, dl_strength, dl_name)
 
         logger.info("IC-LoRA guider rebuilt for upscale (deferred encoding)")
         return up_guider
