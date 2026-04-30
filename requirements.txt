@@ -15,11 +15,19 @@ scenedetect>=0.6.5.2
 av>=14.2.1
 psutil
 einops
+# insightface 0.7.3's prebuilt wheel was compiled against numpy 1.x and
+# crashes with "numpy.dtype size changed" on numpy 2.x. Pin numpy <2 until
+# insightface ships a 2.x-compatible wheel.
+numpy<2
 insightface
 onnxruntime-gpu
 # Audio: vocal isolation (Demucs) + speaker embedding (speechbrain ECAPA-TDNN)
 demucs
 speechbrain>=1.0
+# ROSE optimizer (used by RSLTXVTrainLora when optimizer="rose"). PyPI package
+# is `rose-opt`, the import is `rose_opt`. Replaces the older
+# git+https://github.com/MatthewK78/Rose path which no longer works.
+rose-opt
 # Attention: SageAttention for ~1.5-2x speedup on supported GPUs (auto mode in
 # RSLTXVGenerate / RSLTXVICLoRAGuider falls back to default SDPA without it).
 # Triton is a hard dependency of sageattention -- official `triton` has no
