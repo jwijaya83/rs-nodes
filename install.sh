@@ -17,8 +17,9 @@ pip install -r requirements.txt
 echo
 
 # Install ROSE optimizer (stateless optimizer for LoRA training)
+# Now published on PyPI as `rose-opt`; module is `rose_opt`.
 echo "[3/4] Installing ROSE optimizer..."
-pip install git+https://github.com/MatthewK78/Rose
+pip install rose-opt
 echo
 
 # Pre-download InsightFace antelopev2 face detection + recognition pack (~300MB)

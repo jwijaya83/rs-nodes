@@ -506,6 +506,12 @@ class InProcessTrainer:
 
         step = start_step
         interrupted = False
+        # Track consecutive OOMs so we can stop training when fragmentation
+        # has eaten the heap and every step is failing -- continuing wastes
+        # time and the CPU/GPU offload still grinds. A clean save+exit lets
+        # the user restart in a fresh process where the heap is reset.
+        consecutive_ooms = 0
+        MAX_CONSECUTIVE_OOMS = 5
         while step < self._total_steps:
             step += 1
             # Cancellation check — save checkpoint before exiting
@@ -556,16 +562,47 @@ class InProcessTrainer:
                 self._save_checkpoint(step)
                 interrupted = True
                 break
-            except _OOM_EXCEPTIONS:
-                # OOM on a hard sample — double FFN chunks and retry once
+            except _OOM_EXCEPTIONS as oom_err:
+                # Capture diagnostics from the original failure BEFORE any
+                # cleanup (cleanup changes allocator state). The exception
+                # message carries the actual allocation request size and
+                # CUDA's free/limit numbers, which is what we need to tell
+                # fragmentation apart from "sample too big".
+                first_err = str(oom_err).splitlines()[0] if str(oom_err) else type(oom_err).__name__
+                pre_alloc_gb = torch.cuda.memory_allocated() / 1024**3
+                pre_reserved_gb = torch.cuda.memory_reserved() / 1024**3
+                pre_peak_gb = torch.cuda.max_memory_allocated() / 1024**3
+                # Largest free contiguous block in the caching allocator's
+                # currently-reserved pool -- this is THE fragmentation tell.
+                # If reserved is high but largest_free is small, the heap
+                # is fragmented and empty_cache() won't help.
+                try:
+                    mem_stats = torch.cuda.memory_stats()
+                    largest_free_gb = mem_stats.get(
+                        "reserved_bytes.all.peak", 0
+                    ) / 1024**3
+                except Exception:
+                    largest_free_gb = -1.0
+
                 loss = None
+                # CUDA ops are async; sync first so any in-flight kernels
+                # actually release their memory before empty_cache runs.
+                # Without this the cleanup is a no-op.
+                torch.cuda.synchronize()
                 gc.collect()
                 torch.cuda.empty_cache()
                 self._optimizer.zero_grad(set_to_none=True)
 
                 original_chunks = self._ffn_chunks
                 self._ffn_chunks = max(original_chunks * 2, 8)
-                print(f"Step {step}: OOM — retrying with ffn_chunks={self._ffn_chunks} (was {original_chunks})")
+                post_alloc_gb = torch.cuda.memory_allocated() / 1024**3
+                print(
+                    f"Step {step}: OOM (alloc={pre_alloc_gb:.2f}G "
+                    f"reserved={pre_reserved_gb:.2f}G peak={pre_peak_gb:.2f}G "
+                    f"-> after cleanup alloc={post_alloc_gb:.2f}G) -- "
+                    f"retrying with ffn_chunks={self._ffn_chunks} (was "
+                    f"{original_chunks}). Reason: {first_err}"
+                )
 
                 try:
                     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -573,16 +610,41 @@ class InProcessTrainer:
                     loss.backward()
                     loss_val = loss.item()
                     del loss
-                except _OOM_EXCEPTIONS:
-                    # Still OOM even with more chunks — skip this step
-                    print(f"Step {step}: OOM even with ffn_chunks={self._ffn_chunks} — skipping step")
+                    consecutive_ooms = 0  # recovered
+                except _OOM_EXCEPTIONS as oom_err2:
+                    second_err = str(oom_err2).splitlines()[0] if str(oom_err2) else type(oom_err2).__name__
+                    second_alloc_gb = torch.cuda.memory_allocated() / 1024**3
+                    second_reserved_gb = torch.cuda.memory_reserved() / 1024**3
+                    print(
+                        f"Step {step}: OOM even with ffn_chunks="
+                        f"{self._ffn_chunks} (alloc={second_alloc_gb:.2f}G "
+                        f"reserved={second_reserved_gb:.2f}G) -- skipping "
+                        f"step. Reason: {second_err}"
+                    )
                     loss = None
+                    torch.cuda.synchronize()
                     gc.collect()
                     torch.cuda.empty_cache()
                     self._optimizer.zero_grad(set_to_none=True)
                     oom_skipped = True
+                    consecutive_ooms += 1
                 finally:
                     self._ffn_chunks = original_chunks
+
+                # Heap is fragmented past the point of recovery -- save and
+                # exit cleanly so the user can resume in a fresh process.
+                if consecutive_ooms >= MAX_CONSECUTIVE_OOMS:
+                    print(
+                        f"Step {step}: {consecutive_ooms} consecutive OOMs "
+                        f"-- CUDA heap is fragmented, in-process recovery "
+                        f"is not possible. Saving checkpoint and stopping; "
+                        f"restart ComfyUI and resume training in a fresh "
+                        f"process to continue."
+                    )
+                    self._global_step = step
+                    self._save_checkpoint(step)
+                    interrupted = True
+                    break
 
             del batch  # Release batch tensors
             gc.collect()
@@ -590,6 +652,11 @@ class InProcessTrainer:
 
             if oom_skipped:
                 continue
+
+            # Reached here -> step succeeded (either first try or retry).
+            # Reset the consecutive-OOM counter so a future OOM streak
+            # gets a fresh count toward the bail threshold.
+            consecutive_ooms = 0
 
             # With layer offloading, LoRA grads were moved to CPU by the
             # backward hooks.  Ensure param/grad device agreement for the
@@ -1353,12 +1420,12 @@ class InProcessTrainer:
             return torch.optim.AdamW(params, lr=self._learning_rate)
         elif opt_type == "rose":
             try:
-                from rose import Rose
+                from rose_opt import Rose
                 logger.info(f"Using optimizer: ROSE (stabilize={self._rose_stabilize}, wd={self._rose_weight_decay}, wd_schedule={self._rose_wd_schedule})")
                 return Rose(params, lr=self._learning_rate, stabilize=self._rose_stabilize, weight_decay=self._rose_weight_decay, wd_schedule=self._rose_wd_schedule)
             except ImportError:
                 raise ImportError(
-                    "Rose optimizer not installed. Run: pip install git+https://github.com/MatthewK78/Rose"
+                    "Rose optimizer not installed. Run: pip install rose-opt"
                 )
         else:
             raise ValueError(f"Unknown optimizer_type: {self._optimizer_type!r}")

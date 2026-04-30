@@ -56,6 +56,14 @@ class _OffloadCheckpointFn(torch.autograd.Function):
             out_vx, out_ax = block((vx, ax), **block_kwargs)
 
         block.to("cpu", non_blocking=True)
+        # Sync after the to-CPU move so the GPU-side parameter storage is
+        # actually freed before the next block loads. Without this, the
+        # transfer is still in flight when we return; any Python ref that
+        # grabs the GPU tensor mid-flight (e.g. ComfyUI 0.20.1's dynamic
+        # VRAM scheduler tracking model params) keeps it alive and we
+        # leak ~one block's worth of VRAM per call. Confirmed by OOM
+        # diagnostics showing alloc unchanged after empty_cache.
+        torch.cuda.synchronize(device)
 
         # Always return NEW tensors (detached from block's no_grad graph).
         # The Function mechanism re-attaches grad_fn to these.
