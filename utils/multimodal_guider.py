@@ -123,6 +123,104 @@ class STGBlockWrapper:
 # VRAM-efficient block forward — based on kjnodes LTX2ForwardPatch
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# MasaCtrl-style mutual self-attention for LoRA-free V2V.
+#
+# When iclora_none_mode is on (lora_name='none'), at each sampler step we run
+# the model TWICE per call:
+#   1. Pass A "capture": forward-noised source latent at current sigma. The
+#      attention override stashes K, V from each self-attn layer.
+#   2. Pass B "inject": the actual noisy-latent forward. The attention override
+#      swaps in the cached source K, V (Q stays from current latent).
+# Effect: every noisy token's query "looks up" features from the SOURCE video
+# at corresponding positions -- per-position content-specific routing without
+# LoRA training. Adjacent latent frames see consistent reference structure ->
+# kills the 8-frame VAE-stride popping; motion locks to source per-frame.
+#
+# Self-attention only (q.shape[1] == k.shape[1]); cross-attn to text passes
+# through unchanged. Sage attention is preserved (no manual attention math),
+# so no OOM from materializing scores.
+# ---------------------------------------------------------------------------
+
+class _MasaCtrlState:
+    """Module-level state for the K/V swap. Single-threaded (ComfyUI sampler
+    runs one step at a time per process). Reset before each pair of passes."""
+    def __init__(self):
+        self.mode = "passthrough"  # "capture" | "inject" | "passthrough"
+        self.cache = []  # list of (k, v) per self-attn layer
+        self.layer_idx = 0
+        self.layer_filter = None  # set of layer indices to swap (None = all)
+
+    def reset_capture(self):
+        self.mode = "capture"
+        self.cache = []
+        self.layer_idx = 0
+
+    def reset_inject(self):
+        self.mode = "inject"
+        self.layer_idx = 0
+
+    def reset_passthrough(self):
+        self.mode = "passthrough"
+        self.cache = []
+        self.layer_idx = 0
+
+
+_masactrl_state = _MasaCtrlState()
+
+
+def _masactrl_attn_override(orig_attn_fn, q, k, v, heads, mask=None,
+                              attn_precision=None, skip_reshape=False,
+                              skip_output_reshape=False, **kwargs):
+    """Routing override: capture mode stashes K/V; inject mode swaps in
+    cached K/V; passthrough is identity. Cross-attention skipped."""
+    # Cross-attention: q.shape[1] != k.shape[1] (text context length).
+    if q.shape[1] != k.shape[1]:
+        return orig_attn_fn(
+            q, k, v, heads, mask=mask, attn_precision=attn_precision,
+            skip_reshape=skip_reshape,
+            skip_output_reshape=skip_output_reshape, **kwargs,
+        )
+
+    state = _masactrl_state
+    if state.mode == "capture":
+        state.cache.append((k, v))
+        state.layer_idx += 1
+        return orig_attn_fn(
+            q, k, v, heads, mask=mask, attn_precision=attn_precision,
+            skip_reshape=skip_reshape,
+            skip_output_reshape=skip_output_reshape, **kwargs,
+        )
+    elif state.mode == "inject":
+        idx = state.layer_idx
+        state.layer_idx += 1
+        if idx < len(state.cache):
+            # Optional layer filter: only swap on listed layers
+            if state.layer_filter is None or idx in state.layer_filter:
+                cached_k, cached_v = state.cache[idx]
+                # Sanity: shapes must match for a valid swap
+                if cached_k.shape == k.shape and cached_v.shape == v.shape:
+                    return orig_attn_fn(
+                        q, cached_k, cached_v, heads, mask=mask,
+                        attn_precision=attn_precision,
+                        skip_reshape=skip_reshape,
+                        skip_output_reshape=skip_output_reshape, **kwargs,
+                    )
+        # Fallback: passthrough on shape mismatch or unfiltered layer
+        return orig_attn_fn(
+            q, k, v, heads, mask=mask, attn_precision=attn_precision,
+            skip_reshape=skip_reshape,
+            skip_output_reshape=skip_output_reshape, **kwargs,
+        )
+    else:
+        # passthrough
+        return orig_attn_fn(
+            q, k, v, heads, mask=mask, attn_precision=attn_precision,
+            skip_reshape=skip_reshape,
+            skip_output_reshape=skip_output_reshape, **kwargs,
+        )
+
+
 def _ltx2_forward(
     self,
     x: Tuple[torch.Tensor, torch.Tensor],
@@ -790,6 +888,7 @@ class ICLoRAGuider(MultimodalGuider):
         guide_frame_idx,
         max_shift,
         base_shift,
+        iclora_none_mode=False,
         **kwargs,
     ):
         super().__init__(model, positive, negative, **kwargs)
@@ -800,6 +899,14 @@ class ICLoRAGuider(MultimodalGuider):
         self._guide_frame_idx = guide_frame_idx
         self._max_shift = max_shift
         self._base_shift = base_shift
+        # When True (lora_name='none'): install MasaCtrl-style mutual self-
+        # attention. At each sampler step, run TWO model forward passes:
+        # capture-pass on noised source (caches K, V per self-attn layer)
+        # then inject-pass on actual noisy latent (Q from current latent
+        # but K, V swapped with cached source K, V). Approximates IC-LoRA's
+        # learned attention routing without LoRA weights. Doubles per-step
+        # cost but keeps sage attention (no manual scores).
+        self._iclora_none_mode = iclora_none_mode
         # Set after encoding in sample()
         self._num_guide_frames = 0
         # Save original conds so we can reset before each encode pass
@@ -960,6 +1067,88 @@ class ICLoRAGuider(MultimodalGuider):
         logger.info(f"Guide keyframe at frame_idx={frame_idx_actual}, "
                     f"strength={self._guide_strength}, dsf={dsf}, "
                     f"causal_fix={causal_fix}")
+
+        # MasaCtrl-style mutual self-attention for LoRA-free V2V.
+        # Build source-shape latent: source video encoded at full res +
+        # the same guide_latent appended (so total shape matches video_out).
+        # Install attention override + model_function_wrapper that does
+        # capture-then-inject every model call. Each noisy token's query
+        # looks up K, V from the source video's structure at the same
+        # position -> per-position routing, content-specific, no LoRA needed.
+        if self._iclora_none_mode:
+            # Encode source at full latent resolution (bypass IC-LoRA half-res)
+            src_imgs = self._control_pixels[:num_frames_to_keep]
+            if not causal_fix:
+                src_imgs = torch.cat([src_imgs[:1], src_imgs], dim=0)
+            _, source_full = LTXVAddGuide.encode(
+                self._vae, latent_w, latent_h, src_imgs, scale_factors
+            )
+            if not causal_fix:
+                source_full = source_full[:, :, 1:, :, :]
+
+            # Concat source_video + clean guide_latent so shape == video_out.
+            # video_out = torch.cat([video_init, dilated_guide], dim=2)
+            # source_for_capture = torch.cat([source_full, dilated_guide], dim=2)
+            # Both have the same dilated guide tail; the head differs (noise vs source).
+            source_for_capture = torch.cat([source_full, guide_latent], dim=2)
+            # Match dtype/device of the working latent
+            source_for_capture = source_for_capture.to(
+                device=video_out.device, dtype=video_out.dtype,
+            )
+            logger.info(
+                f"MasaCtrl source_for_capture shape: {list(source_for_capture.shape)} "
+                f"(matches video_out: {list(video_out.shape)})"
+            )
+
+            # Install the attention override (capture/inject routing).
+            # This REPLACES the existing override (sage attention), since
+            # the override needs to know about MasaCtrl mode. The override
+            # falls through to the original sage attention internally.
+            mo = self.model_patcher.model_options
+            mo.setdefault("transformer_options", {})["optimized_attention_override"] = _masactrl_attn_override
+
+            # Install the model_function_wrapper that does the two-pass dance.
+            # Captured in a closure with source_for_capture.
+            def _masactrl_wrapper(apply_model_fn, args):
+                input_x = args["input"]
+                timestep = args["timestep"]
+                c = args["c"]
+
+                state = _masactrl_state
+                # Match source batch size to input
+                src = source_for_capture
+                if src.shape[0] != input_x.shape[0]:
+                    src = src.expand(input_x.shape[0], -1, -1, -1, -1).contiguous()
+
+                # Forward-noise source to current sigma. LTX flow matching:
+                # x_t = (1 - sigma) * x_0 + sigma * noise.
+                # timestep here IS sigma in [0, 1] for LTX.
+                if timestep.ndim == 0:
+                    t_val = timestep.view(1, 1, 1, 1, 1)
+                else:
+                    t_val = timestep.view(-1, 1, 1, 1, 1)
+                noise_t = torch.randn_like(src)
+                noised_source = (1.0 - t_val) * src + t_val * noise_t
+
+                try:
+                    # Pass A: capture K, V from noised-source forward
+                    state.reset_capture()
+                    _ = apply_model_fn(noised_source, timestep, **c)
+
+                    # Pass B: inject K, V into actual noisy forward
+                    state.reset_inject()
+                    output = apply_model_fn(input_x, timestep, **c)
+
+                    return output
+                finally:
+                    state.reset_passthrough()
+
+            mo["model_function_wrapper"] = _masactrl_wrapper
+            logger.info(
+                "MasaCtrl mutual self-attention installed: every step runs "
+                "capture-pass on noised source + inject-pass on noisy latent. "
+                "Per-step cost ~2x baseline."
+            )
 
         self.inner_set_conds({"positive": positive, "negative": negative})
         # --- Reassemble NestedTensor if AV ---

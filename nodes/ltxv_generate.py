@@ -2035,6 +2035,7 @@ class RSLTXVGenerate:
             guide_frame_idx=ci.get("guide_frame_idx", 0),
             max_shift=ci.get("max_shift", 2.2),
             base_shift=ci.get("base_shift", 0.95),
+            iclora_none_mode=(ic_name in ("", "none")),
             video_cfg=upscale_cfg,
             audio_cfg=ci.get("audio_cfg", 7.0),
             stg_scale=ci.get("stg_scale", 0.0),

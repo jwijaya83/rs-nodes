@@ -369,6 +369,7 @@ class RSLTXVICLoRAGuider:
             guide_frame_idx=guide_frame_idx,
             max_shift=max_shift,
             base_shift=base_shift,
+            iclora_none_mode=no_iclora_weights,
             video_cfg=cfg,
             audio_cfg=audio_cfg,
             stg_scale=stg_scale,
