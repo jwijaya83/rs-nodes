@@ -29,6 +29,29 @@ from ..utils.ltxv_train_env import (
 
 logger = logging.getLogger(__name__)
 
+# Self-heal / quota-recovery tuning knobs (see Reference/dataset-self-heal-spec.md).
+#
+# COND_TOKEN_LIMIT — token-length ceiling for a sample's text-conditioning.
+# The encoder pads to multiples of this; anything that comes out larger means
+# the captioner ran away. A single sample with 16x the tokens of the rest
+# blows up attention memory ~256x at training time and triggers C-level
+# aborts when shuffled in. Match this to the encoder's pad multiple.
+#
+# MAX_CAPTION_CHARS — fast pre-filter before the encoder sees a caption.
+# 600 chars ≈ 128 tokens after BPE; tuned to comfortably fit COND_TOKEN_LIMIT.
+#
+# MAX_CAPTION_RETRIES — re-rolls per clip before giving up and rejecting it.
+# Gemma-class models are probabilistic, so wiping context and re-rolling
+# usually produces a completely different caption.
+#
+# MAX_OUTER_PASSES — outer mine→caption cycles before giving up on quota.
+# Each pass beyond the first pays the VRAM-cycle cost of swapping Ollama
+# in/out, so we keep this small.
+COND_TOKEN_LIMIT = 128
+MAX_CAPTION_CHARS = 600
+MAX_CAPTION_RETRIES = 3
+MAX_OUTER_PASSES = 3
+
 # PromptServer is used to push live status updates to the node's on-canvas
 # widget while the dataset builds. Guard the import so the node still loads
 # if the API moves around.
@@ -963,6 +986,278 @@ class RSLTXVPrepareDataset:
             out.append(e2)
         return out
 
+    @staticmethod
+    def _condition_path_for_clip(output_dir: Path, media_path: Path) -> Path:
+        """Derive the condition (.pt) file path for a given clip media_path.
+
+        Mirrors the encoder's path-derivation logic so callers (audit,
+        encoder, reject) all look at the same file. When the clip lives
+        under output_dir, the path is `<output_dir>/conditions/<rel>.pt`
+        preserving the relative subdirectory layout (e.g.
+        `conditions/clips/foo.pt`). When it lives outside output_dir,
+        falls back to a flat `<output_dir>/conditions/<stem>.pt`.
+
+        Robust to relative media_paths: if media_path isn't absolute, it's
+        treated as relative to output_dir before computing the rel path.
+        Without this, callers that loaded dataset.json without normalizing
+        paths would compute the WRONG output location (flat root, not
+        clips/ subdir) and the encoder would write garbage to the root
+        conditions folder instead of finding/refreshing the correct file.
+        """
+        conditions_dir = output_dir / "conditions"
+        if not media_path.is_absolute():
+            media_path = (output_dir / media_path)
+        try:
+            rel = media_path.relative_to(output_dir).with_suffix(".pt")
+        except ValueError:
+            rel = Path(media_path.stem + ".pt")
+        return conditions_dir / rel
+
+    @staticmethod
+    def _purge_clip_artifacts(output_dir: Path, vf: Path) -> None:
+        """Delete a clip and all of its precomputed sibling files.
+
+        Removes the clip itself plus its latent / condition / audio_latent
+        .pt files under output_dir. Used when a clip is fully rejected
+        (e.g., persistent caption-overrun) and must not be re-introduced.
+
+        Idempotent: missing files are silently skipped, deletion failures
+        are logged but don't abort.
+        """
+        for subdir in ("latents", "conditions", "audio_latents"):
+            f = output_dir / subdir / "clips" / f"{vf.stem}.pt"
+            if f.exists():
+                try:
+                    f.unlink()
+                except OSError as e:
+                    logger.warning(f"    Could not delete {f}: {e}")
+        if vf.exists():
+            try:
+                vf.unlink()
+            except OSError as e:
+                logger.warning(f"    Could not delete clip {vf}: {e}")
+
+    @staticmethod
+    def _append_rejected(rejected_path: Path, record: dict) -> None:
+        """Append a rejection record to <output>/rejected.json.
+
+        Loads the existing list (tolerant of malformed file), appends, and
+        writes back. The same load-append-write dance is duplicated in
+        many older sites in this file; new code should use this helper.
+        """
+        rejected: list = []
+        if rejected_path.exists():
+            try:
+                with open(rejected_path) as rf:
+                    rejected = json.load(rf)
+            except (json.JSONDecodeError, KeyError, OSError):
+                rejected = []
+        rejected.append(record)
+        with open(rejected_path, "w") as rf:
+            json.dump(rejected, rf, indent=2)
+
+    def _reject_entry(
+        self,
+        i: int,
+        entries: list,
+        dataset_json_path: Path,
+        reason: str,
+        purge_artifacts: bool = False,
+    ) -> dict:
+        """Reject the entry at index `i`: pop it, log to rejected.json,
+        write dataset.json, and optionally purge on-disk artifacts.
+
+        Returns the popped entry dict so callers can inspect / log fields.
+
+        Args:
+            i: Index of the entry to remove from `entries`.
+            entries: The dataset entries list (mutated in place).
+            dataset_json_path: Path to dataset.json — also used to derive
+                rejected.json and output_dir.
+            reason: Short string written to rejected.json (e.g.,
+                "llm_mismatch", "caption_too_long").
+            purge_artifacts: If True, delete the clip + latents + condition
+                + audio_latent files for this entry. Use for persistent
+                content failures where the clip should not be reused.
+        """
+        rejected_entry = entries.pop(i)
+        output_dir = dataset_json_path.parent
+        rejected_path = output_dir / "rejected.json"
+        vf = Path(rejected_entry.get("media_path", ""))
+        self._append_rejected(rejected_path, {
+            "media_path": str(vf),
+            "source_file": rejected_entry.get("source_file", ""),
+            "reason": reason,
+        })
+        if purge_artifacts and vf.name:
+            self._purge_clip_artifacts(output_dir, vf)
+        with open(dataset_json_path, "w") as f:
+            json.dump(entries, f, indent=2)
+        return rejected_entry
+
+    def _audit_and_repair_dataset(
+        self,
+        output_dir: Path,
+        dataset_json_path: Path,
+        cond_token_limit: int = COND_TOKEN_LIMIT,
+    ) -> tuple[int, int, int]:
+        """Reconcile dataset.json with what's actually on disk.
+
+        Runs once at the top of prepare() to handle state corruption that
+        accumulated outside this node's control:
+          - Entries whose media_path is missing on disk (true orphans).
+          - Clips on disk with no JSON entry (lost-JSON case).
+          - Entries whose saved condition file has prompt_attention_mask
+            length > cond_token_limit (runaway captions). Blanks the caption
+            and deletes the bad condition file so the captioner re-rolls and
+            the encoder re-encodes on the next pass.
+
+        Hard rules:
+          - Always backs up dataset.json before any write that mutates the
+            entry list (timestamped .bak.YYYYMMDD_HHMMSS, matching existing
+            convention).
+          - Drops entries only when media_path is missing on disk (genuine
+            orphan). Never deletes an entry to "fix" a different problem.
+
+        Returns (orphans_dropped, stubs_added, captions_blanked). Caller
+        should treat any nonzero count as "audit changed things, do not
+        early-exit".
+        """
+        if not dataset_json_path.exists():
+            return (0, 0, 0)
+
+        clips_dir = output_dir / "clips"
+        conditions_dir = output_dir / "conditions"
+
+        try:
+            with open(dataset_json_path) as f:
+                entries = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Audit: dataset.json unreadable ({e}); skipping audit")
+            return (0, 0, 0)
+
+        if not isinstance(entries, list):
+            logger.warning("Audit: dataset.json is not a list; skipping audit")
+            return (0, 0, 0)
+
+        self._normalize_loaded_entries(entries, output_dir)
+
+        orphans: list[str] = []   # entries dropped because media_path missing
+        blanked: list[str] = []   # entries whose caption was blanked
+        stubs_added = 0
+
+        # Pass 1: drop true orphans (media_path no longer exists)
+        surviving = []
+        for entry in entries:
+            mp = entry.get("media_path", "")
+            if not mp:
+                # Entry with no media_path is meaningless; treat as orphan
+                orphans.append("(no media_path)")
+                continue
+            if not Path(mp).exists():
+                orphans.append(Path(mp).name)
+                continue
+            surviving.append(entry)
+        entries = surviving
+
+        # Pass 2: stub-add clips on disk with no JSON entry
+        if clips_dir.exists():
+            known = {Path(e["media_path"]).resolve() for e in entries if e.get("media_path")}
+            valid_suffixes = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
+            for clip_path in sorted(clips_dir.iterdir()):
+                if not clip_path.is_file():
+                    continue
+                if clip_path.suffix.lower() not in valid_suffixes:
+                    continue
+                if clip_path.resolve() in known:
+                    continue
+                entries.append({
+                    "media_path": str(clip_path),
+                    "source_file": "",
+                    "characters": [],
+                })
+                stubs_added += 1
+
+        # Pass 3: detect bad conditions (token length over limit) and blank
+        # the corresponding caption + delete the bad condition file. The
+        # captioner and encoder are both idempotent: blank caption triggers
+        # a re-roll on the next pass, missing condition triggers re-encode.
+        if conditions_dir.exists():
+            for entry in entries:
+                if not entry.get("caption"):
+                    continue
+                mp = Path(entry["media_path"])
+                cond_file = self._condition_path_for_clip(output_dir, mp)
+                if not cond_file.exists():
+                    continue
+                try:
+                    blob = torch.load(cond_file, map_location="cpu", weights_only=False)
+                except Exception as e:
+                    logger.warning(
+                        f"Audit: could not load {cond_file.name} ({e}); skipping length check"
+                    )
+                    continue
+                mask = blob.get("prompt_attention_mask") if isinstance(blob, dict) else None
+                if not torch.is_tensor(mask) or mask.dim() < 1:
+                    continue
+                seq_len = int(mask.shape[0])
+                if seq_len <= cond_token_limit:
+                    continue
+                # Runaway caption — blank it, delete the bad condition.
+                entry["caption"] = ""
+                try:
+                    cond_file.unlink()
+                except OSError as e:
+                    logger.warning(
+                        f"Audit: could not delete bad condition file {cond_file.name}: {e}"
+                    )
+                blanked.append(f"{mp.name} ({seq_len} tokens)")
+
+        if not orphans and not blanked and stubs_added == 0:
+            return (0, 0, 0)
+
+        # Backup before write. Aborts the audit's writes (but not its
+        # in-memory file deletions, which already happened) if the backup
+        # fails — better to have a stale dataset.json than a corrupted one.
+        timestamp = _t.strftime("%Y%m%d_%H%M%S")
+        backup_path = dataset_json_path.with_name(f"dataset.json.bak.{timestamp}")
+        try:
+            shutil.copy2(dataset_json_path, backup_path)
+            logger.info(f"Audit: backed up dataset.json to {backup_path.name}")
+        except OSError as e:
+            logger.error(
+                f"Audit: failed to back up dataset.json ({e}); "
+                "skipping audit writes (in-memory entry list will be discarded)"
+            )
+            return (0, 0, 0)
+
+        with open(dataset_json_path, "w") as f:
+            json.dump(self._entries_for_write(entries, output_dir), f, indent=2)
+
+        if orphans:
+            logger.info(
+                f"Audit: dropped {len(orphans)} orphan entries (media_path missing on disk)"
+            )
+            for name in orphans[:10]:
+                logger.info(f"  - {name}")
+            if len(orphans) > 10:
+                logger.info(f"  ...and {len(orphans) - 10} more")
+        if stubs_added:
+            logger.info(
+                f"Audit: added {stubs_added} stub entries for clips on disk with no JSON entry"
+            )
+        if blanked:
+            logger.info(
+                f"Audit: blanked {len(blanked)} captions whose condition exceeded "
+                f"{cond_token_limit} tokens (will be re-captioned + re-encoded)"
+            )
+            for name in blanked[:10]:
+                logger.info(f"  - {name}")
+            if len(blanked) > 10:
+                logger.info(f"  ...and {len(blanked) - 10} more")
+
+        return (len(orphans), stubs_added, len(blanked))
+
     def prepare(
         self,
         media_folder: str,
@@ -1114,52 +1409,146 @@ class RSLTXVPrepareDataset:
         global _FACE_PADDING
         _FACE_PADDING = face_padding
 
+        # Audit pass: reconcile dataset.json against on-disk state. Drops
+        # orphan entries, stubs missing entries, blanks captions whose
+        # condition file is over the token limit (those are the runaway
+        # captions that crash training when shuffled in). Runs BEFORE the
+        # early-exit check so any repairs surfaced here force the rest of
+        # the pipeline to do the corresponding refill work.
+        audit_dropped, audit_stubbed, audit_blanked = self._audit_and_repair_dataset(
+            output_dir, dataset_json_path,
+        )
+        # Only stubs and blanks require pipeline follow-up (re-caption,
+        # re-encode). Orphan drops are pure metadata cleanup — the missing
+        # files are already gone, so there's nothing left to refill, and
+        # forcing the full pipeline to run would needlessly re-trigger
+        # entry-driven phases (transcript backfill etc.) that aren't
+        # idempotent against fields-vs-artifacts mismatches.
+        audit_needs_followup = (audit_stubbed + audit_blanked) > 0
+
         # ----------------------------------------------------------------
-        # Early-exit: if all preprocessing artifacts are already on disk
-        # AND media_folder has no NEW source videos to ingest, treat as
-        # complete and return immediately. dataset.json is only the
-        # manifest used to BUILD these artifacts; once they exist, it's
-        # not consulted again. This skips the cleanup / captioning / write
-        # paths entirely so a wiped or stale dataset.json can never cause
-        # damage on resume.
+        # Artifact-stem reconciliation. The encoded files (latents,
+        # conditions, audio_latents) are the source of truth for "is the
+        # dataset complete?" — NOT dataset.json. dataset.json can be
+        # corrupted, partially restored from backup, or missing fields,
+        # and none of that affects training as long as the encoded files
+        # exist for every clip on disk.
+        #
+        # Build the stem set from each kind by looking at <kind>/clips/,
+        # which is the actual layout the encoders write to. The previous
+        # check used <kind>.iterdir() which only sees the clips/ subdir
+        # itself (a directory) and filtered it out — meaning early-exit
+        # NEVER fired in the standard layout. Bug, fixed.
+        #
+        # Decision tree:
+        #   clip_stems == all encoded stems AND no new source media
+        #     -> early exit, do nothing
+        #   clip_stems != encoded stems
+        #     -> targeted repair: skip mining, skip the captioning loop
+        #        for stems that already have a condition (artifact-trumps-
+        #        JSON guards), encoders fill in only what's missing
+        #   new source media exists
+        #     -> mining runs to ingest the new sources
         # ----------------------------------------------------------------
-        if clips_dir.exists() and latents_dir.exists():
-            clip_files = [p for p in clips_dir.iterdir() if p.is_file()]
-            latent_files = [p for p in latents_dir.iterdir() if p.is_file()]
-            artifacts_ok = bool(clip_files) and bool(latent_files)
-            if artifacts_ok and with_audio:
-                artifacts_ok = (
-                    audio_latents_dir.exists()
-                    and any(p.is_file() for p in audio_latents_dir.iterdir())
-                )
-            if artifacts_ok and conditioning_folder:
-                artifacts_ok = (
-                    conditions_dir.exists()
-                    and any(p.is_file() for p in conditions_dir.iterdir())
-                )
-            if artifacts_ok:
-                # Derive processed source stems from clip filenames
-                # (clips look like "video_chunk0001.mp4" etc.)
-                processed_stems = set()
-                for cp in clip_files:
-                    stem = cp.stem
-                    if "_chunk" in stem:
-                        processed_stems.add(stem.rsplit("_chunk", 1)[0])
-                    else:
-                        processed_stems.add(stem)
-                # Are all source videos in media_folder represented?
-                no_new_media = True
-                for item in self._scan_media(media_folder):
-                    if Path(item["path"]).stem not in processed_stems:
-                        no_new_media = False
-                        break
-                if no_new_media:
-                    logger.info(
-                        f"Preprocessing already complete ({len(clip_files)} clips, "
-                        f"{len(latent_files)} latents) -- skipping prepare, "
-                        f"dataset.json not touched"
-                    )
-                    return (str(output_dir), str(dataset_json_path))
+        def _stems_with_pt(kind_dir: Path) -> set[str]:
+            """Stems of .pt files under kind_dir/clips/ (the encoder layout)."""
+            sub = kind_dir / "clips"
+            if not sub.exists():
+                return set()
+            return {p.stem for p in sub.iterdir() if p.is_file() and p.suffix == ".pt"}
+
+        clip_video_suffixes = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
+        clip_stems: set[str] = set()
+        if clips_dir.exists():
+            clip_stems = {
+                p.stem for p in clips_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in clip_video_suffixes
+            }
+        latent_stems = _stems_with_pt(latents_dir)
+        condition_stems = _stems_with_pt(conditions_dir)
+        audio_latent_stems = _stems_with_pt(audio_latents_dir) if with_audio else clip_stems
+
+        missing_latents = clip_stems - latent_stems
+        missing_conditions = clip_stems - condition_stems
+        missing_audio_latents = (clip_stems - audio_latent_stems) if with_audio else set()
+
+        # Source media check — for deciding whether to skip mining.
+        processed_sources = {
+            (s.rsplit("_chunk", 1)[0] if "_chunk" in s else s)
+            for s in clip_stems
+        }
+        new_source_media = []
+        if media_folder.exists():
+            for item in self._scan_media(media_folder):
+                if Path(item["path"]).stem not in processed_sources:
+                    new_source_media.append(item)
+
+        # State summary for the log so the user sees exactly what we decided.
+        artifacts_complete = (
+            bool(clip_stems)
+            and not missing_latents
+            and not missing_conditions
+            and not missing_audio_latents
+        )
+
+        # "Established dataset" — clips exist on disk AND at least some
+        # encoded files exist. This is the recovery / fix-only state. In
+        # this state dataset.json is NOT a source of truth (it can be
+        # wiped, partial, restored from backup, missing fields). Only the
+        # encoded artifacts are. The only legitimate work in this state is
+        # filling in missing encodes for clips that are already on disk.
+        # New source media in media_folder is explicitly ignored — the
+        # user must start a fresh dataset to ingest those, not mix mining
+        # into a recovery run.
+        dataset_is_established = bool(clip_stems) and bool(
+            latent_stems or condition_stems or audio_latent_stems
+        )
+
+        if (
+            not audit_needs_followup
+            and artifacts_complete
+            and dataset_is_established
+        ):
+            logger.info(
+                f"prepare: dataset complete — {len(clip_stems)} clips, all "
+                f"latents/conditions{'/audio_latents' if with_audio else ''} "
+                f"present. Skipping all phases. "
+                f"(dataset.json not consulted; encoded artifacts are the "
+                f"source of truth.)"
+            )
+            return (str(output_dir), str(dataset_json_path))
+
+        # If we get here, there is real work to do. Surface what's actually
+        # missing so the rest of the run is interpretable, and so the user
+        # sees that we're NOT redoing the entire dataset.
+        if clip_stems:
+            n_miss = len(missing_latents | missing_conditions | missing_audio_latents)
+            mode_str = (
+                "ESTABLISHED DATASET (recovery mode — JSON ignored, fixing missing encodes only)"
+                if dataset_is_established
+                else f"FRESH DATASET (will mine {len(new_source_media)} new source video(s))"
+            )
+            logger.info(
+                f"Reconciliation: {len(clip_stems)} clips on disk, "
+                f"{len(missing_latents)} missing latents, "
+                f"{len(missing_conditions)} missing conditions, "
+                f"{len(missing_audio_latents)} missing audio_latents. "
+                f"Mode: {mode_str}. "
+                f"Will encode {n_miss} clip(s)."
+            )
+        elif new_source_media:
+            logger.info(
+                f"Reconciliation: no clips yet, {len(new_source_media)} "
+                f"new source video(s) to mine."
+            )
+
+        # Skip mining entirely when the dataset is established. Mining
+        # exists to add NEW clips from NEW source videos; in recovery mode
+        # we only fix existing clips' missing encodes. If the user wants
+        # to ingest new source media on top of an established dataset,
+        # they need to start a fresh dataset (different output_name) or
+        # explicitly wipe encoded artifacts first.
+        skip_mining = dataset_is_established
 
         # Scan current media folder
         media_files = self._scan_media(media_folder)
@@ -1481,9 +1870,20 @@ class RSLTXVPrepareDataset:
         # on disk), we want zero model loads, not one model load + 168 no-op
         # iterations.  Use key existence (not truthiness) so silent clips with
         # an empty transcript don't get re-attempted on every run.
+        #
+        # Artifact-trumps-JSON guard: if the condition file already exists
+        # for this clip, the transcript was already merged into the caption
+        # at the time the condition was encoded — re-transcribing would be
+        # cosmetic only (the transcript gets written back into dataset.json
+        # but does not change training data). Skip those entries so a wiped
+        # JSON doesn't trigger re-transcription of an already-complete dataset.
         backfill_targets = (
             [e for e in existing_entries
-             if "transcript" not in e and Path(e["media_path"]).exists()]
+             if "transcript" not in e
+             and Path(e["media_path"]).exists()
+             and not self._condition_path_for_clip(
+                 output_dir, Path(e["media_path"])
+             ).exists()]
             if transcribe_speech else []
         )
         if transcribe_speech and not backfill_targets:
@@ -1546,13 +1946,31 @@ class RSLTXVPrepareDataset:
                 if hallucination_purge:
                     logger.info(f"Purged {len(hallucination_purge)} clips with no usable speech")
 
-        # --- Rolling dataset budget check ---
-        # When max_samples is set, skip clip extraction entirely if we're full.
-        if max_samples > 0 and len(existing_entries) >= max_samples:
-            logger.info(
-                f"Dataset at capacity ({len(existing_entries)}/{max_samples}), "
-                "skipping clip extraction"
-            )
+        # --- Mining gate ---
+        # Skip the entire mining phase when:
+        #   - the rolling dataset is already at capacity, OR
+        #   - reconciliation showed there's no new source media to ingest
+        #     (skip_mining is set above based on artifact-stem comparison)
+        # The second case is critical when dataset.json is partially
+        # corrupted: its per-character quota counts may be wrong (chars
+        # field missing on entries) and would falsely re-trigger mining
+        # for a dataset whose ENCODED artifacts are already complete or
+        # nearly complete. Encoded artifacts are the source of truth;
+        # don't mine to satisfy a JSON-derived quota when the artifacts
+        # already exist.
+        if (max_samples > 0 and len(existing_entries) >= max_samples) or skip_mining:
+            if skip_mining:
+                logger.info(
+                    "Skipping mining: no new source media. Will only fix "
+                    "missing encodes on existing clips (if any). "
+                    f"({len(missing_latents | missing_conditions | missing_audio_latents)} "
+                    f"clip(s) need encoding work.)"
+                )
+            else:
+                logger.info(
+                    f"Dataset at capacity ({len(existing_entries)}/{max_samples}), "
+                    "skipping clip extraction"
+                )
             # Jump straight to captioning / encoding below.
         else:
             # Determine whether we're in rolling-dataset mode (max_samples set)
@@ -2329,6 +2747,37 @@ class RSLTXVPrepareDataset:
             skip_id_pass=skip_id_pass,
         )
 
+        # Post-captioning quota check. If clips got rejected (MISMATCH face
+        # QC, or length-overshoot caption rejection) and the chunk pool
+        # still has unused candidates, the dataset is now under quota.
+        # Automatic re-mining is non-trivial because mining state is
+        # interleaved with character-mode setup throughout prepare(); for
+        # now we surface a clear warning so the user knows to re-run
+        # prepare_dataset, which will resume from the persisted chunk_pool
+        # and fill the gap. See Reference/dataset-self-heal-spec.md for
+        # the deferred auto-remine plan.
+        try:
+            with open(dataset_json_path) as _qf:
+                _post_cap_entries = json.load(_qf)
+        except (OSError, json.JSONDecodeError):
+            _post_cap_entries = []
+        _pool_remaining = pool_state.get("remaining", 0)
+        if max_samples > 0 and len(_post_cap_entries) < max_samples:
+            shortfall = max_samples - len(_post_cap_entries)
+            if _pool_remaining > 0:
+                logger.warning(
+                    f"Post-caption quota check: {len(_post_cap_entries)}/{max_samples} "
+                    f"samples (short by {shortfall}). chunk_pool has "
+                    f"{_pool_remaining} clips remaining — re-run prepare_dataset "
+                    f"to mine replacements for the rejected clips."
+                )
+            else:
+                logger.warning(
+                    f"Post-caption quota check: {len(_post_cap_entries)}/{max_samples} "
+                    f"samples (short by {shortfall}). chunk_pool is empty — "
+                    f"add more source media to fill the remaining slots."
+                )
+
         # --- PHASE 3: Encode conditions and latents ---
         # Reload entries from JSON — captioning may have rejected some clips,
         # and existing_entries in memory still has the pre-rejection list.
@@ -2544,16 +2993,20 @@ class RSLTXVPrepareDataset:
             entries = json.load(f)
 
         data_root = dataset_json_path.parent
+        # Normalize relative media_paths to absolute so downstream path
+        # logic is consistent — without this, _condition_path_for_clip
+        # used to fall back to a flat <stem>.pt root path and the encoder
+        # would write to conditions/foo.pt instead of conditions/clips/foo.pt,
+        # corrupting the dataset layout. _condition_path_for_clip is now
+        # robust to relative paths too, but normalizing here means the
+        # encoder works correctly even if that helper changes.
+        self._normalize_loaded_entries(entries, data_root)
         to_encode = []
         for entry in entries:
             media_path = Path(entry["media_path"])
-            # Preserve relative directory structure (e.g. clips/filename.pt)
-            # to match how latents are stored — PrecomputedDataset requires matching paths
-            try:
-                rel_path = media_path.relative_to(data_root).with_suffix(".pt")
-            except ValueError:
-                rel_path = Path(media_path.stem + ".pt")
-            output_file = conditions_dir / rel_path
+            # Reuse the shared path helper so audit / encoder always look
+            # at exactly the same condition file for a given clip.
+            output_file = self._condition_path_for_clip(data_root, media_path)
             if not output_file.exists():
                 to_encode.append((entry, output_file))
 
@@ -4239,13 +4692,44 @@ class RSLTXVPrepareDataset:
         with open(dataset_json_path) as f:
             entries = json.load(f)
 
+        # Resolve any relative media_path to absolute against output_dir.
+        # Without this, the artifact-trumps-JSON guard below computes the
+        # wrong condition file path (relative_to() throws on relative
+        # paths and the fallback flattens the clips/ subdir away), causing
+        # the guard to miss every entry and re-caption an entire dataset.
+        self._normalize_loaded_entries(entries, dataset_json_path.parent)
+
         # Check if all entries already have captions (and none are marked mismatch)
         uncaptioned = [i for i, e in enumerate(entries) if not e.get("caption")]
         if not uncaptioned:
             logger.info("All clips already captioned, skipping")
             return
 
-        logger.info(f"{len(uncaptioned)} clips need captioning, {len(entries) - len(uncaptioned)} already done")
+        # Of the uncaptioned entries, how many already have a condition file
+        # on disk? Those are the ones the artifact-trumps-JSON guard will
+        # skip — no captioning, no encoding. Surface the real number up
+        # front so the user sees we're not redoing the entire dataset.
+        output_dir_for_count = dataset_json_path.parent
+        actual_work = sum(
+            1 for i in uncaptioned
+            if not self._condition_path_for_clip(
+                output_dir_for_count, Path(entries[i]["media_path"])
+            ).exists()
+        )
+        skipped_due_to_existing_cond = len(uncaptioned) - actual_work
+        if skipped_due_to_existing_cond:
+            logger.info(
+                f"Captioning: {actual_work} clip(s) need work "
+                f"(JSON says {len(uncaptioned)} lack captions, but "
+                f"{skipped_due_to_existing_cond} already have an encoded "
+                f"condition file on disk — JSON ignored for those, "
+                f"encoded artifact wins)"
+            )
+        else:
+            logger.info(
+                f"{len(uncaptioned)} clips need captioning, "
+                f"{len(entries) - len(uncaptioned)} already done"
+            )
 
         # Make sure the requested Ollama model is installed before we
         # start the loop.  If it's not, pull it (streaming progress to
@@ -4260,6 +4744,13 @@ class RSLTXVPrepareDataset:
         caption_first_time: float = 0.0  # gen time of first caption in session
         caption_gen_times: list[float] = []  # all gen times in session for averaging
 
+        # The encoded condition file is the source of truth. If it exists
+        # on disk, this entry has already been captioned + encoded —
+        # regardless of whether dataset.json still has the caption text
+        # (e.g., a wiped or partial JSON). Skipping here avoids re-doing
+        # work the artifacts already prove was done.
+        output_dir_for_skip = dataset_json_path.parent
+
         i = 0
         while i < len(entries):
             entry = entries[i]
@@ -4268,6 +4759,18 @@ class RSLTXVPrepareDataset:
                 continue
 
             vf = Path(entry["media_path"])
+
+            # Artifact-trumps-JSON guard. If the condition file is already
+            # there, this clip is encoded; the missing caption in JSON is
+            # cosmetic and should not trigger captioning + re-encode.
+            existing_cond = self._condition_path_for_clip(output_dir_for_skip, vf)
+            if existing_cond.exists():
+                logger.info(
+                    f"[{i+1}/{len(entries)}] Skip {vf.name}: condition exists "
+                    f"on disk (caption missing in JSON is cosmetic only)"
+                )
+                i += 1
+                continue
 
             if caption_mode == "ollama":
                 logger.info(f"[{i+1}/{len(entries)}] Captioning: {vf.name}")
@@ -4286,25 +4789,8 @@ class RSLTXVPrepareDataset:
                 if prep is None:
                     # MISMATCH — reject this entry
                     logger.info(f"  LLM QC: MISMATCH — removing {vf.name}")
-                    rejected_entry = entries.pop(i)
+                    self._reject_entry(i, entries, dataset_json_path, "llm_mismatch")
                     removed_count += 1
-                    rejected_path = dataset_json_path.parent / "rejected.json"
-                    rejected = []
-                    if rejected_path.exists():
-                        try:
-                            with open(rejected_path) as rf:
-                                rejected = json.load(rf)
-                        except (json.JSONDecodeError, KeyError):
-                            pass
-                    rejected.append({
-                        "media_path": str(vf),
-                        "source_file": rejected_entry.get("source_file", ""),
-                        "reason": "llm_mismatch",
-                    })
-                    with open(rejected_path, "w") as rf:
-                        json.dump(rejected, rf, indent=2)
-                    with open(dataset_json_path, "w") as f:
-                        json.dump(entries, f, indent=2)
                     continue
 
                 # Handle fallback (frame extraction failed)
@@ -4318,10 +4804,54 @@ class RSLTXVPrepareDataset:
                     i += 1
                     continue
 
-                # Caption via persistent multi-turn conversation
-                caption, ollama_messages, cap_gen_time, token_count = self._caption_single_ollama(
-                    prep, ollama_url, ollama_model, ollama_messages,
-                )
+                # Caption via persistent multi-turn conversation, with a
+                # length-check + re-roll loop. Probabilistic VLMs occasionally
+                # emit page-long captions that, post-encoding, balloon
+                # attention memory at training time and cause C-level aborts.
+                # On overshoot we wipe Ollama's conversation context (the
+                # runaway turn would poison subsequent rolls if carried
+                # forward) and try again. After MAX_CAPTION_RETRIES failures
+                # the clip is fully rejected: removed from dataset.json,
+                # logged in rejected.json, and its clip / latents / audio
+                # latents files are deleted so it can't be re-introduced.
+                attempt = 0
+                caption = ""
+                cap_gen_time = 0.0
+                token_count = 0
+                while True:
+                    caption, ollama_messages, cap_gen_time, token_count = self._caption_single_ollama(
+                        prep, ollama_url, ollama_model, ollama_messages,
+                    )
+                    if len(caption) <= MAX_CAPTION_CHARS:
+                        break
+                    attempt += 1
+                    logger.warning(
+                        f"  Caption {len(caption)} chars > {MAX_CAPTION_CHARS} "
+                        f"(attempt {attempt}/{MAX_CAPTION_RETRIES}) — wiping context, re-rolling. "
+                        f"First 200 chars: {caption[:200]!r}"
+                    )
+                    # Wipe context AND gen-time tracking; the slow / runaway
+                    # turn distorts both, and the next session should start
+                    # clean.
+                    ollama_messages = None
+                    caption_first_time = 0.0
+                    caption_gen_times.clear()
+                    if attempt >= MAX_CAPTION_RETRIES:
+                        break
+
+                if len(caption) > MAX_CAPTION_CHARS:
+                    # Persistently runaway — clean reject and purge artifacts
+                    # so the clip can't be re-introduced.
+                    logger.error(
+                        f"  Caption stayed over {MAX_CAPTION_CHARS} chars after "
+                        f"{MAX_CAPTION_RETRIES} attempts — rejecting {vf.name}"
+                    )
+                    self._reject_entry(
+                        i, entries, dataset_json_path,
+                        "caption_too_long", purge_artifacts=True,
+                    )
+                    removed_count += 1
+                    continue
 
                 # Detect slowdown or context limit — reset session if either:
                 # 1. Average gen time exceeds 40% of first caption's gen time
