@@ -314,11 +314,32 @@ async function loadHistory() {
                 lossData[nodeId] = { steps: [], losses: [], lrs: [], timestamps: [], totalSteps: 0 };
             }
             const ld = lossData[nodeId];
-            for (const entry of history.steps) {
+            // Reconstruct timestamps from the persisted per-step durations
+            // so the chart's avg time/step is meaningful across resume.
+            // Without step_time, all loaded steps would share performance.now()
+            // and the avg would be dominated by the live-session interval
+            // divided by the (huge) historical step count → near-zero. Anchor
+            // the newest historical step at "now" and walk backward by each
+            // recorded step_time so the spacing matches reality.
+            //
+            // Falls back gracefully for old histories that don't have
+            // step_time (or where some entries are missing it): uses 0 for
+            // those, which means avg only counts steps where we have data.
+            const now = performance.now();
+            let cumulativeMs = 0;
+            const reverseTimes = [];
+            for (let i = history.steps.length - 1; i >= 0; i--) {
+                reverseTimes.push(now - cumulativeMs);
+                const st = history.steps[i].step_time;
+                cumulativeMs += (typeof st === "number" ? st : 0) * 1000;
+            }
+            reverseTimes.reverse();
+            for (let i = 0; i < history.steps.length; i++) {
+                const entry = history.steps[i];
                 ld.steps.push(entry.step);
                 ld.losses.push(entry.loss);
                 ld.lrs.push(entry.lr || 0);
-                ld.timestamps.push(performance.now());
+                ld.timestamps.push(reverseTimes[i]);
             }
             if (history.ema_loss != null) ld.emaLoss = history.ema_loss;
             statusEl.textContent = `Loaded ${ld.steps.length} steps from history`;

@@ -18,6 +18,7 @@ import gc
 import logging
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -525,6 +526,12 @@ class InProcessTrainer:
         consecutive_ooms = 0
         MAX_CONSECUTIVE_OOMS = 5
         while step < self._total_steps:
+            # Capture the wall-clock start of this step so we can persist
+            # per-step duration into loss_history.json. Without it the
+            # training monitor's "avg" can't be reconstructed across resume —
+            # it falls back to all-loaded-steps-share-one-timestamp which
+            # makes avg essentially meaningless.
+            _step_start = time.monotonic()
             step += 1
             # Cancellation check — save checkpoint before exiting
             if cancel_check is not None:
@@ -718,11 +725,16 @@ class InProcessTrainer:
                 except Exception:
                     pass
 
-            # Record step for loss history persistence
+            # Record step for loss history persistence. step_time is the
+            # measured wall-clock duration of this step in seconds; the
+            # training monitor uses it to reconstruct accurate timestamps
+            # across resume (otherwise all loaded steps share the page-
+            # load time and the avg time-per-step on the chart is wrong).
             epoch = (step - 1) // self._step_epoch + 1
             self._loss_steps.append({
                 "step": step, "loss": loss_val, "lr": lr,
                 "ema_loss": self._ema_loss, "epoch": epoch,
+                "step_time": time.monotonic() - _step_start,
             })
             # Save loss history every 50 steps (cheap JSON write)
             if step % 50 == 0:
