@@ -16,12 +16,15 @@ set -euo pipefail
 WORKSPACE=/workspace
 COMFY_DIR="$WORKSPACE/ComfyUI"
 RS_NODES_DIR="$COMFY_DIR/custom_nodes/rs-nodes"
+VENV="$WORKSPACE/.venv"
 PORT="${COMFY_PORT:-8188}"
 LOG_FILE="${COMFY_LOG:-/workspace/comfyui.log}"
 
-# Ubuntu 24.04 (PEP 668) marks the system Python as externally-managed,
-# which blocks pip installs unless we opt in. The container is single-
-# purpose so we accept the risk globally.
+# Ubuntu 24.04 (PEP 668) marks the system Python as externally-managed.
+# We do all installs into a venv on the network volume instead, so
+# state persists across container resets (no re-installing torch every
+# boot) AND we sidestep PEP 668 entirely. The flag stays set as a
+# fallback for any pip that escapes the venv (e.g. via sudo).
 export PIP_BREAK_SYSTEM_PACKAGES=1
 
 # Tee everything to a log file so external shells (e.g. launch.bat
@@ -150,7 +153,27 @@ if [ -d "$RS_NODES_DIR/runpod" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 3. Python deps (idempotent — pip is a no-op on already-installed pkgs)
+# 2.6. Persistent venv on the network volume
+#      Without this, every container reset re-downloads + reinstalls
+#      every pip package (torch alone is ~3 GB). The venv lives on
+#      /workspace so it survives Stop+Start / migrate / terminate.
+#      --system-site-packages lets us inherit the base image's CUDA /
+#      system libs while letting us override Python packages (torch,
+#      sageattention, etc.) with newer versions installed into the venv.
+# -----------------------------------------------------------------------------
+if [ ! -f "$VENV/bin/python" ]; then
+    log "Creating venv at $VENV (one-time, ~30s)"
+    python3 -m venv --system-site-packages "$VENV"
+fi
+log "Activating venv at $VENV"
+# shellcheck disable=SC1091
+source "$VENV/bin/activate"
+log "Python: $(which python)  ($(python --version 2>&1))"
+log "Pip:    $(which pip)"
+
+# -----------------------------------------------------------------------------
+# 3. Python deps (idempotent — pip is a no-op on already-installed pkgs;
+#    only first boot or version changes cause real downloads).
 # -----------------------------------------------------------------------------
 log "Installing ComfyUI Python deps..."
 pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || \
@@ -233,6 +256,6 @@ fi
 # -----------------------------------------------------------------------------
 # 6. Launch ComfyUI on the public port
 # -----------------------------------------------------------------------------
-log "Launching ComfyUI on 0.0.0.0:${PORT}"
+log "Launching ComfyUI on 0.0.0.0:${PORT}  (venv: $VENV)"
 cd "$COMFY_DIR"
-exec python main.py --listen 0.0.0.0 --port "$PORT" "$@"
+exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT" "$@"

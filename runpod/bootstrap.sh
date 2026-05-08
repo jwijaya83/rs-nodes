@@ -28,6 +28,7 @@ WORKSPACE=/workspace
 COMFY_DIR="$WORKSPACE/ComfyUI"
 RS_NODES_DIR="$COMFY_DIR/custom_nodes/rs-nodes"
 MODELS_ROOT="$COMFY_DIR/models"
+VENV="$WORKSPACE/.venv"
 PORT="${COMFY_PORT:-8188}"
 
 OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:31b gemma4:26b}"
@@ -145,6 +146,17 @@ git -C "$RS_NODES_DIR" submodule update --init --recursive || \
 # Phase 2 — Base Python deps
 # -----------------------------------------------------------------------------
 banner "Phase 2/7  Python deps (ComfyUI + rs-nodes + ROSE)"
+# Persistent venv on the network volume so installs survive container
+# resets. --system-site-packages inherits CUDA / system libs from the
+# base image while letting us override pkg versions in the venv.
+if [ ! -f "$VENV/bin/python" ]; then
+    log "Creating venv at $VENV (one-time)"
+    python3 -m venv --system-site-packages "$VENV"
+fi
+# shellcheck disable=SC1091
+source "$VENV/bin/activate"
+log "venv active: $(which python) ($(python --version 2>&1))"
+
 pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || \
     log "WARN: ComfyUI deps install failed"
 [ -f "$RS_NODES_DIR/requirements.txt" ] && \
@@ -296,9 +308,9 @@ df -h /workspace | tail -1 | sed 's/^/    /'
 # Phase 7 — Launch ComfyUI
 # -----------------------------------------------------------------------------
 if [ "$RS_LAUNCH_COMFY" = "1" ]; then
-    banner "Phase 7/7  Launching ComfyUI on 0.0.0.0:${PORT}"
+    banner "Phase 7/7  Launching ComfyUI on 0.0.0.0:${PORT} (venv: $VENV)"
     cd "$COMFY_DIR"
-    exec python main.py --listen 0.0.0.0 --port "$PORT"
+    exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT"
 else
     banner "Phase 7/7  Launch skipped (RS_LAUNCH_COMFY=0)"
     log "Run manually:  cd $COMFY_DIR && python main.py --listen 0.0.0.0 --port $PORT"
