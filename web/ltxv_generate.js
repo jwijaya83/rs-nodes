@@ -118,25 +118,54 @@ function preRollSeed(node) {
     }
 }
 
-// Wrap app.queuePrompt once so every queue submission gets a fresh seed roll
-// for any RSLTXVGenerate node on the graph. Bound + closure-saved original
-// so chained extensions still work.
-const _origQueuePrompt = app.queuePrompt.bind(app);
-app.queuePrompt = async function (...args) {
-    try {
-        for (const node of (app.graph?._nodes || [])) {
-            if (node.comfyClass === "RSLTXVGenerate") {
-                preRollSeed(node);
+// Wrap whichever queue-submission method is actually wired up so every
+// queue submission gets a fresh seed roll for any RSLTXVGenerate node.
+// Bound + closure-saved original so chained extensions still work.
+//
+// The wrap MUST happen inside setup() rather than at module top-level —
+// at module load time `app.queuePrompt` and `app.api` may not be defined
+// yet, and any wrapping there gets clobbered by later ComfyUI init.
+// 0.20.x in particular routes submissions through `app.api.queuePrompt`
+// rather than the legacy `app.queuePrompt`, so we hook both.
+function installSeedRollHook() {
+    const wrap = (target, method, label) => {
+        if (!target || typeof target[method] !== "function") return false;
+        // Prevent double-wrapping if this extension's setup runs twice
+        if (target[method].__rsRollWrapped) return true;
+        const orig = target[method].bind(target);
+        const wrapped = async function (...args) {
+            try {
+                for (const node of (app.graph?._nodes || [])) {
+                    if (node.comfyClass === "RSLTXVGenerate") {
+                        preRollSeed(node);
+                    }
+                }
+            } catch (e) {
+                console.warn(`rs-nodes preRollSeed failed (${label}):`, e);
             }
-        }
-    } catch (e) {
-        console.warn("rs-nodes preRollSeed failed:", e);
+            return orig(...args);
+        };
+        wrapped.__rsRollWrapped = true;
+        target[method] = wrapped;
+        return true;
+    };
+    const w1 = wrap(app, "queuePrompt", "app.queuePrompt");
+    const w2 = wrap(app.api, "queuePrompt", "app.api.queuePrompt");
+    if (!w1 && !w2) {
+        console.warn(
+            "rs-nodes: could not hook any queue submission method; "
+            + "seed_mode=random/increment/decrement will not roll seeds. "
+            + "(Neither app.queuePrompt nor app.api.queuePrompt exists.)"
+        );
     }
-    return _origQueuePrompt(...args);
-};
+}
 
 app.registerExtension({
     name: "rs-nodes.LTXVGenerate",
+
+    setup() {
+        installSeedRollHook();
+    },
 
     nodeCreated(node) {
         if (node.comfyClass === "RSLTXVGenerate") {

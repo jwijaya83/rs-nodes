@@ -16,6 +16,7 @@ Key design decisions vs the subprocess approach:
 import gc
 import logging
 import shutil
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -470,6 +471,9 @@ class InProcessTrainer:
         step = start_step
         interrupted = False
         while step < self._total_steps:
+            # Capture step start so loss_history.json can persist actual
+            # per-step duration. Monitor-only — does not affect training.
+            _step_start = time.monotonic()
             step += 1
             # Cancellation check — save checkpoint before exiting
             if cancel_check is not None:
@@ -602,11 +606,14 @@ class InProcessTrainer:
                 except Exception:
                     pass
 
-            # Record step for loss history persistence
+            # Record step for loss history persistence. step_time lets
+            # the training monitor reconstruct accurate timestamps across
+            # resume so the chart's avg s/step is meaningful.
             epoch = (step - 1) // self._step_epoch + 1
             self._loss_steps.append({
                 "step": step, "loss": loss_val, "lr": lr,
                 "ema_loss": self._ema_loss, "epoch": epoch,
+                "step_time": time.monotonic() - _step_start,
             })
             # Save loss history every 50 steps (cheap JSON write)
             if step % 50 == 0:
