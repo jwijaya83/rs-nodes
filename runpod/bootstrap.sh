@@ -169,11 +169,11 @@ pip install --no-cache-dir rose-opt || log "WARN: ROSE install failed"
 log "Upgrading PyTorch to cu130 wheels..."
 pip install --upgrade --no-cache-dir --index-url https://download.pytorch.org/whl/cu130 \
     torch torchvision torchaudio || log "WARN: cu130 upgrade failed"
-log "Ensuring cu13 runtime libraries (NVRTC + cuDNN + cuBLAS)..."
+log "Ensuring NVIDIA CUDA runtime libraries (NVRTC + cuDNN + cuBLAS)..."
 pip install --no-cache-dir \
-    nvidia-cuda-nvrtc-cu13 nvidia-cuda-runtime-cu13 \
-    nvidia-cublas-cu13 nvidia-cudnn-cu13 || \
-    log "WARN: cu13 runtime libs install failed"
+    nvidia-cuda-nvrtc nvidia-cuda-runtime \
+    nvidia-cublas nvidia-cudnn || \
+    log "WARN: CUDA runtime libs install failed"
 log "Installing SageAttention..."
 pip install --no-cache-dir sageattention || log "WARN: SageAttention install failed"
 
