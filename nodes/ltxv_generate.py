@@ -609,9 +609,29 @@ class RSLTXVGenerate:
         audio_is_input = has_audio and audio is not None  # True = user provided audio, pass through
         if has_audio:
             if audio is not None:
-                # Encode provided audio into latent space
+                # Encode provided audio into latent space.
+                # Match ComfyUI's canonical audio encode path
+                # (comfy_extras/nodes_audio.py::VAEEncodeAudio.execute):
+                # resample to the VAE's expected rate if needed, then pass a
+                # channels-LAST waveform tensor (NOT the AUDIO dict). The
+                # standard VAE wrapper's encode() does pixel-style cropping
+                # which crashes on a dict input ("'LazyAudioMap' object has
+                # no attribute 'shape'").
                 logger.info("Encoding input audio latents")
-                audio_samples = audio_vae.encode(audio)
+                sample_rate = int(audio["sample_rate"])
+                vae_sample_rate = int(getattr(audio_vae, "audio_sample_rate", 44100))
+                if vae_sample_rate != sample_rate:
+                    import torchaudio
+                    waveform = torchaudio.functional.resample(
+                        audio["waveform"], sample_rate, vae_sample_rate,
+                    )
+                else:
+                    waveform = audio["waveform"]
+                audio_samples = audio_vae.encode(waveform.movedim(1, -1))
+                # Tolerate either a tensor or a {"samples": Tensor} dict —
+                # different VAE wrapper versions return different things.
+                if isinstance(audio_samples, dict) and "samples" in audio_samples:
+                    audio_samples = audio_samples["samples"]
             else:
                 # Create empty audio latents — the AV model generates audio from scratch
                 logger.info("Creating empty audio latents for generation")
