@@ -162,6 +162,24 @@ log "Ensuring ROSE optimizer..."
 pip install --no-cache-dir rose-opt || \
     log "WARN: ROSE install failed (only needed for training)"
 
+# Performance stack:
+#   * Upgrade PyTorch to cu130 wheels — Blackwell (RTX 50xx / PRO 6000)
+#     hardware fp8 paths and comfy-kitchen's cuda+triton backends require
+#     it. Stock RunPod pytorch image ships cu128 which leaves these
+#     disabled (only the slow eager backend runs). Idempotent: pip
+#     skips when already at the right version.
+#   * SageAttention — 30-50% faster attention than vanilla PyTorch SDPA.
+#     ComfyUI auto-detects and uses it.
+log "Ensuring PyTorch cu130 wheels (Blackwell perf path)..."
+pip install --upgrade --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/cu130 \
+    torch torchvision torchaudio || \
+    log "WARN: PyTorch cu130 upgrade failed; running on stock cu128"
+
+log "Ensuring SageAttention..."
+pip install --no-cache-dir sageattention || \
+    log "WARN: SageAttention install failed; using stock PyTorch attention"
+
 # -----------------------------------------------------------------------------
 # 4. Optional InsightFace pre-download (gated by env var so the dispatch
 #    path that doesn't need it doesn't pay the bandwidth)

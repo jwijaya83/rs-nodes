@@ -147,6 +147,14 @@ pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || \
     log "WARN: rs-nodes deps install failed"
 pip install --no-cache-dir rose-opt || log "WARN: ROSE install failed"
 
+# Blackwell perf stack: cu130 PyTorch (engages hardware fp8 paths +
+# comfy-kitchen's cuda/triton backends) + SageAttention (faster attn).
+log "Upgrading PyTorch to cu130 wheels..."
+pip install --upgrade --no-cache-dir --index-url https://download.pytorch.org/whl/cu130 \
+    torch torchvision torchaudio || log "WARN: cu130 upgrade failed"
+log "Installing SageAttention..."
+pip install --no-cache-dir sageattention || log "WARN: SageAttention install failed"
+
 # -----------------------------------------------------------------------------
 # Phase 3 — Extra custom-node packs (workflow-specific)
 # -----------------------------------------------------------------------------
