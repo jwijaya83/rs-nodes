@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# rs-nodes pod-side: ONE-SHOT setup for a fresh RunPod network volume.
+# Run this once on a brand-new pod with the volume mounted at /workspace
+# and it will end with ComfyUI serving on port 8188.
+#
+# Idempotent: safe to re-run after a crash, after a partial download,
+# or on a re-deployed pod. Each phase skips work that's already done.
+#
+# Configure via env vars before running (all optional):
+#   HF_TOKEN          — HuggingFace token for downloads (read scope is enough)
+#   OLLAMA_MODEL      — Ollama model(s) to pull (space-separated, default: gemma4:31b gemma4:26b)
+#   RS_INSTALL_OLLAMA — set to "0" to skip Ollama (default: "1")
+#   RS_LAUNCH_COMFY   — set to "0" to skip the final ComfyUI launch (default: "1")
+#   RS_NODE_PACKS     — space-separated key list for install_extras pack set
+#                       (default: "vhs controlnet_aux essentials ltxvideo sam3")
+#
+# Examples:
+#   bash /workspace/bootstrap.sh
+#   HF_TOKEN=hf_xxx OLLAMA_MODEL="gemma4:31b gemma4:26b" bash /workspace/bootstrap.sh
+#   RS_LAUNCH_COMFY=0 bash /workspace/bootstrap.sh   # provision then exit
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Config (override via env vars before invocation)
+# -----------------------------------------------------------------------------
+WORKSPACE=/workspace
+COMFY_DIR="$WORKSPACE/ComfyUI"
+RS_NODES_DIR="$COMFY_DIR/custom_nodes/rs-nodes"
+MODELS_ROOT="$COMFY_DIR/models"
+PORT="${COMFY_PORT:-8188}"
+
+OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:31b gemma4:26b}"
+OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
+OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+RS_INSTALL_OLLAMA="${RS_INSTALL_OLLAMA:-1}"   # default ON — RSPromptFormatter needs it
+RS_LAUNCH_COMFY="${RS_LAUNCH_COMFY:-1}"
+RS_NODE_PACKS="${RS_NODE_PACKS:-vhs controlnet_aux essentials ltxvideo sam3 seedvr2}"
+
+export OLLAMA_MODELS OLLAMA_HOST
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+banner() {
+    echo ""
+    echo "========================================================================"
+    echo "  $*"
+    echo "========================================================================"
+}
+log() { printf '[bootstrap] %s\n' "$*"; }
+
+# -----------------------------------------------------------------------------
+# Phase 0 — DNS guard
+# Some RunPod regions ship containers with an empty /etc/resolv.conf.
+# Lives on the container disk so this has to run every cold boot.
+# -----------------------------------------------------------------------------
+banner "Phase 0/7  DNS check"
+if ! getent hosts github.com >/dev/null 2>&1; then
+    log "DNS resolution broken; injecting public resolvers"
+    { echo "nameserver 8.8.8.8"; echo "nameserver 1.1.1.1"; } > /etc/resolv.conf || \
+        log "WARN: could not write /etc/resolv.conf"
+    if ! getent hosts github.com >/dev/null 2>&1; then
+        log "ERROR: DNS still broken after injection. Bail out."
+        exit 1
+    fi
+fi
+log "OK"
+
+mkdir -p "$WORKSPACE"
+cd "$WORKSPACE"
+
+# -----------------------------------------------------------------------------
+# Phase 0.5 — sshd survival
+#   When this script is the Container Start Command, RunPod's stock
+#   init never runs and sshd has no host keys. Persist them on the
+#   volume so they survive every container reset and SSH clients
+#   don't see "host key changed" warnings. Also persist authorized_keys
+#   the same way.
+# -----------------------------------------------------------------------------
+banner "Phase 0.5/7  sshd host keys + authorized_keys"
+
+mkdir -p /workspace/.ssh /workspace/.ssh/host_keys /etc/ssh /root/.ssh
+chmod 700 /workspace/.ssh /root/.ssh
+
+if compgen -G "/workspace/.ssh/host_keys/ssh_host_*" > /dev/null; then
+    log "Restoring sshd host keys from /workspace/.ssh/host_keys"
+    cp -f /workspace/.ssh/host_keys/ssh_host_* /etc/ssh/
+elif compgen -G "/etc/ssh/ssh_host_*" > /dev/null; then
+    log "Persisting existing sshd host keys to /workspace/.ssh/host_keys"
+    cp -f /etc/ssh/ssh_host_* /workspace/.ssh/host_keys/
+else
+    log "Generating fresh sshd host keys (ssh-keygen -A)"
+    ssh-keygen -A
+    cp -f /etc/ssh/ssh_host_* /workspace/.ssh/host_keys/
+fi
+chmod 600 /etc/ssh/ssh_host_*_key 2>/dev/null || true
+chmod 644 /etc/ssh/ssh_host_*_key.pub 2>/dev/null || true
+
+if [ -s /workspace/.ssh/authorized_keys ]; then
+    log "Restoring authorized_keys from /workspace/.ssh"
+    cp /workspace/.ssh/authorized_keys /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+elif [ -s /root/.ssh/authorized_keys ]; then
+    log "Persisting authorized_keys -> /workspace/.ssh"
+    cp /root/.ssh/authorized_keys /workspace/.ssh/authorized_keys
+    chmod 600 /workspace/.ssh/authorized_keys
+fi
+
+if command -v service >/dev/null 2>&1; then
+    service ssh restart 2>&1 | sed 's/^/[sshd] /' || true
+elif [ -x /usr/sbin/sshd ]; then
+    pkill -f /usr/sbin/sshd 2>/dev/null || true
+    /usr/sbin/sshd
+fi
+
+# -----------------------------------------------------------------------------
+# Phase 1 — ComfyUI + rs-nodes checkout
+# -----------------------------------------------------------------------------
+banner "Phase 1/7  ComfyUI + rs-nodes"
+if [ ! -d "$COMFY_DIR/.git" ]; then
+    log "Cloning ComfyUI..."
+    git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
+else
+    log "ComfyUI present; pulling..."
+    git -C "$COMFY_DIR" pull --ff-only || log "WARN: ComfyUI pull failed"
+fi
+
+if [ ! -d "$RS_NODES_DIR/.git" ]; then
+    log "Cloning rs-nodes..."
+    git clone https://github.com/richservo/rs-nodes.git "$RS_NODES_DIR"
+else
+    log "rs-nodes present; pulling..."
+    git -C "$RS_NODES_DIR" pull --ff-only || log "WARN: rs-nodes pull failed"
+fi
+git -C "$RS_NODES_DIR" submodule update --init --recursive || \
+    log "WARN: submodule update failed"
+
+# -----------------------------------------------------------------------------
+# Phase 2 — Base Python deps
+# -----------------------------------------------------------------------------
+banner "Phase 2/7  Python deps (ComfyUI + rs-nodes + ROSE)"
+pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || \
+    log "WARN: ComfyUI deps install failed"
+[ -f "$RS_NODES_DIR/requirements.txt" ] && \
+    pip install --no-cache-dir -r "$RS_NODES_DIR/requirements.txt" || \
+    log "WARN: rs-nodes deps install failed"
+pip install --no-cache-dir rose-opt || log "WARN: ROSE install failed"
+
+# -----------------------------------------------------------------------------
+# Phase 3 — Extra custom-node packs (workflow-specific)
+# -----------------------------------------------------------------------------
+banner "Phase 3/7  Custom node packs ($RS_NODE_PACKS)"
+declare -A NODE_PACKS=(
+    [vhs]="ComfyUI-VideoHelperSuite|https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git"
+    [controlnet_aux]="comfyui_controlnet_aux|https://github.com/Fannovel16/comfyui_controlnet_aux.git"
+    [essentials]="ComfyUI_essentials|https://github.com/cubiq/ComfyUI_essentials.git"
+    [ltxvideo]="ComfyUI-LTXVideo|https://github.com/Lightricks/ComfyUI-LTXVideo.git"
+    [sam3]="ComfyUI-SAM3|https://github.com/PozzettiAndrea/ComfyUI-SAM3.git"
+    [seedvr2]="ComfyUI-SeedVR2_VideoUpscaler|https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git"
+)
+
+CUSTOM_NODES_DIR="$COMFY_DIR/custom_nodes"
+for key in $RS_NODE_PACKS; do
+    spec="${NODE_PACKS[$key]:-}"
+    if [ -z "$spec" ]; then
+        log "WARN: unknown pack '$key'; skipping (known: ${!NODE_PACKS[*]})"
+        continue
+    fi
+    name="${spec%%|*}"
+    url="${spec##*|}"
+    target="$CUSTOM_NODES_DIR/$name"
+
+    if [ -d "$target/.git" ]; then
+        log "[$key] $name exists; pulling..."
+        git -C "$target" pull --ff-only || log "  WARN: pull failed"
+    else
+        log "[$key] cloning $url"
+        git clone "$url" "$target" || { log "  ERROR: clone failed"; continue; }
+    fi
+    [ -f "$target/requirements.txt" ] && \
+        pip install --no-cache-dir -r "$target/requirements.txt" || \
+        log "  WARN: pip install failed for $key"
+    [ -f "$target/install.py" ] && \
+        (cd "$target" && python install.py) || true
+done
+
+# -----------------------------------------------------------------------------
+# Phase 4 — Model weights from HuggingFace
+# Default manifest: Koi_NoPeople IC-LoRA workflow (~57 GB total, bf16 dev).
+# -----------------------------------------------------------------------------
+banner "Phase 4/7  Model weights from HuggingFace"
+
+WGET_AUTH=()
+if [ -n "${HF_TOKEN:-}" ]; then
+    log "HF_TOKEN set; using authenticated requests"
+    WGET_AUTH=(--header="Authorization: Bearer ${HF_TOKEN}")
+else
+    log "No HF_TOKEN — proceeding unauthenticated (rate-limited; ungated repos only)"
+fi
+
+MODELS=(
+    "checkpoints|ltx-2.3-22b-dev-fp8.safetensors|https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors"
+    "text_encoders|gemma_3_12B_it_fp4_mixed.safetensors|https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
+    "latent_upscale_models|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+    "loras|ltx-2.3-22b-distilled-lora-384-1.1.safetensors|https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+    "loras|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors|https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control/resolve/main/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
+)
+
+mkdir -p "$MODELS_ROOT"
+for entry in "${MODELS[@]}"; do
+    IFS='|' read -r subdir name url <<< "$entry"
+    dir="$MODELS_ROOT/$subdir"
+    file="$dir/$name"
+    mkdir -p "$dir"
+    if [ -s "$file" ]; then
+        log "[ok]    $subdir/$name ($(stat -c%s "$file") bytes)"
+        continue
+    fi
+    log "[fetch] $subdir/$name"
+    wget -c --tries=3 --no-verbose --show-progress \
+        "${WGET_AUTH[@]}" -O "$file" "$url" || {
+            log "  ERROR: download failed for $name"
+            rm -f "$file"
+            continue
+        }
+done
+
+# -----------------------------------------------------------------------------
+# Phase 5 — Ollama install + model pull
+# -----------------------------------------------------------------------------
+if [ "$RS_INSTALL_OLLAMA" = "1" ]; then
+    banner "Phase 5/7  Ollama (model: $OLLAMA_MODEL)"
+    if ! command -v ollama >/dev/null 2>&1; then
+        log "Installing Ollama..."
+        curl -fsSL https://ollama.com/install.sh | sh
+    else
+        log "Ollama already installed: $(ollama --version 2>&1 | head -1)"
+    fi
+    mkdir -p "$OLLAMA_MODELS"
+
+    if curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
+        log "Ollama server already running on $OLLAMA_HOST"
+    else
+        log "Starting Ollama server (OLLAMA_MODELS=$OLLAMA_MODELS)"
+        nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
+            ollama serve > /workspace/ollama.log 2>&1 &
+        for i in $(seq 1 30); do
+            curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1 && break
+            sleep 2
+        done
+        if ! curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
+            log "WARN: Ollama server didn't come up. See /workspace/ollama.log"
+        fi
+    fi
+
+    for model in $OLLAMA_MODEL; do
+        if ollama list | awk 'NR>1 {print $1}' | grep -Fxq "$model"; then
+            log "$model already cached"
+        else
+            log "Pulling $model..."
+            ollama pull "$model" || log "  WARN: pull failed for $model"
+        fi
+    done
+else
+    banner "Phase 5/7  Ollama (skipped, RS_INSTALL_OLLAMA=0)"
+fi
+
+# -----------------------------------------------------------------------------
+# Phase 6 — Summary
+# -----------------------------------------------------------------------------
+banner "Phase 6/7  Summary"
+log "ComfyUI:        $COMFY_DIR ($(git -C "$COMFY_DIR" rev-parse --short HEAD 2>/dev/null || echo '?'))"
+log "rs-nodes:       $RS_NODES_DIR ($(git -C "$RS_NODES_DIR" rev-parse --short HEAD 2>/dev/null || echo '?'))"
+log "Custom nodes installed:"
+ls -1 "$CUSTOM_NODES_DIR" | sed 's/^/    /'
+log "Models on volume:"
+du -sh "$MODELS_ROOT"/* 2>/dev/null | sed 's/^/    /' || true
+log "Disk usage on /workspace:"
+df -h /workspace | tail -1 | sed 's/^/    /'
+
+# -----------------------------------------------------------------------------
+# Phase 7 — Launch ComfyUI
+# -----------------------------------------------------------------------------
+if [ "$RS_LAUNCH_COMFY" = "1" ]; then
+    banner "Phase 7/7  Launching ComfyUI on 0.0.0.0:${PORT}"
+    cd "$COMFY_DIR"
+    exec python main.py --listen 0.0.0.0 --port "$PORT"
+else
+    banner "Phase 7/7  Launch skipped (RS_LAUNCH_COMFY=0)"
+    log "Run manually:  cd $COMFY_DIR && python main.py --listen 0.0.0.0 --port $PORT"
+fi
