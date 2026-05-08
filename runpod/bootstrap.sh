@@ -174,6 +174,19 @@ pip install --no-cache-dir \
     nvidia-cuda-nvrtc nvidia-cuda-runtime \
     nvidia-cublas nvidia-cudnn || \
     log "WARN: CUDA runtime libs install failed"
+
+# pip-installed NVIDIA libs go in venv site-packages/nvidia/*/lib/;
+# PyTorch dlopen() needs LD_LIBRARY_PATH set so it can find them.
+NV_LIB_PATHS=$(python -c "
+import nvidia, os
+r = os.path.dirname(nvidia.__file__)
+print(':'.join(os.path.join(r, d, 'lib') for d in sorted(os.listdir(r))
+               if os.path.isdir(os.path.join(r, d, 'lib'))))
+" 2>/dev/null || echo "")
+if [ -n "$NV_LIB_PATHS" ]; then
+    log "NVIDIA lib paths: $NV_LIB_PATHS"
+    export LD_LIBRARY_PATH="$NV_LIB_PATHS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 log "Installing SageAttention..."
 pip install --no-cache-dir sageattention || log "WARN: SageAttention install failed"
 

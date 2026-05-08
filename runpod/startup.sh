@@ -217,6 +217,26 @@ pip install --no-cache-dir \
     nvidia-cudnn || \
     log "WARN: CUDA runtime libs install failed; JIT kernels may crash"
 
+# pip-installed NVIDIA libs land in venv site-packages/nvidia/*/lib/.
+# PyTorch's nvrtc dlopen() searches LD_LIBRARY_PATH at runtime, so
+# every nvidia/* lib dir has to be visible. Compute and persist it
+# into the venv's activate script so any shell that activates the
+# venv (including the exec at the end of this script) inherits it.
+NV_LIB_PATHS=$(python -c "
+import nvidia, os
+r = os.path.dirname(nvidia.__file__)
+paths = []
+for d in sorted(os.listdir(r)):
+    lib_dir = os.path.join(r, d, 'lib')
+    if os.path.isdir(lib_dir):
+        paths.append(lib_dir)
+print(':'.join(paths))
+" 2>/dev/null || echo "")
+if [ -n "$NV_LIB_PATHS" ]; then
+    log "NVIDIA lib paths: $NV_LIB_PATHS"
+    export LD_LIBRARY_PATH="$NV_LIB_PATHS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
 log "Ensuring SageAttention..."
 pip install --no-cache-dir sageattention || \
     log "WARN: SageAttention install failed; using stock PyTorch attention"
