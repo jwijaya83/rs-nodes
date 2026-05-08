@@ -269,6 +269,13 @@ fi
 # -----------------------------------------------------------------------------
 # 6. Launch ComfyUI on the public port
 # -----------------------------------------------------------------------------
-log "Launching ComfyUI on 0.0.0.0:${PORT}  (venv: $VENV)"
+# --highvram keeps loaded weights resident on the GPU instead of
+# offloading to CPU between operations. On a 96 GB Blackwell card
+# the LTX-2.3 22B fp8 (~29 GB) + gemma fp4 text encoder (~9 GB) +
+# audio_vae easily fit; eliminating the CPU↔GPU ping-pong can be
+# 2-5x faster after the first warmup. Override via COMFY_EXTRA_ARGS
+# env var (e.g. "" to disable, or "--gpu-only" for max-aggressive).
+COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:---highvram}"
+log "Launching ComfyUI on 0.0.0.0:${PORT}  (venv: $VENV, args: $COMFY_EXTRA_ARGS)"
 cd "$COMFY_DIR"
-exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT" "$@"
+exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT" $COMFY_EXTRA_ARGS "$@"
