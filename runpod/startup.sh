@@ -204,6 +204,17 @@ pip install --upgrade --no-cache-dir \
     torch torchvision torchaudio || \
     log "WARN: PyTorch cu130 upgrade failed; running on stock cu128"
 
+# cu130 PyTorch needs the cu13 NVRTC + companion runtime libs for
+# JIT-compiled kernels (e.g. torchaudio spectrogram's complex abs).
+# Without these, runs crash with "failed to open libnvrtc-builtins.so.13.0".
+log "Ensuring cu13 runtime libraries..."
+pip install --no-cache-dir \
+    nvidia-cuda-nvrtc-cu13 \
+    nvidia-cuda-runtime-cu13 \
+    nvidia-cublas-cu13 \
+    nvidia-cudnn-cu13 || \
+    log "WARN: cu13 runtime libs install failed; JIT kernels may crash"
+
 log "Ensuring SageAttention..."
 pip install --no-cache-dir sageattention || \
     log "WARN: SageAttention install failed; using stock PyTorch attention"
