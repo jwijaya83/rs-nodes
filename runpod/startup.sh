@@ -134,6 +134,16 @@ log "Updating rs-nodes submodules..."
 git -C "$RS_NODES_DIR" submodule update --init --recursive || \
     log "WARN: submodule update failed"
 
+# Mirror pod-side helper scripts from rs-nodes/runpod/ to /workspace/
+# so Container Start Command + manual runs find them at the documented
+# paths even on a fresh container disk. git pull is the delivery channel
+# (works around wedged sshd / scp).
+if [ -d "$RS_NODES_DIR/runpod" ]; then
+    log "Mirroring rs-nodes/runpod scripts to /workspace/"
+    cp -f "$RS_NODES_DIR/runpod/"*.sh /workspace/ 2>/dev/null || true
+    chmod +x /workspace/*.sh 2>/dev/null || true
+fi
+
 # -----------------------------------------------------------------------------
 # 3. Python deps (idempotent — pip is a no-op on already-installed pkgs)
 # -----------------------------------------------------------------------------
