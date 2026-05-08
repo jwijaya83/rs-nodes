@@ -43,11 +43,13 @@ declare -A PACKS=(
     [ltxvideo]="ComfyUI-LTXVideo|https://github.com/Lightricks/ComfyUI-LTXVideo.git"
     [sam3]="ComfyUI-SAM3|https://github.com/PozzettiAndrea/ComfyUI-SAM3.git"
     [seedvr2]="ComfyUI-SeedVR2_VideoUpscaler|https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git"
+    [res4lyf]="RES4LYF|https://github.com/ClownsharkBatwing/RES4LYF.git"
 )
 
 # Default selection (all keys above — Linux-friendly stack including
-# SeedVR2 as a substitute for Windows-only RTX upscaling).
-SELECTED=(vhs controlnet_aux essentials ltxvideo sam3 seedvr2)
+# SeedVR2 as a substitute for Windows-only RTX upscaling, plus RES4LYF
+# for the res_2s sampler family used by LTX-2 distilled workflows).
+SELECTED=(vhs controlnet_aux essentials ltxvideo sam3 seedvr2 res4lyf)
 
 # Apply +pack / -pack overrides from args.
 for arg in "$@"; do
