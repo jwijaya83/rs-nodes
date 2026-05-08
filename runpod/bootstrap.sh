@@ -39,6 +39,11 @@ RS_NODE_PACKS="${RS_NODE_PACKS:-vhs controlnet_aux essentials ltxvideo sam3 seed
 
 export OLLAMA_MODELS OLLAMA_HOST
 
+# Ubuntu 24.04 (PEP 668) marks the system Python as externally-managed,
+# blocking pip installs unless we opt in. The container is single-
+# purpose so we accept this globally.
+export PIP_BREAK_SYSTEM_PACKAGES=1
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------

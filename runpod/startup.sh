@@ -19,6 +19,11 @@ RS_NODES_DIR="$COMFY_DIR/custom_nodes/rs-nodes"
 PORT="${COMFY_PORT:-8188}"
 LOG_FILE="${COMFY_LOG:-/workspace/comfyui.log}"
 
+# Ubuntu 24.04 (PEP 668) marks the system Python as externally-managed,
+# which blocks pip installs unless we opt in. The container is single-
+# purpose so we accept the risk globally.
+export PIP_BREAK_SYSTEM_PACKAGES=1
+
 # Tee everything to a log file so external shells (e.g. launch.bat
 # tailing from Windows) can see startup + ComfyUI output even when
 # the script runs as the container's start command (no attached TTY).
