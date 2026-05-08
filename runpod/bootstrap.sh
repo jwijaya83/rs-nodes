@@ -142,6 +142,15 @@ fi
 git -C "$RS_NODES_DIR" submodule update --init --recursive || \
     log "WARN: submodule update failed"
 
+# Mirror pod-side helper scripts (startup.sh, install_*, monitor.sh, etc.)
+# to /workspace/ so the pod template's Container Start Command finds
+# them on subsequent boots without re-running bootstrap.sh.
+if [ -d "$RS_NODES_DIR/runpod" ]; then
+    log "Mirroring rs-nodes/runpod scripts to /workspace/"
+    cp -f "$RS_NODES_DIR/runpod/"*.sh /workspace/ 2>/dev/null || true
+    chmod +x /workspace/*.sh 2>/dev/null || true
+fi
+
 # -----------------------------------------------------------------------------
 # Phase 2 — Base Python deps
 # -----------------------------------------------------------------------------
