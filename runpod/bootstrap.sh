@@ -36,7 +36,7 @@ OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
 OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
 RS_INSTALL_OLLAMA="${RS_INSTALL_OLLAMA:-1}"   # default ON — RSPromptFormatter needs it
 RS_LAUNCH_COMFY="${RS_LAUNCH_COMFY:-1}"
-RS_NODE_PACKS="${RS_NODE_PACKS:-vhs controlnet_aux essentials ltxvideo sam3 seedvr2 res4lyf}"
+RS_NODE_PACKS="${RS_NODE_PACKS:-vhs controlnet_aux essentials ltxvideo seedvr2 res4lyf}"
 
 export OLLAMA_MODELS OLLAMA_HOST
 
@@ -219,7 +219,6 @@ declare -A NODE_PACKS=(
     [controlnet_aux]="comfyui_controlnet_aux|https://github.com/Fannovel16/comfyui_controlnet_aux.git"
     [essentials]="ComfyUI_essentials|https://github.com/cubiq/ComfyUI_essentials.git"
     [ltxvideo]="ComfyUI-LTXVideo|https://github.com/Lightricks/ComfyUI-LTXVideo.git"
-    [sam3]="ComfyUI-SAM3|https://github.com/PozzettiAndrea/ComfyUI-SAM3.git"
     [seedvr2]="ComfyUI-SeedVR2_VideoUpscaler|https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git"
     [res4lyf]="RES4LYF|https://github.com/ClownsharkBatwing/RES4LYF.git"
 )
