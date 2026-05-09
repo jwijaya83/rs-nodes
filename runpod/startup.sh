@@ -172,51 +172,85 @@ log "Python: $(which python)  ($(python --version 2>&1))"
 log "Pip:    $(which pip)"
 
 # -----------------------------------------------------------------------------
-# 3. Python deps (idempotent — pip is a no-op on already-installed pkgs;
-#    only first boot or version changes cause real downloads).
+# 3. Python deps — fast path on warm boots.
+#
+# On a fresh volume, every pip install runs (slow first boot). On every
+# subsequent boot, a marker file at /workspace/.provision_hash holds the
+# sha256 of the requirements.txt files. If the hash matches, skip every
+# pip install — saves 30-90s per boot. If requirements.txt changes
+# (because rs-nodes adds a dep, etc.), the hash mismatches and pip runs
+# normally to install the new pieces.
+#
+# To force a full re-provision (e.g. to pick up a new torch wheel from
+# the cu130 index), delete the marker:
+#     rm /workspace/.provision_hash
+# Then restart the container (kill.bat or Stop+Start).
 # -----------------------------------------------------------------------------
-log "Installing ComfyUI Python deps..."
-pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || \
-    log "WARN: ComfyUI deps install failed"
+PROVISION_MARKER="$WORKSPACE/.provision_hash"
+REQ_HASH=$(cat "$COMFY_DIR/requirements.txt" "$RS_NODES_DIR/requirements.txt" 2>/dev/null | sha256sum | cut -d' ' -f1)
+STORED_HASH=""
+[ -f "$PROVISION_MARKER" ] && STORED_HASH=$(cat "$PROVISION_MARKER" 2>/dev/null)
 
-log "Installing rs-nodes Python deps..."
-if [ -f "$RS_NODES_DIR/requirements.txt" ]; then
-    pip install --no-cache-dir -r "$RS_NODES_DIR/requirements.txt" || \
-        log "WARN: rs-nodes deps install failed"
+if [ -n "$REQ_HASH" ] && [ "$REQ_HASH" = "$STORED_HASH" ]; then
+    FAST_PATH=1
+    log "Provision marker matches — skipping pip install steps (fast path)"
+else
+    FAST_PATH=0
+    if [ -z "$STORED_HASH" ]; then
+        log "No provision marker — running full pip provisioning"
+    else
+        log "Requirements changed since last boot — re-running pip"
+    fi
 fi
 
-# ROSE optimizer — published as rose-opt, imported as rose_opt
-log "Ensuring ROSE optimizer..."
-pip install --no-cache-dir rose-opt || \
-    log "WARN: ROSE install failed (only needed for training)"
+if [ "$FAST_PATH" != "1" ]; then
+    log "Installing ComfyUI Python deps..."
+    pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || \
+        log "WARN: ComfyUI deps install failed"
 
-# Performance stack:
-#   * Upgrade PyTorch to cu130 wheels — Blackwell (RTX 50xx / PRO 6000)
-#     hardware fp8 paths and comfy-kitchen's cuda+triton backends require
-#     it. Stock RunPod pytorch image ships cu128 which leaves these
-#     disabled (only the slow eager backend runs). Idempotent: pip
-#     skips when already at the right version.
-#   * SageAttention — 30-50% faster attention than vanilla PyTorch SDPA.
-#     ComfyUI auto-detects and uses it.
-log "Ensuring PyTorch cu130 wheels (Blackwell perf path)..."
-pip install --upgrade --no-cache-dir \
-    --index-url https://download.pytorch.org/whl/cu130 \
-    torch torchvision torchaudio || \
-    log "WARN: PyTorch cu130 upgrade failed; running on stock cu128"
+    log "Installing rs-nodes Python deps..."
+    if [ -f "$RS_NODES_DIR/requirements.txt" ]; then
+        pip install --no-cache-dir -r "$RS_NODES_DIR/requirements.txt" || \
+            log "WARN: rs-nodes deps install failed"
+    fi
 
-# cu130 PyTorch needs the matching NVRTC + companion runtime libs
-# for JIT-compiled kernels (e.g. torchaudio spectrogram's complex abs).
-# Without these, runs crash with "failed to open libnvrtc-builtins.so.13.0".
-# NVIDIA deprecated the -cu13 suffixed packages; use the unsuffixed
-# names which now ship the cu13-compatible builds.
-log "Ensuring NVIDIA CUDA runtime libraries..."
-pip install --no-cache-dir \
-    nvidia-cuda-nvrtc \
-    nvidia-cuda-runtime \
-    nvidia-cublas \
-    nvidia-cudnn || \
-    log "WARN: CUDA runtime libs install failed; JIT kernels may crash"
+    # ROSE optimizer — published as rose-opt, imported as rose_opt
+    log "Ensuring ROSE optimizer..."
+    pip install --no-cache-dir rose-opt || \
+        log "WARN: ROSE install failed (only needed for training)"
 
+    # Performance stack:
+    #   * Upgrade PyTorch to cu130 wheels — Blackwell (RTX 50xx / PRO 6000)
+    #     hardware fp8 paths and comfy-kitchen's cuda+triton backends require
+    #     it. Stock RunPod pytorch image ships cu128 which leaves these
+    #     disabled (only the slow eager backend runs). Idempotent: pip
+    #     skips when already at the right version.
+    #   * SageAttention — 30-50% faster attention than vanilla PyTorch SDPA.
+    #     ComfyUI auto-detects and uses it.
+    log "Ensuring PyTorch cu130 wheels (Blackwell perf path)..."
+    pip install --upgrade --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cu130 \
+        torch torchvision torchaudio || \
+        log "WARN: PyTorch cu130 upgrade failed; running on stock cu128"
+
+    # cu130 PyTorch needs the matching NVRTC + companion runtime libs
+    # for JIT-compiled kernels (e.g. torchaudio spectrogram's complex abs).
+    # Without these, runs crash with "failed to open libnvrtc-builtins.so.13.0".
+    # NVIDIA deprecated the -cu13 suffixed packages; use the unsuffixed
+    # names which now ship the cu13-compatible builds.
+    log "Ensuring NVIDIA CUDA runtime libraries..."
+    pip install --no-cache-dir \
+        nvidia-cuda-nvrtc \
+        nvidia-cuda-runtime \
+        nvidia-cublas \
+        nvidia-cudnn || \
+        log "WARN: CUDA runtime libs install failed; JIT kernels may crash"
+fi
+
+# LD_LIBRARY_PATH must be computed every boot — env vars don't persist
+# across container restarts, even though the underlying nvidia/* lib
+# dirs do. Stays outside the fast-path skip.
+#
 # pip-installed NVIDIA libs land in venv site-packages/nvidia/*/lib/.
 # PyTorch's nvrtc dlopen() searches LD_LIBRARY_PATH at runtime, so
 # every nvidia/* lib dir has to be visible. Compute and persist it
@@ -237,9 +271,18 @@ if [ -n "$NV_LIB_PATHS" ]; then
     export LD_LIBRARY_PATH="$NV_LIB_PATHS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
-log "Ensuring SageAttention..."
-pip install --no-cache-dir sageattention || \
-    log "WARN: SageAttention install failed; using stock PyTorch attention"
+if [ "$FAST_PATH" != "1" ]; then
+    log "Ensuring SageAttention..."
+    pip install --no-cache-dir sageattention || \
+        log "WARN: SageAttention install failed; using stock PyTorch attention"
+
+    # All pip blocks succeeded — write the provision marker so next
+    # boot can fast-path.
+    if [ -n "$REQ_HASH" ]; then
+        echo "$REQ_HASH" > "$PROVISION_MARKER"
+        log "Wrote provision marker: $PROVISION_MARKER"
+    fi
+fi
 
 # -----------------------------------------------------------------------------
 # 4. Optional InsightFace pre-download (gated by env var so the dispatch
