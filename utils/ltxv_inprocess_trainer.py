@@ -282,6 +282,9 @@ class InProcessTrainer:
             logger.info("Setting up layer offloading (blocks stream CPU↔GPU one at a time)...")
             self._transformer.train()
             setup_layer_offloading(self._transformer, device)
+            print(f"DEBUG: ep params={sum(1 for _ in self._embeddings_processor.parameters())}, "
+                f"on_meta={sum(1 for p in self._embeddings_processor.parameters() if str(p.device)=='meta')}, "
+                f"first_meta_name={next((n for n,p in self._embeddings_processor.named_parameters() if str(p.device)=='meta'), None)}")
             self._embeddings_processor.to(device)
             self._embeddings_processor.eval()
         else:
