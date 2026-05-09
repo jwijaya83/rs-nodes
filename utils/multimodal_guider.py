@@ -1223,12 +1223,25 @@ class ICLoRAGuider(MultimodalGuider):
         self._apply_model_sampling(latent_image)
 
         # Distilled mode: when cfg=1.0, use official sigma schedule + distilled LoRA
-        # (unless custom sigmas were provided via RSSigmaScheduler)
+        # (unless custom sigmas were provided via the SIGMAS input on the
+        # generate node — RSHDRSigmas, RSSigmaScheduler, or any other
+        # SIGMAS-emitting node).
         is_distilled = self.video_cfg == 1.0
         if is_distilled:
             base_sigmas = torch.tensor(self.DISTILLED_SIGMAS, dtype=torch.float32)
-            # Check if external sigmas were provided (different from generate node's default)
-            custom_sigmas = not torch.equal(sigmas, base_sigmas) and sigmas[0] == 1.0 and sigmas[-1] == 0.0
+            # Honor the explicit "user wired sigmas" flag set by RSLTXVGenerate.
+            # Falls back to value-difference detection for older callers that
+            # don't set the flag.
+            user_flag = getattr(self, '_user_provided_sigmas', None)
+            if user_flag is True:
+                custom_sigmas = True
+            elif user_flag is False:
+                custom_sigmas = False
+            else:
+                custom_sigmas = (
+                    not torch.equal(sigmas, base_sigmas)
+                    and sigmas[0] == 1.0 and sigmas[-1] == 0.0
+                )
             if custom_sigmas:
                 logger.info(f"Distilled mode: using custom sigmas ({len(sigmas)-1} steps)")
             else:
