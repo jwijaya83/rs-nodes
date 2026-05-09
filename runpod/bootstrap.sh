@@ -239,30 +239,44 @@ for key in $RS_NODE_PACKS; do
 done
 
 # -----------------------------------------------------------------------------
-# Phase 4 — Model weights from HuggingFace
+# Phase 4 — Model weights from HuggingFace via hf-transfer
 # Default manifest: Koi_NoPeople IC-LoRA workflow (~57 GB total, bf16 dev).
+#
+# hf-transfer is HuggingFace's Rust-based parallel downloader — 50-150x
+# faster than single-connection wget on long-haul routes (US<->EU was
+# observed at 3 MB/s with wget vs 200-500 MB/s with hf-transfer).
 # -----------------------------------------------------------------------------
-banner "Phase 4/7  Model weights from HuggingFace"
+banner "Phase 4/7  Model weights from HuggingFace (hf-transfer)"
 
-WGET_AUTH=()
-if [ -n "${HF_TOKEN:-}" ]; then
-    log "HF_TOKEN set; using authenticated requests"
-    WGET_AUTH=(--header="Authorization: Bearer ${HF_TOKEN}")
-else
+# Ensure hf-transfer is available; install if missing
+if ! python -c "import hf_transfer" 2>/dev/null; then
+    log "Installing hf-transfer + huggingface_hub..."
+    pip install --no-cache-dir -U "huggingface_hub[hf_transfer]" || \
+        log "WARN: hf-transfer install failed; will fall back to wget"
+fi
+
+# Enable parallel-connection downloads
+export HF_HUB_ENABLE_HF_TRANSFER=1
+HAVE_HF=$(command -v hf >/dev/null 2>&1 && echo 1 || echo 0)
+
+if [ -z "${HF_TOKEN:-}" ]; then
     log "No HF_TOKEN — proceeding unauthenticated (rate-limited; ungated repos only)"
 fi
 
+# Manifest format: <subdir>|<filename>|<repo_id>|<repo_path>
+# Splitting URL into (repo_id, repo_path) so we can use `hf download`
+# directly without parsing the resolve URL.
 MODELS=(
-    "checkpoints|ltx-2.3-22b-dev-fp8.safetensors|https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors"
-    "text_encoders|gemma_3_12B_it_fp4_mixed.safetensors|https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
-    "latent_upscale_models|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-    "loras|ltx-2.3-22b-distilled-lora-384-1.1.safetensors|https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
-    "loras|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors|https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control/resolve/main/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
+    "checkpoints|ltx-2.3-22b-dev-fp8.safetensors|Lightricks/LTX-2.3-fp8|ltx-2.3-22b-dev-fp8.safetensors"
+    "text_encoders|gemma_3_12B_it_fp4_mixed.safetensors|Comfy-Org/ltx-2|split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
+    "latent_upscale_models|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|Lightricks/LTX-2.3|ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+    "loras|ltx-2.3-22b-distilled-lora-384-1.1.safetensors|Lightricks/LTX-2.3|ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+    "loras|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
 )
 
 mkdir -p "$MODELS_ROOT"
 for entry in "${MODELS[@]}"; do
-    IFS='|' read -r subdir name url <<< "$entry"
+    IFS='|' read -r subdir name repo_id repo_path <<< "$entry"
     dir="$MODELS_ROOT/$subdir"
     file="$dir/$name"
     mkdir -p "$dir"
@@ -270,13 +284,36 @@ for entry in "${MODELS[@]}"; do
         log "[ok]    $subdir/$name ($(stat -c%s "$file") bytes)"
         continue
     fi
-    log "[fetch] $subdir/$name"
-    wget -c --tries=3 --no-verbose --show-progress \
-        "${WGET_AUTH[@]}" -O "$file" "$url" || {
-            log "  ERROR: download failed for $name"
-            rm -f "$file"
+    log "[fetch] $subdir/$name (repo=$repo_id)"
+    if [ "$HAVE_HF" = "1" ]; then
+        # hf download writes into a layout cache by default; use --local-dir
+        # to drop the file directly at the target path. The CLI puts files
+        # under <local-dir>/<repo_path>, so we download into a temp staging
+        # dir then move the file to its final flat location.
+        staging=$(mktemp -d -p /workspace 2>/dev/null || mktemp -d)
+        if hf download "$repo_id" "$repo_path" \
+                --local-dir "$staging" \
+                ${HF_TOKEN:+--token "$HF_TOKEN"} 2>&1 | sed 's/^/    /'; then
+            mv -f "$staging/$repo_path" "$file" 2>/dev/null || \
+                cp -f "$staging/$repo_path" "$file"
+            rm -rf "$staging"
+            log "  done: $(stat -c%s "$file") bytes"
+        else
+            log "  ERROR: hf download failed for $name"
+            rm -rf "$staging" "$file"
             continue
-        }
+        fi
+    else
+        # Fallback: wget (single-connection, slow on long-haul)
+        url="https://huggingface.co/${repo_id}/resolve/main/${repo_path}"
+        wget -c --tries=3 --no-verbose --show-progress \
+            ${HF_TOKEN:+--header="Authorization: Bearer ${HF_TOKEN}"} \
+            -O "$file" "$url" || {
+                log "  ERROR: wget download failed for $name"
+                rm -f "$file"
+                continue
+            }
+    fi
 done
 
 # -----------------------------------------------------------------------------
