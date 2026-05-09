@@ -20,6 +20,7 @@ from .nodes.frame_collector import RSFrameCollector
 from .nodes.ltxv_prepare_dataset import RSLTXVPrepareDataset
 from .nodes.ltxv_train_lora import RSLTXVTrainLoRA
 from .nodes.sigma_scheduler import RSSigmaScheduler
+from .nodes.hdr_sigmas import RSHDRSigmas
 from .nodes.video_save import RSVideoSave
 from .nodes.exr_sequence_save import RSEXRSequenceSave
 from .nodes.logc3_decode import RSLogC3Decode
@@ -52,6 +53,7 @@ NODE_CLASS_MAPPINGS = {
     "RSLTXVPrepareDataset": RSLTXVPrepareDataset,
     "RSLTXVTrainLoRA": RSLTXVTrainLoRA,
     "RSSigmaScheduler": RSSigmaScheduler,
+    "RSHDRSigmas": RSHDRSigmas,
     "RSVideoSave": RSVideoSave,
     "RSEXRSequenceSave": RSEXRSequenceSave,
     "RSLogC3Decode": RSLogC3Decode,
@@ -83,6 +85,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSLTXVPrepareDataset": "RS LTXV Prepare Dataset",
     "RSLTXVTrainLoRA": "RS LTXV Train LoRA",
     "RSSigmaScheduler": "RS Sigma Scheduler",
+    "RSHDRSigmas": "RS HDR Sigmas",
     "RSVideoSave": "RS Video Save (ProRes)",
     "RSEXRSequenceSave": "RS EXR Sequence Save",
     "RSLogC3Decode": "RS LogC3 HDR Decode",
