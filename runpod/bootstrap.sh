@@ -273,6 +273,12 @@ fi
 # Manifest format: <subdir>|<filename>|<repo_id>|<repo_path>
 # Splitting URL into (repo_id, repo_path) so we can use `hf download`
 # directly without parsing the resolve URL.
+#
+# Both fp8 (29 GB) and bf16 (44 GB) checkpoints download by default.
+# fp8 hits the Blackwell hardware fp8 path for speed; bf16 is the
+# full-precision dev model for quality work. Total LTX checkpoints:
+# ~73 GB. Pods with smaller volumes can drop bf16 by setting
+# RS_LTX_BF16=0.
 MODELS=(
     "checkpoints|ltx-2.3-22b-dev-fp8.safetensors|Lightricks/LTX-2.3-fp8|ltx-2.3-22b-dev-fp8.safetensors"
     "text_encoders|gemma_3_12B_it_fp4_mixed.safetensors|Comfy-Org/ltx-2|split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
@@ -280,6 +286,9 @@ MODELS=(
     "loras|ltx-2.3-22b-distilled-lora-384-1.1.safetensors|Lightricks/LTX-2.3|ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
     "loras|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
 )
+if [ "${RS_LTX_BF16:-1}" = "1" ]; then
+    MODELS+=("checkpoints|ltx-2.3-22b-dev.safetensors|Lightricks/LTX-2.3|ltx-2.3-22b-dev.safetensors")
+fi
 
 mkdir -p "$MODELS_ROOT"
 for entry in "${MODELS[@]}"; do
