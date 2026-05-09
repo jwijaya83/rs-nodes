@@ -171,6 +171,33 @@ source "$VENV/bin/activate"
 log "Python: $(which python)  ($(python --version 2>&1))"
 log "Pip:    $(which pip)"
 
+PYSITE="$VENV/lib/python3.12/site-packages"
+
+# -----------------------------------------------------------------------------
+# 2.7. Self-healing checks — run on EVERY boot regardless of fast path.
+#      These catch corruption from partial pip installs (SSH drop / OOM mid-
+#      install) and version drift from older bootstraps. Cheap if everything
+#      is already correct (pip says "already satisfied" in <2s).
+# -----------------------------------------------------------------------------
+
+# Numpy metadata heal: a partial pip install can leave a numpy-X.Y.dist-info
+# directory with malformed METADATA, so importlib.metadata.version("numpy")
+# returns None, which then breaks transformers' dependency check at import.
+# Detect + force-reinstall if broken.
+if ! python -c "from importlib.metadata import version; v = version('numpy'); assert v and v != 'None'" 2>/dev/null; then
+    log "numpy metadata broken or missing — force-reinstalling..."
+    rm -rf "$PYSITE"/numpy-*.dist-info 2>/dev/null || true
+    pip install --no-cache-dir --force-reinstall numpy || \
+        log "WARN: numpy reinstall failed"
+fi
+
+# huggingface_hub version pin: transformers 4.57+ declares hub<1.0 as a
+# strict requirement. Older bootstrap revs installed hf-transfer with
+# `pip -U huggingface_hub[hf_transfer]` which pulled 1.x and broke
+# transformers. Idempotent — pip says "Requirement already satisfied"
+# in ~1s if version is already correct.
+pip install --no-cache-dir "huggingface_hub[hf_transfer]<1.0,>=0.34" 2>&1 | tail -3
+
 # -----------------------------------------------------------------------------
 # 3. Python deps — fast path on warm boots.
 #

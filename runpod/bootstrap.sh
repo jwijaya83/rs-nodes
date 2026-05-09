@@ -166,18 +166,34 @@ fi
 source "$VENV/bin/activate"
 log "venv active: $(which python) ($(python --version 2>&1))"
 
-pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || \
-    log "WARN: ComfyUI deps install failed"
-[ -f "$RS_NODES_DIR/requirements.txt" ] && \
-    pip install --no-cache-dir -r "$RS_NODES_DIR/requirements.txt" || \
-    log "WARN: rs-nodes deps install failed"
-pip install --no-cache-dir rose-opt || log "WARN: ROSE install failed"
+# Defensive cleanup: cu130 torch upgrade and other --upgrade pip operations
+# can leave numpy's .dist-info in a corrupt state where importlib.metadata
+# can't read the version (`found=None`), which then breaks transformers
+# import at ComfyUI startup. Wipe stale/broken numpy metadata so pip
+# resolves cleanly into a fresh install.
+PYSITE="$VENV/lib/python3.12/site-packages"
+if compgen -G "$PYSITE/numpy-*.dist-info" > /dev/null 2>&1; then
+    log "Clearing existing numpy dist-info entries (defensive)..."
+    rm -rf "$PYSITE"/numpy-*.dist-info
+fi
 
-# Blackwell perf stack: cu130 PyTorch (engages hardware fp8 paths +
-# comfy-kitchen's cuda/triton backends) + SageAttention (faster attn).
+# Install order matters. Pip processes each `install` independently;
+# later --upgrade calls can clobber earlier-resolved versions. We
+# install in this order:
+#   1. Framework: torch cu130 + NVIDIA + SageAttention (defines
+#      tensor/CUDA stack)
+#   2. Hub pin: huggingface_hub[hf_transfer] <1.0,>=0.34 (locks the
+#      hub version that transformers 4.57+ requires)
+#   3. App requirements LAST: ComfyUI + rs-nodes + rose-opt — these
+#      transitively bring in transformers and friends; by being last,
+#      they see hub already pinned and pip resolves transformers to a
+#      version compatible with the pinned hub.
+
+# 1. Framework
 log "Upgrading PyTorch to cu130 wheels..."
 pip install --upgrade --no-cache-dir --index-url https://download.pytorch.org/whl/cu130 \
     torch torchvision torchaudio || log "WARN: cu130 upgrade failed"
+
 log "Ensuring NVIDIA CUDA runtime libraries (NVRTC + cuDNN + cuBLAS)..."
 pip install --no-cache-dir \
     nvidia-cuda-nvrtc nvidia-cuda-runtime \
@@ -199,10 +215,44 @@ fi
 log "Installing SageAttention..."
 pip install --no-cache-dir sageattention || log "WARN: SageAttention install failed"
 
-# Write the provision hash marker so the FIRST startup.sh boot after
-# bootstrap can fast-path past pip install. Without this marker
-# startup.sh would re-validate every pip dep on the next container
-# restart (slow, even if all "Already satisfied").
+# 2. hf-transfer + huggingface_hub pin (BEFORE app requirements)
+log "Installing hf-transfer + huggingface_hub (pinned <1.0)..."
+pip install --no-cache-dir "huggingface_hub[hf_transfer]<1.0,>=0.34" || \
+    log "WARN: hf-transfer install failed"
+
+# 3. App requirements LAST — see comment above for rationale.
+log "Installing ComfyUI Python deps..."
+pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || \
+    log "WARN: ComfyUI deps install failed"
+log "Installing rs-nodes Python deps..."
+[ -f "$RS_NODES_DIR/requirements.txt" ] && \
+    pip install --no-cache-dir -r "$RS_NODES_DIR/requirements.txt" || \
+    log "WARN: rs-nodes deps install failed"
+log "Installing ROSE optimizer..."
+pip install --no-cache-dir rose-opt || log "WARN: ROSE install failed"
+
+# 4. Verification — every critical Python import must succeed before
+# we declare bootstrap "done". If any fail, bootstrap exits non-zero
+# and the marker files are NOT written. Container Start Command will
+# re-run bootstrap on next boot, which is the right behavior — better
+# than silently launching ComfyUI into a crash loop 30 minutes later.
+log "Verifying core Python deps (numpy / torch / transformers / sageattention)..."
+python - <<'PY' || { log "ERROR: Python dep verification failed. Bootstrap aborted; markers not written."; exit 1; }
+import importlib, sys
+ok = True
+for mod in ["numpy", "torch", "torchvision", "transformers", "sageattention", "huggingface_hub"]:
+    try:
+        m = importlib.import_module(mod)
+        print(f"  OK   {mod} {getattr(m, '__version__', '?')}")
+    except Exception as e:
+        print(f"  FAIL {mod}: {type(e).__name__}: {e}", file=sys.stderr)
+        ok = False
+sys.exit(0 if ok else 1)
+PY
+log "All core deps verified."
+
+# Write provision hash marker AFTER verification passes. Future startup.sh
+# boots fast-path past pip when this marker matches the current hash.
 PROVISION_MARKER="$WORKSPACE/.provision_hash"
 PROV_HASH=$(cat "$COMFY_DIR/requirements.txt" "$RS_NODES_DIR/requirements.txt" 2>/dev/null | sha256sum | cut -d' ' -f1)
 if [ -n "$PROV_HASH" ]; then
@@ -258,11 +308,15 @@ done
 # -----------------------------------------------------------------------------
 banner "Phase 4/7  Model weights from HuggingFace (hf-transfer)"
 
-# Ensure hf-transfer is available; install if missing
+# Ensure hf-transfer is available; install if missing.
+# Pin huggingface_hub<1.0 because transformers (~4.57.x) declares
+# huggingface-hub<1.0 as a strict requirement and refuses to import
+# with hub 1.x present. hf_transfer support exists in both 0.x and
+# 1.x, so 0.x keeps everyone happy.
 if ! python -c "import hf_transfer" 2>/dev/null; then
-    log "Installing hf-transfer + huggingface_hub..."
-    pip install --no-cache-dir -U "huggingface_hub[hf_transfer]" || \
-        log "WARN: hf-transfer install failed; will fall back to wget"
+    log "Installing hf-transfer + huggingface_hub (pinned <1.0)..."
+    pip install --no-cache-dir "huggingface_hub[hf_transfer]<1.0,>=0.34" || \
+        log "WARN: hf-transfer install failed; will fall back to curl"
 fi
 
 # Enable parallel-connection downloads
