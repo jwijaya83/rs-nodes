@@ -341,37 +341,26 @@ class RSLTXVTrainLoRA:
         # ---- Step 2: load EmbeddingsProcessor from checkpoint ----
         logger.info("Loading EmbeddingsProcessor from checkpoint...")
 
-        # === TEMP DEBUG: confirm what loader code + metadata are reaching us ===
-        import json as _json
-        import os as _os
+        # Sanity check: the EmbeddingsProcessor configurator reads its layer
+        # count + dims from the safetensors `config.transformer` section. If
+        # the user accidentally points `model_path` at an audio VAE / vocoder
+        # / VAE-only checkpoint, that section is missing, the model gets
+        # built with defaults (V1 19B-style 2-block), no state-dict keys
+        # match, and every param stays on the meta device — surfacing later
+        # as a confusing "Cannot copy out of meta tensor" at `.to(device)`.
+        # Catch it here with a clear error.
         from safetensors import safe_open as _safe_open
-        import ltx_core, ltx_trainer, safetensors as _st
-        from ltx_core.text_encoders.gemma import embeddings_connector as _ec
-        from ltx_core.text_encoders.gemma.encoders import encoder_configurator as _confg
-        from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader as _Sfl
-        logger.info(f"[DEBUG] model_full_path = {model_full_path}")
-        logger.info(f"[DEBUG] file size MB = {_os.path.getsize(model_full_path) / (1024*1024):.1f}")
-        logger.info(f"[DEBUG] safetensors version = {_st.__version__}")
-        logger.info(f"[DEBUG] ltx_core from: {ltx_core.__file__}")
-        logger.info(f"[DEBUG] ltx_trainer from: {ltx_trainer.__file__}")
-        logger.info(f"[DEBUG] embeddings_connector from: {_ec.__file__}")
-        logger.info(f"[DEBUG] encoder_configurator from: {_confg.__file__}")
+        import json as _json
         with _safe_open(model_full_path, framework="pt", device="cpu") as _f:
-            _meta = _f.metadata()
-        logger.info(f"[DEBUG] safetensors metadata keys: {list(_meta.keys()) if _meta else 'NONE'}")
-        if _meta and "config" in _meta:
-            _cfg = _json.loads(_meta["config"])
-            _t = _cfg.get("transformer", {})
-            logger.info(f"[DEBUG] transformer keys count: {len(_t)}")
-            for _k in ("connector_num_layers", "connector_num_attention_heads",
-                       "connector_attention_head_dim", "audio_connector_num_attention_heads",
-                       "caption_proj_before_connector", "connector_apply_gated_attention"):
-                logger.info(f"[DEBUG]   transformer[{_k}] = {_t.get(_k, '<MISSING>')}")
-        # also: what does the SDLoader's metadata() return?
-        _via_loader = _Sfl().metadata(model_full_path)
-        logger.info(f"[DEBUG] SDLoader.metadata() top keys: {list(_via_loader.keys()) if _via_loader else 'EMPTY'}")
-        logger.info(f"[DEBUG] SDLoader.metadata().transformer count: {len(_via_loader.get('transformer', {})) if _via_loader else 0}")
-        # === END TEMP DEBUG ===
+            _meta = _f.metadata() or {}
+        _cfg = _json.loads(_meta["config"]) if "config" in _meta else {}
+        if not _cfg.get("transformer"):
+            raise ValueError(
+                f"`model_path` points at '{Path(model_full_path).name}', which has no "
+                f"transformer config in its safetensors metadata. This is likely a VAE / "
+                f"audio_vae / vocoder checkpoint, not a full LTX-2 model. Pick a checkpoint "
+                f"like ltx-2-19b-dev.safetensors or ltx-2.3-22b-dev-fp8.safetensors."
+            )
 
         from ltx_trainer.model_loader import load_embeddings_processor
         embeddings_processor = load_embeddings_processor(
