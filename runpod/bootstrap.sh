@@ -259,7 +259,14 @@ fi
 export HF_HUB_ENABLE_HF_TRANSFER=1
 HAVE_HF=$(command -v hf >/dev/null 2>&1 && echo 1 || echo 0)
 
-if [ -z "${HF_TOKEN:-}" ]; then
+# Pass HF_TOKEN to child processes via environment, NEVER via CLI args.
+# CLI args (--token, --header=Bearer ...) appear in `ps -ef` and are
+# visible to anyone with read access to /proc, including process listings
+# captured in screenshots, logs, or chat transcripts. The hf CLI reads
+# HF_TOKEN from the environment by default, and so does huggingface_hub.
+if [ -n "${HF_TOKEN:-}" ]; then
+    export HF_TOKEN
+else
     log "No HF_TOKEN — proceeding unauthenticated (rate-limited; ungated repos only)"
 fi
 
@@ -292,10 +299,10 @@ for entry in "${MODELS[@]}"; do
         # dir then move the file to its final flat location.
         # No `| sed` pipe — hf-transfer's progress bar uses carriage returns
         # which a pipe would block-buffer until completion. Stream direct.
+        # No --token — hf reads HF_TOKEN from the environment (exported above).
         staging=$(mktemp -d -p /workspace 2>/dev/null || mktemp -d)
         if hf download "$repo_id" "$repo_path" \
-                --local-dir "$staging" \
-                ${HF_TOKEN:+--token "$HF_TOKEN"}; then
+                --local-dir "$staging"; then
             mv -f "$staging/$repo_path" "$file" 2>/dev/null || \
                 cp -f "$staging/$repo_path" "$file"
             rm -rf "$staging"
@@ -306,15 +313,27 @@ for entry in "${MODELS[@]}"; do
             continue
         fi
     else
-        # Fallback: wget (single-connection, slow on long-haul)
+        # Fallback: curl with header in a 0600 temp file. Avoids the token
+        # appearing in `ps` (which `wget --header="Authorization: Bearer X"`
+        # would do). curl's `-H @file` reads the header from a file path.
         url="https://huggingface.co/${repo_id}/resolve/main/${repo_path}"
-        wget -c --tries=3 --no-verbose --show-progress \
-            ${HF_TOKEN:+--header="Authorization: Bearer ${HF_TOKEN}"} \
-            -O "$file" "$url" || {
-                log "  ERROR: wget download failed for $name"
-                rm -f "$file"
-                continue
-            }
+        hdrfile=""
+        curl_auth=()
+        if [ -n "${HF_TOKEN:-}" ]; then
+            hdrfile=$(mktemp)
+            chmod 600 "$hdrfile"
+            printf 'Authorization: Bearer %s\n' "$HF_TOKEN" > "$hdrfile"
+            curl_auth=(-H "@$hdrfile")
+        fi
+        if curl -L --fail --retry 3 -C - --progress-bar \
+                "${curl_auth[@]}" \
+                -o "$file" "$url"; then
+            log "  done: $(stat -c%s "$file") bytes"
+        else
+            log "  ERROR: curl download failed for $name"
+            rm -f "$file"
+        fi
+        [ -n "$hdrfile" ] && rm -f "$hdrfile"
     fi
 done
 
