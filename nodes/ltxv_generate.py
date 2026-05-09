@@ -697,7 +697,11 @@ class RSLTXVGenerate:
         model_sampling_obj.set_parameters(shift=shift)
         m.add_object_patch("model_sampling", model_sampling_obj)
 
-        # Build sigmas if not provided
+        # Build sigmas if not provided. Track whether the user explicitly
+        # connected an external SIGMAS input — even if the values happen
+        # to match the guider's distilled-mode default, the guider should
+        # honor the user's explicit choice and skip its internal override.
+        user_provided_sigmas = sigmas is not None
         if sigmas is None:
             # Use float64 to avoid precision loss at high shift values
             # (shift > ~20 causes exp(shift) to swallow small terms in float32)
@@ -714,6 +718,11 @@ class RSLTXVGenerate:
             scale_factor = one_minus_z[-1] / (1.0 - 0.1)
             sig[non_zero_mask] = 1.0 - (one_minus_z / scale_factor)
             sigmas = sig.float()  # back to float32 for sampler
+        if guider is not None:
+            try:
+                guider._user_provided_sigmas = user_provided_sigmas
+            except Exception:
+                pass
 
         # Build sampler if not provided
         if sampler is None:
