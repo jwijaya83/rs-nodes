@@ -340,6 +340,39 @@ class RSLTXVTrainLoRA:
 
         # ---- Step 2: load EmbeddingsProcessor from checkpoint ----
         logger.info("Loading EmbeddingsProcessor from checkpoint...")
+
+        # === TEMP DEBUG: confirm what loader code + metadata are reaching us ===
+        import json as _json
+        import os as _os
+        from safetensors import safe_open as _safe_open
+        import ltx_core, ltx_trainer, safetensors as _st
+        from ltx_core.text_encoders.gemma import embeddings_connector as _ec
+        from ltx_core.text_encoders.gemma.encoders import encoder_configurator as _confg
+        from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader as _Sfl
+        logger.info(f"[DEBUG] model_full_path = {model_full_path}")
+        logger.info(f"[DEBUG] file size MB = {_os.path.getsize(model_full_path) / (1024*1024):.1f}")
+        logger.info(f"[DEBUG] safetensors version = {_st.__version__}")
+        logger.info(f"[DEBUG] ltx_core from: {ltx_core.__file__}")
+        logger.info(f"[DEBUG] ltx_trainer from: {ltx_trainer.__file__}")
+        logger.info(f"[DEBUG] embeddings_connector from: {_ec.__file__}")
+        logger.info(f"[DEBUG] encoder_configurator from: {_confg.__file__}")
+        with _safe_open(model_full_path, framework="pt", device="cpu") as _f:
+            _meta = _f.metadata()
+        logger.info(f"[DEBUG] safetensors metadata keys: {list(_meta.keys()) if _meta else 'NONE'}")
+        if _meta and "config" in _meta:
+            _cfg = _json.loads(_meta["config"])
+            _t = _cfg.get("transformer", {})
+            logger.info(f"[DEBUG] transformer keys count: {len(_t)}")
+            for _k in ("connector_num_layers", "connector_num_attention_heads",
+                       "connector_attention_head_dim", "audio_connector_num_attention_heads",
+                       "caption_proj_before_connector", "connector_apply_gated_attention"):
+                logger.info(f"[DEBUG]   transformer[{_k}] = {_t.get(_k, '<MISSING>')}")
+        # also: what does the SDLoader's metadata() return?
+        _via_loader = _Sfl().metadata(model_full_path)
+        logger.info(f"[DEBUG] SDLoader.metadata() top keys: {list(_via_loader.keys()) if _via_loader else 'EMPTY'}")
+        logger.info(f"[DEBUG] SDLoader.metadata().transformer count: {len(_via_loader.get('transformer', {})) if _via_loader else 0}")
+        # === END TEMP DEBUG ===
+
         from ltx_trainer.model_loader import load_embeddings_processor
         embeddings_processor = load_embeddings_processor(
             checkpoint_path=model_full_path,
