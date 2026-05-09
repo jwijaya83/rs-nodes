@@ -290,10 +290,12 @@ for entry in "${MODELS[@]}"; do
         # to drop the file directly at the target path. The CLI puts files
         # under <local-dir>/<repo_path>, so we download into a temp staging
         # dir then move the file to its final flat location.
+        # No `| sed` pipe — hf-transfer's progress bar uses carriage returns
+        # which a pipe would block-buffer until completion. Stream direct.
         staging=$(mktemp -d -p /workspace 2>/dev/null || mktemp -d)
         if hf download "$repo_id" "$repo_path" \
                 --local-dir "$staging" \
-                ${HF_TOKEN:+--token "$HF_TOKEN"} 2>&1 | sed 's/^/    /'; then
+                ${HF_TOKEN:+--token "$HF_TOKEN"}; then
             mv -f "$staging/$repo_path" "$file" 2>/dev/null || \
                 cp -f "$staging/$repo_path" "$file"
             rm -rf "$staging"
