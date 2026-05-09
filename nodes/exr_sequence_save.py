@@ -29,7 +29,20 @@ class RSEXRSequenceSave:
                 "audio": ("AUDIO", {"tooltip": "Passed through — EXR sequences don't contain audio, but this lets a ProRes/MP4 saver downstream still receive it."}),
                 "index": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1,
                                   "tooltip": "Directory index suffix. 0 = auto-increment (same pattern as the ProRes save node)."}),
-                "output_dir": ("STRING", {"default": "", "tooltip": "Subdirectory under ComfyUI output. Empty = output root. The image sequence goes into a new subdirectory below this."}),
+                "output_dir": ("STRING", {"default": "", "tooltip":
+                    "When runpod is OFF: subdirectory under ComfyUI output (the EXR sequence "
+                    "goes into a new subdirectory below this). When runpod is ON: absolute LOCAL "
+                    "path on your home machine where the pull tool will deposit the sequence "
+                    "directory (e.g. E:\\Comfy\\Source\\Project\\renders\\cut01)."}),
+                "runpod": ("BOOLEAN", {"default": False, "tooltip":
+                    "Stage this sequence for later pull from a RunPod pod. EXR frames are written "
+                    "to <output>/runpod_pending/<run_id>/<seqname>/ on the pod with a manifest, "
+                    "and a separate local-side pull tool moves the whole directory to `output_dir`. "
+                    "Off = save directly to output_dir as today."}),
+                "pull_server_url": ("STRING", {"default": "http://localhost:8765/pull", "tooltip":
+                    "Only used when runpod is ON. URL of the local pull server (reached on the "
+                    "pod via SSH reverse tunnel). Empty = skip the auto-pull; you'd run a manual "
+                    "pull from the manifests later."}),
                 "bit_depth": (["16", "32"], {"default": "16",
                                               "tooltip": "EXR float precision. 16 = half-float (smaller files, plenty of range for display / grading). 32 = full float (max precision, ~2x file size)."}),
                 "compression": (["zip", "zips", "piz", "rle", "pxr24", "none"], {"default": "zip",
@@ -52,19 +65,35 @@ class RSEXRSequenceSave:
     def save_exr_sequence(self, images, filename_prefix,
                           audio=None, index=0, output_dir="",
                           bit_depth="16", compression="zip",
-                          frame_padding=6):
+                          frame_padding=6, runpod=False,
+                          pull_server_url="http://localhost:8765/pull"):
         import cv2
         import numpy as np
         import folder_paths
+        from ..utils import runpod_staging
 
         # OpenCV needs the OPENCV_IO_ENABLE_OPENEXR flag on some builds —
         # set it before writing in case the calling process hasn't.
         os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
-        # Resolve base output path.
-        base = folder_paths.get_output_directory()
-        if output_dir.strip():
-            base = os.path.join(base, output_dir.strip())
+        # Resolve base output path. runpod=True overrides to a per-run
+        # staging directory; the user-specified output_dir is captured
+        # in the manifest for the local-side pull tool.
+        staging_handle = None
+        if runpod:
+            target_dir = output_dir.strip()
+            if not target_dir:
+                raise ValueError(
+                    "RSEXRSequenceSave: runpod=True requires output_dir to be "
+                    "set to the local path where the pull tool should deposit "
+                    "the sequence."
+                )
+            staging_handle = runpod_staging.allocate(prefix_hint=filename_prefix)
+            base = staging_handle.staging_dir
+        else:
+            base = folder_paths.get_output_directory()
+            if output_dir.strip():
+                base = os.path.join(base, output_dir.strip())
         os.makedirs(base, exist_ok=True)
 
         # Split prefix into subdirectory + directory-name base so the same
@@ -157,5 +186,28 @@ class RSEXRSequenceSave:
             f"Saved EXR sequence ({wrote} frames, {bit_depth}-bit {compression}, "
             f"alpha={has_alpha}): {out_dir}"
         )
+
+        # Mark the staging dir ready for the local pull tool. Done LAST
+        # so a partially-written sequence can't be picked up.
+        if staging_handle is not None:
+            target_dir_str = output_dir.strip()
+            target_path = os.path.join(target_dir_str, os.path.basename(out_dir))
+            runpod_staging.write_manifest(
+                staging_handle,
+                target_path=target_path,
+                kind="directory",
+                saver="RSEXRSequenceSave",
+                extra={"frames": wrote, "bit_depth": bit_depth,
+                       "compression": compression},
+            )
+            # Best-effort callback so the local pull server scps the
+            # sequence home immediately. Failures are non-fatal — the
+            # manifest stays on the pod for a later manual pull.
+            runpod_staging.notify_pull(
+                staging_handle,
+                target_path=target_path,
+                kind="directory",
+                callback_url=pull_server_url,
+            )
 
         return (images, audio, out_dir)

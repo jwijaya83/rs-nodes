@@ -609,9 +609,29 @@ class RSLTXVGenerate:
         audio_is_input = has_audio and audio is not None  # True = user provided audio, pass through
         if has_audio:
             if audio is not None:
-                # Encode provided audio into latent space
+                # Encode provided audio into latent space.
+                # Match ComfyUI's canonical audio encode path
+                # (comfy_extras/nodes_audio.py::VAEEncodeAudio.execute):
+                # resample to the VAE's expected rate if needed, then pass a
+                # channels-LAST waveform tensor (NOT the AUDIO dict). The
+                # standard VAE wrapper's encode() does pixel-style cropping
+                # which crashes on a dict input ("'LazyAudioMap' object has
+                # no attribute 'shape'").
                 logger.info("Encoding input audio latents")
-                audio_samples = audio_vae.encode(audio)
+                sample_rate = int(audio["sample_rate"])
+                vae_sample_rate = int(getattr(audio_vae, "audio_sample_rate", 44100))
+                if vae_sample_rate != sample_rate:
+                    import torchaudio
+                    waveform = torchaudio.functional.resample(
+                        audio["waveform"], sample_rate, vae_sample_rate,
+                    )
+                else:
+                    waveform = audio["waveform"]
+                audio_samples = audio_vae.encode(waveform.movedim(1, -1))
+                # Tolerate either a tensor or a {"samples": Tensor} dict —
+                # different VAE wrapper versions return different things.
+                if isinstance(audio_samples, dict) and "samples" in audio_samples:
+                    audio_samples = audio_samples["samples"]
             else:
                 # Create empty audio latents — the AV model generates audio from scratch
                 logger.info("Creating empty audio latents for generation")
@@ -677,7 +697,11 @@ class RSLTXVGenerate:
         model_sampling_obj.set_parameters(shift=shift)
         m.add_object_patch("model_sampling", model_sampling_obj)
 
-        # Build sigmas if not provided
+        # Build sigmas if not provided. Track whether the user explicitly
+        # connected an external SIGMAS input — even if the values happen
+        # to match the guider's distilled-mode default, the guider should
+        # honor the user's explicit choice and skip its internal override.
+        user_provided_sigmas = sigmas is not None
         if sigmas is None:
             # Use float64 to avoid precision loss at high shift values
             # (shift > ~20 causes exp(shift) to swallow small terms in float32)
@@ -694,6 +718,11 @@ class RSLTXVGenerate:
             scale_factor = one_minus_z[-1] / (1.0 - 0.1)
             sig[non_zero_mask] = 1.0 - (one_minus_z / scale_factor)
             sigmas = sig.float()  # back to float32 for sampler
+        if guider is not None:
+            try:
+                guider._user_provided_sigmas = user_provided_sigmas
+            except Exception:
+                pass
 
         # Build sampler if not provided
         if sampler is None:

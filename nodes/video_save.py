@@ -31,7 +31,19 @@ class RSVideoSave:
                 "audio": ("AUDIO", {"tooltip": "Optional audio to mux into the .mov file."}),
                 "index": ("INT", {"default": 0, "min": 0, "max": 99999, "step": 1,
                                   "tooltip": "File index suffix. 0 = auto-increment."}),
-                "output_dir": ("STRING", {"default": "", "tooltip": "Subdirectory under ComfyUI output. Empty = output root."}),
+                "output_dir": ("STRING", {"default": "", "tooltip":
+                    "When runpod is OFF: subdirectory under ComfyUI output (empty = output root). "
+                    "When runpod is ON: absolute LOCAL path on your home machine where the pull "
+                    "tool will deposit this file (e.g. E:\\Comfy\\Source\\Project\\renders\\cut01)."}),
+                "runpod": ("BOOLEAN", {"default": False, "tooltip":
+                    "Stage this save for later pull from a RunPod pod. The file is written to "
+                    "<output>/runpod_pending/<run_id>/ on the pod with a manifest, and a separate "
+                    "local-side pull tool moves it to the path in `output_dir`. Off = save directly "
+                    "to output_dir as today."}),
+                "pull_server_url": ("STRING", {"default": "http://localhost:8765/pull", "tooltip":
+                    "Only used when runpod is ON. URL of the local pull server (reached on the "
+                    "pod via SSH reverse tunnel). Empty = skip the auto-pull; you'd run a manual "
+                    "pull from the manifests later."}),
             },
         }
 
@@ -56,14 +68,30 @@ class RSVideoSave:
     }
 
     def save_video(self, images, filename_prefix, fps, profile,
-                   audio=None, index=0, output_dir=""):
+                   audio=None, index=0, output_dir="", runpod=False,
+                   pull_server_url="http://localhost:8765/pull"):
         import av
         import folder_paths
+        from ..utils import runpod_staging
 
-        # Resolve output path
-        base = folder_paths.get_output_directory()
-        if output_dir.strip():
-            base = os.path.join(base, output_dir.strip())
+        # When runpod is on, the file is written to a per-run staging
+        # directory under <comfy_output>/runpod_pending/. The user's
+        # `output_dir` is captured in a manifest for the local-side
+        # pull tool to honor; the ComfyUI-side base ignores it.
+        staging_handle = None
+        if runpod:
+            target_dir = output_dir.strip()
+            if not target_dir:
+                raise ValueError(
+                    "RSVideoSave: runpod=True requires output_dir to be set "
+                    "to the local path where the pull tool should deposit the file."
+                )
+            staging_handle = runpod_staging.allocate(prefix_hint=filename_prefix)
+            base = staging_handle.staging_dir
+        else:
+            base = folder_paths.get_output_directory()
+            if output_dir.strip():
+                base = os.path.join(base, output_dir.strip())
         os.makedirs(base, exist_ok=True)
 
         # Build filename — split prefix into subdirectory + basename
@@ -158,5 +186,29 @@ class RSVideoSave:
 
         file_size_mb = os.path.getsize(out_path) / (1024 * 1024)
         logger.info(f"Saved ProRes {profile} ({num_frames} frames, {fps}fps): {out_path} ({file_size_mb:.1f} MB)")
+
+        # Mark the staging dir ready for the local pull tool. Done LAST
+        # so a crashed save doesn't tempt the puller to pick up a
+        # partial container.
+        if staging_handle is not None:
+            target_dir = output_dir.strip()
+            target_path = os.path.join(target_dir, os.path.basename(out_path))
+            runpod_staging.write_manifest(
+                staging_handle,
+                target_path=target_path,
+                kind="file",
+                saver="RSVideoSave",
+                extra={"profile": profile, "fps": fps, "frames": num_frames},
+            )
+            # Best-effort callback so the local pull server scps the
+            # file home immediately. Failures (no tunnel, server not
+            # running) are logged but the manifest is still on the pod
+            # for a later manual pull.
+            runpod_staging.notify_pull(
+                staging_handle,
+                target_path=target_path,
+                kind="file",
+                callback_url=pull_server_url,
+            )
 
         return (images, audio, out_path)
