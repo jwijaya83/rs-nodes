@@ -199,6 +199,17 @@ fi
 log "Installing SageAttention..."
 pip install --no-cache-dir sageattention || log "WARN: SageAttention install failed"
 
+# Write the provision hash marker so the FIRST startup.sh boot after
+# bootstrap can fast-path past pip install. Without this marker
+# startup.sh would re-validate every pip dep on the next container
+# restart (slow, even if all "Already satisfied").
+PROVISION_MARKER="$WORKSPACE/.provision_hash"
+PROV_HASH=$(cat "$COMFY_DIR/requirements.txt" "$RS_NODES_DIR/requirements.txt" 2>/dev/null | sha256sum | cut -d' ' -f1)
+if [ -n "$PROV_HASH" ]; then
+    echo "$PROV_HASH" > "$PROVISION_MARKER"
+    log "Wrote provision hash: $PROVISION_MARKER"
+fi
+
 # -----------------------------------------------------------------------------
 # Phase 3 — Extra custom-node packs (workflow-specific)
 # -----------------------------------------------------------------------------
