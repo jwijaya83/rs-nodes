@@ -369,6 +369,12 @@ du -sh "$MODELS_ROOT"/* 2>/dev/null | sed 's/^/    /' || true
 log "Disk usage on /workspace:"
 df -h /workspace | tail -1 | sed 's/^/    /'
 
+# Mark bootstrap complete so init.sh's fast path will pick startup.sh
+# on subsequent boots. Without this marker init.sh re-runs bootstrap.sh
+# (which is fine since it's idempotent, but slower than startup.sh).
+touch "$WORKSPACE/.bootstrap_done"
+log "Bootstrap complete marker written: $WORKSPACE/.bootstrap_done"
+
 # -----------------------------------------------------------------------------
 # Phase 7 — Launch ComfyUI
 # -----------------------------------------------------------------------------
