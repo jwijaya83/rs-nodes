@@ -21,10 +21,22 @@
 # Backward-compatible: rs-studio falls back to its local converter
 # when this endpoint isn't available (older rs-nodes on the pod).
 
+import os
+
 from aiohttp import web
 
 import server
 import nodes
+
+# Always log when widget walking is happening for diagnostic
+# purposes during the v3-IO debugging push. Once we've stabilised
+# we can gate this behind RS_UITOAPI_DEBUG=1 again.
+_DEBUG = True
+
+# Bumped whenever the conversion logic changes — printed on import so
+# the operator can confirm which version Comfy actually loaded.
+_VERSION = "2"
+print(f"[rs/uitoapi] version {_VERSION} loaded (debug={_DEBUG})")
 
 
 # Frontend-only nodes that have no class_type and shouldn't appear
@@ -172,6 +184,7 @@ def _convert_node(node, link_by_dest, warnings):
         inp for inp in workflow_inputs if inp.get("widget") is not None
     ]
     widget_order = []  # list of (name, is_promoted)
+    widget_source = "tagged_widgets"
     if tagged_widgets:
         for inp in tagged_widgets:
             name = inp.get("name") or (inp.get("widget") or {}).get("name")
@@ -180,8 +193,10 @@ def _convert_node(node, link_by_dest, warnings):
             widget_order.append((name, inp.get("link") is not None))
     else:
         # Legacy fallback: derive widget order from INPUT_TYPES.
+        widget_source = "input_types_fallback"
         canonical = _canonical_input_order(node_class) if node_class else None
         if canonical is None:
+            widget_source = "input_types_missing_walked_workflow_inputs"
             # No class registered AND no widget tags — derive from
             # widget-typed entries in workflow_inputs as a last resort.
             canonical = []
@@ -202,6 +217,15 @@ def _convert_node(node, link_by_dest, warnings):
             if not _is_widget_type(declared_type):
                 continue
             widget_order.append((name, promoted.get(name, False)))
+
+    if _DEBUG:
+        print(
+            f"[rs/uitoapi] node {node_id} ({node_type}) "
+            f"widget_source={widget_source} "
+            f"widgets_values={widgets_values} "
+            f"widget_order={widget_order} "
+            f"workflow_inputs={[{'name': i.get('name'), 'type': i.get('type'), 'widget': i.get('widget'), 'link': i.get('link')} for i in workflow_inputs]}"
+        )
 
     # ----- 3. Walk widget_order against widgets_values -----
     # Widgets promoted to inputs (link != None) still occupy a slot
