@@ -20,18 +20,32 @@ set -e
 
 WORKSPACE=/workspace
 BOOTSTRAP_URL="https://raw.githubusercontent.com/richservo/rs-nodes/master/runpod/bootstrap.sh"
+DONE_MARKER="$WORKSPACE/.bootstrap_done"
 
 mkdir -p "$WORKSPACE"
 
-# Subsequent-boot fast path: startup.sh exists on the volume already
-# (mirrored there by an earlier bootstrap.sh run).
-if [ -x "$WORKSPACE/startup.sh" ] && [ -d "$WORKSPACE/ComfyUI/custom_nodes/rs-nodes" ]; then
-    echo "[init] /workspace/startup.sh present — running it"
+# Subsequent-boot fast path: bootstrap fully completed at least once
+# (marker written by bootstrap.sh at the end of Phase 6).
+#
+# We require the marker rather than just file-existence checks: a
+# partial bootstrap interrupted mid-run (e.g. user edited pod config
+# and triggered a silent reboot) leaves startup.sh and the rs-nodes
+# clone in place but skips Phase 4 (model weights). The marker tells
+# us provisioning actually finished, so it's safe to take the fast
+# path.
+if [ -f "$DONE_MARKER" ] && [ -x "$WORKSPACE/startup.sh" ]; then
+    echo "[init] $DONE_MARKER present — running startup.sh (fast path)"
     exec bash "$WORKSPACE/startup.sh"
 fi
 
-# First-boot path: fetch and exec bootstrap.sh.
-echo "[init] First boot detected — fetching bootstrap.sh"
+# First-boot OR incomplete-bootstrap path: fetch and exec bootstrap.sh.
+# bootstrap.sh is idempotent; re-running on a partial volume picks up
+# from where the last run was killed.
+if [ -x "$WORKSPACE/startup.sh" ]; then
+    echo "[init] startup.sh present but bootstrap marker missing — re-running bootstrap.sh"
+else
+    echo "[init] First boot detected — fetching bootstrap.sh"
+fi
 curl -fsSL "$BOOTSTRAP_URL" -o "$WORKSPACE/bootstrap.sh"
 chmod +x "$WORKSPACE/bootstrap.sh"
 exec bash "$WORKSPACE/bootstrap.sh"

@@ -36,7 +36,7 @@ OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
 OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
 RS_INSTALL_OLLAMA="${RS_INSTALL_OLLAMA:-1}"   # default ON — RSPromptFormatter needs it
 RS_LAUNCH_COMFY="${RS_LAUNCH_COMFY:-1}"
-RS_NODE_PACKS="${RS_NODE_PACKS:-vhs controlnet_aux essentials ltxvideo sam3 seedvr2 res4lyf}"
+RS_NODE_PACKS="${RS_NODE_PACKS:-vhs controlnet_aux essentials ltxvideo seedvr2 res4lyf}"
 
 export OLLAMA_MODELS OLLAMA_HOST
 
@@ -166,18 +166,34 @@ fi
 source "$VENV/bin/activate"
 log "venv active: $(which python) ($(python --version 2>&1))"
 
-pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || \
-    log "WARN: ComfyUI deps install failed"
-[ -f "$RS_NODES_DIR/requirements.txt" ] && \
-    pip install --no-cache-dir -r "$RS_NODES_DIR/requirements.txt" || \
-    log "WARN: rs-nodes deps install failed"
-pip install --no-cache-dir rose-opt || log "WARN: ROSE install failed"
+# Defensive cleanup: cu130 torch upgrade and other --upgrade pip operations
+# can leave numpy's .dist-info in a corrupt state where importlib.metadata
+# can't read the version (`found=None`), which then breaks transformers
+# import at ComfyUI startup. Wipe stale/broken numpy metadata so pip
+# resolves cleanly into a fresh install.
+PYSITE="$VENV/lib/python3.12/site-packages"
+if compgen -G "$PYSITE/numpy-*.dist-info" > /dev/null 2>&1; then
+    log "Clearing existing numpy dist-info entries (defensive)..."
+    rm -rf "$PYSITE"/numpy-*.dist-info
+fi
 
-# Blackwell perf stack: cu130 PyTorch (engages hardware fp8 paths +
-# comfy-kitchen's cuda/triton backends) + SageAttention (faster attn).
+# Install order matters. Pip processes each `install` independently;
+# later --upgrade calls can clobber earlier-resolved versions. We
+# install in this order:
+#   1. Framework: torch cu130 + NVIDIA + SageAttention (defines
+#      tensor/CUDA stack)
+#   2. Hub pin: huggingface_hub[hf_transfer] <1.0,>=0.34 (locks the
+#      hub version that transformers 4.57+ requires)
+#   3. App requirements LAST: ComfyUI + rs-nodes + rose-opt — these
+#      transitively bring in transformers and friends; by being last,
+#      they see hub already pinned and pip resolves transformers to a
+#      version compatible with the pinned hub.
+
+# 1. Framework
 log "Upgrading PyTorch to cu130 wheels..."
 pip install --upgrade --no-cache-dir --index-url https://download.pytorch.org/whl/cu130 \
     torch torchvision torchaudio || log "WARN: cu130 upgrade failed"
+
 log "Ensuring NVIDIA CUDA runtime libraries (NVRTC + cuDNN + cuBLAS)..."
 pip install --no-cache-dir \
     nvidia-cuda-nvrtc nvidia-cuda-runtime \
@@ -199,6 +215,51 @@ fi
 log "Installing SageAttention..."
 pip install --no-cache-dir sageattention || log "WARN: SageAttention install failed"
 
+# 2. hf-transfer + huggingface_hub pin (BEFORE app requirements)
+log "Installing hf-transfer + huggingface_hub (pinned <1.0)..."
+pip install --no-cache-dir "huggingface_hub[hf_transfer]<1.0,>=0.34" || \
+    log "WARN: hf-transfer install failed"
+
+# 3. App requirements LAST — see comment above for rationale.
+log "Installing ComfyUI Python deps..."
+pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || \
+    log "WARN: ComfyUI deps install failed"
+log "Installing rs-nodes Python deps..."
+[ -f "$RS_NODES_DIR/requirements.txt" ] && \
+    pip install --no-cache-dir -r "$RS_NODES_DIR/requirements.txt" || \
+    log "WARN: rs-nodes deps install failed"
+log "Installing ROSE optimizer..."
+pip install --no-cache-dir rose-opt || log "WARN: ROSE install failed"
+
+# 4. Verification — every critical Python import must succeed before
+# we declare bootstrap "done". If any fail, bootstrap exits non-zero
+# and the marker files are NOT written. Container Start Command will
+# re-run bootstrap on next boot, which is the right behavior — better
+# than silently launching ComfyUI into a crash loop 30 minutes later.
+log "Verifying core Python deps (numpy / torch / transformers / sageattention)..."
+python - <<'PY' || { log "ERROR: Python dep verification failed. Bootstrap aborted; markers not written."; exit 1; }
+import importlib, sys
+ok = True
+for mod in ["numpy", "torch", "torchvision", "transformers", "sageattention", "huggingface_hub"]:
+    try:
+        m = importlib.import_module(mod)
+        print(f"  OK   {mod} {getattr(m, '__version__', '?')}")
+    except Exception as e:
+        print(f"  FAIL {mod}: {type(e).__name__}: {e}", file=sys.stderr)
+        ok = False
+sys.exit(0 if ok else 1)
+PY
+log "All core deps verified."
+
+# Write provision hash marker AFTER verification passes. Future startup.sh
+# boots fast-path past pip when this marker matches the current hash.
+PROVISION_MARKER="$WORKSPACE/.provision_hash"
+PROV_HASH=$(cat "$COMFY_DIR/requirements.txt" "$RS_NODES_DIR/requirements.txt" 2>/dev/null | sha256sum | cut -d' ' -f1)
+if [ -n "$PROV_HASH" ]; then
+    echo "$PROV_HASH" > "$PROVISION_MARKER"
+    log "Wrote provision hash: $PROVISION_MARKER"
+fi
+
 # -----------------------------------------------------------------------------
 # Phase 3 — Extra custom-node packs (workflow-specific)
 # -----------------------------------------------------------------------------
@@ -208,7 +269,6 @@ declare -A NODE_PACKS=(
     [controlnet_aux]="comfyui_controlnet_aux|https://github.com/Fannovel16/comfyui_controlnet_aux.git"
     [essentials]="ComfyUI_essentials|https://github.com/cubiq/ComfyUI_essentials.git"
     [ltxvideo]="ComfyUI-LTXVideo|https://github.com/Lightricks/ComfyUI-LTXVideo.git"
-    [sam3]="ComfyUI-SAM3|https://github.com/PozzettiAndrea/ComfyUI-SAM3.git"
     [seedvr2]="ComfyUI-SeedVR2_VideoUpscaler|https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git"
     [res4lyf]="RES4LYF|https://github.com/ClownsharkBatwing/RES4LYF.git"
 )
@@ -239,30 +299,64 @@ for key in $RS_NODE_PACKS; do
 done
 
 # -----------------------------------------------------------------------------
-# Phase 4 — Model weights from HuggingFace
+# Phase 4 — Model weights from HuggingFace via hf-transfer
 # Default manifest: Koi_NoPeople IC-LoRA workflow (~57 GB total, bf16 dev).
+#
+# hf-transfer is HuggingFace's Rust-based parallel downloader — 50-150x
+# faster than single-connection wget on long-haul routes (US<->EU was
+# observed at 3 MB/s with wget vs 200-500 MB/s with hf-transfer).
 # -----------------------------------------------------------------------------
-banner "Phase 4/7  Model weights from HuggingFace"
+banner "Phase 4/7  Model weights from HuggingFace (hf-transfer)"
 
-WGET_AUTH=()
+# Ensure hf-transfer is available; install if missing.
+# Pin huggingface_hub<1.0 because transformers (~4.57.x) declares
+# huggingface-hub<1.0 as a strict requirement and refuses to import
+# with hub 1.x present. hf_transfer support exists in both 0.x and
+# 1.x, so 0.x keeps everyone happy.
+if ! python -c "import hf_transfer" 2>/dev/null; then
+    log "Installing hf-transfer + huggingface_hub (pinned <1.0)..."
+    pip install --no-cache-dir "huggingface_hub[hf_transfer]<1.0,>=0.34" || \
+        log "WARN: hf-transfer install failed; will fall back to curl"
+fi
+
+# Enable parallel-connection downloads
+export HF_HUB_ENABLE_HF_TRANSFER=1
+HAVE_HF=$(command -v hf >/dev/null 2>&1 && echo 1 || echo 0)
+
+# Pass HF_TOKEN to child processes via environment, NEVER via CLI args.
+# CLI args (--token, --header=Bearer ...) appear in `ps -ef` and are
+# visible to anyone with read access to /proc, including process listings
+# captured in screenshots, logs, or chat transcripts. The hf CLI reads
+# HF_TOKEN from the environment by default, and so does huggingface_hub.
 if [ -n "${HF_TOKEN:-}" ]; then
-    log "HF_TOKEN set; using authenticated requests"
-    WGET_AUTH=(--header="Authorization: Bearer ${HF_TOKEN}")
+    export HF_TOKEN
 else
     log "No HF_TOKEN — proceeding unauthenticated (rate-limited; ungated repos only)"
 fi
 
+# Manifest format: <subdir>|<filename>|<repo_id>|<repo_path>
+# Splitting URL into (repo_id, repo_path) so we can use `hf download`
+# directly without parsing the resolve URL.
+#
+# Both fp8 (29 GB) and bf16 (44 GB) checkpoints download by default.
+# fp8 hits the Blackwell hardware fp8 path for speed; bf16 is the
+# full-precision dev model for quality work. Total LTX checkpoints:
+# ~73 GB. Pods with smaller volumes can drop bf16 by setting
+# RS_LTX_BF16=0.
 MODELS=(
-    "checkpoints|ltx-2.3-22b-dev-fp8.safetensors|https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors"
-    "text_encoders|gemma_3_12B_it_fp4_mixed.safetensors|https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
-    "latent_upscale_models|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-    "loras|ltx-2.3-22b-distilled-lora-384-1.1.safetensors|https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
-    "loras|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors|https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control/resolve/main/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
+    "checkpoints|ltx-2.3-22b-dev-fp8.safetensors|Lightricks/LTX-2.3-fp8|ltx-2.3-22b-dev-fp8.safetensors"
+    "text_encoders|gemma_3_12B_it_fp4_mixed.safetensors|Comfy-Org/ltx-2|split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
+    "latent_upscale_models|ltx-2.3-spatial-upscaler-x2-1.1.safetensors|Lightricks/LTX-2.3|ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+    "loras|ltx-2.3-22b-distilled-lora-384-1.1.safetensors|Lightricks/LTX-2.3|ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+    "loras|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors|Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control|ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
 )
+if [ "${RS_LTX_BF16:-1}" = "1" ]; then
+    MODELS+=("checkpoints|ltx-2.3-22b-dev.safetensors|Lightricks/LTX-2.3|ltx-2.3-22b-dev.safetensors")
+fi
 
 mkdir -p "$MODELS_ROOT"
 for entry in "${MODELS[@]}"; do
-    IFS='|' read -r subdir name url <<< "$entry"
+    IFS='|' read -r subdir name repo_id repo_path <<< "$entry"
     dir="$MODELS_ROOT/$subdir"
     file="$dir/$name"
     mkdir -p "$dir"
@@ -270,13 +364,50 @@ for entry in "${MODELS[@]}"; do
         log "[ok]    $subdir/$name ($(stat -c%s "$file") bytes)"
         continue
     fi
-    log "[fetch] $subdir/$name"
-    wget -c --tries=3 --no-verbose --show-progress \
-        "${WGET_AUTH[@]}" -O "$file" "$url" || {
-            log "  ERROR: download failed for $name"
-            rm -f "$file"
+    log "[fetch] $subdir/$name (repo=$repo_id)"
+    if [ "$HAVE_HF" = "1" ]; then
+        # hf download writes into a layout cache by default; use --local-dir
+        # to drop the file directly at the target path. The CLI puts files
+        # under <local-dir>/<repo_path>, so we download into a temp staging
+        # dir then move the file to its final flat location.
+        # No `| sed` pipe — hf-transfer's progress bar uses carriage returns
+        # which a pipe would block-buffer until completion. Stream direct.
+        # No --token — hf reads HF_TOKEN from the environment (exported above).
+        staging=$(mktemp -d -p /workspace 2>/dev/null || mktemp -d)
+        if hf download "$repo_id" "$repo_path" \
+                --local-dir "$staging"; then
+            mv -f "$staging/$repo_path" "$file" 2>/dev/null || \
+                cp -f "$staging/$repo_path" "$file"
+            rm -rf "$staging"
+            log "  done: $(stat -c%s "$file") bytes"
+        else
+            log "  ERROR: hf download failed for $name"
+            rm -rf "$staging" "$file"
             continue
-        }
+        fi
+    else
+        # Fallback: curl with header in a 0600 temp file. Avoids the token
+        # appearing in `ps` (which `wget --header="Authorization: Bearer X"`
+        # would do). curl's `-H @file` reads the header from a file path.
+        url="https://huggingface.co/${repo_id}/resolve/main/${repo_path}"
+        hdrfile=""
+        curl_auth=()
+        if [ -n "${HF_TOKEN:-}" ]; then
+            hdrfile=$(mktemp)
+            chmod 600 "$hdrfile"
+            printf 'Authorization: Bearer %s\n' "$HF_TOKEN" > "$hdrfile"
+            curl_auth=(-H "@$hdrfile")
+        fi
+        if curl -L --fail --retry 3 -C - --progress-bar \
+                "${curl_auth[@]}" \
+                -o "$file" "$url"; then
+            log "  done: $(stat -c%s "$file") bytes"
+        else
+            log "  ERROR: curl download failed for $name"
+            rm -f "$file"
+        fi
+        [ -n "$hdrfile" ] && rm -f "$hdrfile"
+    fi
 done
 
 # -----------------------------------------------------------------------------
@@ -331,6 +462,12 @@ log "Models on volume:"
 du -sh "$MODELS_ROOT"/* 2>/dev/null | sed 's/^/    /' || true
 log "Disk usage on /workspace:"
 df -h /workspace | tail -1 | sed 's/^/    /'
+
+# Mark bootstrap complete so init.sh's fast path will pick startup.sh
+# on subsequent boots. Without this marker init.sh re-runs bootstrap.sh
+# (which is fine since it's idempotent, but slower than startup.sh).
+touch "$WORKSPACE/.bootstrap_done"
+log "Bootstrap complete marker written: $WORKSPACE/.bootstrap_done"
 
 # -----------------------------------------------------------------------------
 # Phase 7 — Launch ComfyUI

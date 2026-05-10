@@ -171,52 +171,113 @@ source "$VENV/bin/activate"
 log "Python: $(which python)  ($(python --version 2>&1))"
 log "Pip:    $(which pip)"
 
-# -----------------------------------------------------------------------------
-# 3. Python deps (idempotent — pip is a no-op on already-installed pkgs;
-#    only first boot or version changes cause real downloads).
-# -----------------------------------------------------------------------------
-log "Installing ComfyUI Python deps..."
-pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || \
-    log "WARN: ComfyUI deps install failed"
+PYSITE="$VENV/lib/python3.12/site-packages"
 
-log "Installing rs-nodes Python deps..."
-if [ -f "$RS_NODES_DIR/requirements.txt" ]; then
-    pip install --no-cache-dir -r "$RS_NODES_DIR/requirements.txt" || \
-        log "WARN: rs-nodes deps install failed"
+# -----------------------------------------------------------------------------
+# 2.7. Self-healing checks — run on EVERY boot regardless of fast path.
+#      These catch corruption from partial pip installs (SSH drop / OOM mid-
+#      install) and version drift from older bootstraps. Cheap if everything
+#      is already correct (pip says "already satisfied" in <2s).
+# -----------------------------------------------------------------------------
+
+# Numpy metadata heal: a partial pip install can leave a numpy-X.Y.dist-info
+# directory with malformed METADATA, so importlib.metadata.version("numpy")
+# returns None, which then breaks transformers' dependency check at import.
+# Detect + force-reinstall if broken.
+if ! python -c "from importlib.metadata import version; v = version('numpy'); assert v and v != 'None'" 2>/dev/null; then
+    log "numpy metadata broken or missing — force-reinstalling..."
+    rm -rf "$PYSITE"/numpy-*.dist-info 2>/dev/null || true
+    pip install --no-cache-dir --force-reinstall numpy || \
+        log "WARN: numpy reinstall failed"
 fi
 
-# ROSE optimizer — published as rose-opt, imported as rose_opt
-log "Ensuring ROSE optimizer..."
-pip install --no-cache-dir rose-opt || \
-    log "WARN: ROSE install failed (only needed for training)"
+# huggingface_hub version pin: transformers 4.57+ declares hub<1.0 as a
+# strict requirement. Older bootstrap revs installed hf-transfer with
+# `pip -U huggingface_hub[hf_transfer]` which pulled 1.x and broke
+# transformers. Idempotent — pip says "Requirement already satisfied"
+# in ~1s if version is already correct.
+pip install --no-cache-dir "huggingface_hub[hf_transfer]<1.0,>=0.34" 2>&1 | tail -3
 
-# Performance stack:
-#   * Upgrade PyTorch to cu130 wheels — Blackwell (RTX 50xx / PRO 6000)
-#     hardware fp8 paths and comfy-kitchen's cuda+triton backends require
-#     it. Stock RunPod pytorch image ships cu128 which leaves these
-#     disabled (only the slow eager backend runs). Idempotent: pip
-#     skips when already at the right version.
-#   * SageAttention — 30-50% faster attention than vanilla PyTorch SDPA.
-#     ComfyUI auto-detects and uses it.
-log "Ensuring PyTorch cu130 wheels (Blackwell perf path)..."
-pip install --upgrade --no-cache-dir \
-    --index-url https://download.pytorch.org/whl/cu130 \
-    torch torchvision torchaudio || \
-    log "WARN: PyTorch cu130 upgrade failed; running on stock cu128"
+# -----------------------------------------------------------------------------
+# 3. Python deps — fast path on warm boots.
+#
+# On a fresh volume, every pip install runs (slow first boot). On every
+# subsequent boot, a marker file at /workspace/.provision_hash holds the
+# sha256 of the requirements.txt files. If the hash matches, skip every
+# pip install — saves 30-90s per boot. If requirements.txt changes
+# (because rs-nodes adds a dep, etc.), the hash mismatches and pip runs
+# normally to install the new pieces.
+#
+# To force a full re-provision (e.g. to pick up a new torch wheel from
+# the cu130 index), delete the marker:
+#     rm /workspace/.provision_hash
+# Then restart the container (kill.bat or Stop+Start).
+# -----------------------------------------------------------------------------
+PROVISION_MARKER="$WORKSPACE/.provision_hash"
+REQ_HASH=$(cat "$COMFY_DIR/requirements.txt" "$RS_NODES_DIR/requirements.txt" 2>/dev/null | sha256sum | cut -d' ' -f1)
+STORED_HASH=""
+[ -f "$PROVISION_MARKER" ] && STORED_HASH=$(cat "$PROVISION_MARKER" 2>/dev/null)
 
-# cu130 PyTorch needs the matching NVRTC + companion runtime libs
-# for JIT-compiled kernels (e.g. torchaudio spectrogram's complex abs).
-# Without these, runs crash with "failed to open libnvrtc-builtins.so.13.0".
-# NVIDIA deprecated the -cu13 suffixed packages; use the unsuffixed
-# names which now ship the cu13-compatible builds.
-log "Ensuring NVIDIA CUDA runtime libraries..."
-pip install --no-cache-dir \
-    nvidia-cuda-nvrtc \
-    nvidia-cuda-runtime \
-    nvidia-cublas \
-    nvidia-cudnn || \
-    log "WARN: CUDA runtime libs install failed; JIT kernels may crash"
+if [ -n "$REQ_HASH" ] && [ "$REQ_HASH" = "$STORED_HASH" ]; then
+    FAST_PATH=1
+    log "Provision marker matches — skipping pip install steps (fast path)"
+else
+    FAST_PATH=0
+    if [ -z "$STORED_HASH" ]; then
+        log "No provision marker — running full pip provisioning"
+    else
+        log "Requirements changed since last boot — re-running pip"
+    fi
+fi
 
+if [ "$FAST_PATH" != "1" ]; then
+    log "Installing ComfyUI Python deps..."
+    pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || \
+        log "WARN: ComfyUI deps install failed"
+
+    log "Installing rs-nodes Python deps..."
+    if [ -f "$RS_NODES_DIR/requirements.txt" ]; then
+        pip install --no-cache-dir -r "$RS_NODES_DIR/requirements.txt" || \
+            log "WARN: rs-nodes deps install failed"
+    fi
+
+    # ROSE optimizer — published as rose-opt, imported as rose_opt
+    log "Ensuring ROSE optimizer..."
+    pip install --no-cache-dir rose-opt || \
+        log "WARN: ROSE install failed (only needed for training)"
+
+    # Performance stack:
+    #   * Upgrade PyTorch to cu130 wheels — Blackwell (RTX 50xx / PRO 6000)
+    #     hardware fp8 paths and comfy-kitchen's cuda+triton backends require
+    #     it. Stock RunPod pytorch image ships cu128 which leaves these
+    #     disabled (only the slow eager backend runs). Idempotent: pip
+    #     skips when already at the right version.
+    #   * SageAttention — 30-50% faster attention than vanilla PyTorch SDPA.
+    #     ComfyUI auto-detects and uses it.
+    log "Ensuring PyTorch cu130 wheels (Blackwell perf path)..."
+    pip install --upgrade --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cu130 \
+        torch torchvision torchaudio || \
+        log "WARN: PyTorch cu130 upgrade failed; running on stock cu128"
+
+    # cu130 PyTorch needs the matching NVRTC + companion runtime libs
+    # for JIT-compiled kernels (e.g. torchaudio spectrogram's complex abs).
+    # Without these, runs crash with "failed to open libnvrtc-builtins.so.13.0".
+    # NVIDIA deprecated the -cu13 suffixed packages; use the unsuffixed
+    # names which now ship the cu13-compatible builds.
+    log "Ensuring NVIDIA CUDA runtime libraries..."
+    pip install --no-cache-dir \
+        nvidia-cuda-nvrtc \
+        nvidia-cuda-runtime \
+        nvidia-cublas \
+        nvidia-cudnn || \
+        log "WARN: CUDA runtime libs install failed; JIT kernels may crash"
+fi
+
+# LD_LIBRARY_PATH must be computed every boot — env vars don't persist
+# across container restarts, even though the underlying nvidia/* lib
+# dirs do. Stays outside the fast-path skip.
+#
 # pip-installed NVIDIA libs land in venv site-packages/nvidia/*/lib/.
 # PyTorch's nvrtc dlopen() searches LD_LIBRARY_PATH at runtime, so
 # every nvidia/* lib dir has to be visible. Compute and persist it
@@ -237,9 +298,18 @@ if [ -n "$NV_LIB_PATHS" ]; then
     export LD_LIBRARY_PATH="$NV_LIB_PATHS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
-log "Ensuring SageAttention..."
-pip install --no-cache-dir sageattention || \
-    log "WARN: SageAttention install failed; using stock PyTorch attention"
+if [ "$FAST_PATH" != "1" ]; then
+    log "Ensuring SageAttention..."
+    pip install --no-cache-dir sageattention || \
+        log "WARN: SageAttention install failed; using stock PyTorch attention"
+
+    # All pip blocks succeeded — write the provision marker so next
+    # boot can fast-path.
+    if [ -n "$REQ_HASH" ]; then
+        echo "$REQ_HASH" > "$PROVISION_MARKER"
+        log "Wrote provision marker: $PROVISION_MARKER"
+    fi
+fi
 
 # -----------------------------------------------------------------------------
 # 4. Optional InsightFace pre-download (gated by env var so the dispatch
@@ -263,27 +333,35 @@ if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
             log "WARN: Ollama install failed"
     fi
     # Models live on the network volume so they survive pod terminate.
-    # Without this, every fresh container would re-pull them.
     export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
     export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
     mkdir -p "$OLLAMA_MODELS"
-    log "Starting Ollama (OLLAMA_MODELS=$OLLAMA_MODELS) in the background..."
+    log "Starting Ollama in the background..."
     nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
         ollama serve >/workspace/ollama.log 2>&1 &
 
-    # Pull required models (no-op if already on volume).
-    OLLAMA_MODEL_LIST="${OLLAMA_MODEL:-gemma4:31b gemma4:26b}"
-    # Wait briefly for server to come up before pulling.
-    for i in $(seq 1 15); do
-        curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1 && break
-        sleep 2
-    done
-    for model in $OLLAMA_MODEL_LIST; do
-        if ! ollama list | awk 'NR>1 {print $1}' | grep -Fxq "$model"; then
-            log "Pulling Ollama model: $model"
-            ollama pull "$model" || log "WARN: pull failed for $model"
-        fi
-    done
+    # First-time-only: wait for ollama to be up, pull required models,
+    # write a marker. On all subsequent boots, skip the wait+pull
+    # entirely — models are already on the volume, and Ollama itself
+    # comes up in the background; ComfyUI doesn't need to wait for it.
+    # Saves up to 30s on every warm boot.
+    OLLAMA_READY_MARKER="$WORKSPACE/.ollama_ready"
+    if [ ! -f "$OLLAMA_READY_MARKER" ]; then
+        OLLAMA_MODEL_LIST="${OLLAMA_MODEL:-gemma4:31b gemma4:26b}"
+        log "First-time ollama setup — waiting for server then pulling: $OLLAMA_MODEL_LIST"
+        for i in $(seq 1 15); do
+            curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1 && break
+            sleep 2
+        done
+        for model in $OLLAMA_MODEL_LIST; do
+            if ! ollama list | awk 'NR>1 {print $1}' | grep -Fxq "$model"; then
+                log "Pulling Ollama model: $model"
+                ollama pull "$model" || log "WARN: pull failed for $model"
+            fi
+        done
+        touch "$OLLAMA_READY_MARKER"
+        log "Wrote ollama ready marker."
+    fi
 fi
 
 # -----------------------------------------------------------------------------
