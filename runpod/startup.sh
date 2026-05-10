@@ -333,27 +333,35 @@ if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
             log "WARN: Ollama install failed"
     fi
     # Models live on the network volume so they survive pod terminate.
-    # Without this, every fresh container would re-pull them.
     export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
     export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
     mkdir -p "$OLLAMA_MODELS"
-    log "Starting Ollama (OLLAMA_MODELS=$OLLAMA_MODELS) in the background..."
+    log "Starting Ollama in the background..."
     nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
         ollama serve >/workspace/ollama.log 2>&1 &
 
-    # Pull required models (no-op if already on volume).
-    OLLAMA_MODEL_LIST="${OLLAMA_MODEL:-gemma4:31b gemma4:26b}"
-    # Wait briefly for server to come up before pulling.
-    for i in $(seq 1 15); do
-        curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1 && break
-        sleep 2
-    done
-    for model in $OLLAMA_MODEL_LIST; do
-        if ! ollama list | awk 'NR>1 {print $1}' | grep -Fxq "$model"; then
-            log "Pulling Ollama model: $model"
-            ollama pull "$model" || log "WARN: pull failed for $model"
-        fi
-    done
+    # First-time-only: wait for ollama to be up, pull required models,
+    # write a marker. On all subsequent boots, skip the wait+pull
+    # entirely — models are already on the volume, and Ollama itself
+    # comes up in the background; ComfyUI doesn't need to wait for it.
+    # Saves up to 30s on every warm boot.
+    OLLAMA_READY_MARKER="$WORKSPACE/.ollama_ready"
+    if [ ! -f "$OLLAMA_READY_MARKER" ]; then
+        OLLAMA_MODEL_LIST="${OLLAMA_MODEL:-gemma4:31b gemma4:26b}"
+        log "First-time ollama setup — waiting for server then pulling: $OLLAMA_MODEL_LIST"
+        for i in $(seq 1 15); do
+            curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1 && break
+            sleep 2
+        done
+        for model in $OLLAMA_MODEL_LIST; do
+            if ! ollama list | awk 'NR>1 {print $1}' | grep -Fxq "$model"; then
+                log "Pulling Ollama model: $model"
+                ollama pull "$model" || log "WARN: pull failed for $model"
+            fi
+        done
+        touch "$OLLAMA_READY_MARKER"
+        log "Wrote ollama ready marker."
+    fi
 fi
 
 # -----------------------------------------------------------------------------
