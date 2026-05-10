@@ -26,6 +26,7 @@ from .nodes.logc3_decode import RSLogC3Decode
 from .nodes.prompt_relay_encode import RSPromptRelayEncode
 from .nodes.prompt_relay_timeline import RSPromptRelayTimeline
 from .nodes.runpod_dispatch import RSRunOnRunPod
+from .nodes.image_strip_alpha import RSImageStripAlpha
 
 WEB_DIRECTORY = "./web"
 
@@ -58,6 +59,7 @@ NODE_CLASS_MAPPINGS = {
     "RSPromptRelayEncode": RSPromptRelayEncode,
     "RSPromptRelayTimeline": RSPromptRelayTimeline,
     "RSRunOnRunPod": RSRunOnRunPod,
+    "RSImageStripAlpha": RSImageStripAlpha,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -89,6 +91,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "RSPromptRelayEncode": "RS Prompt Relay Encode",
     "RSPromptRelayTimeline": "RS Prompt Relay Timeline",
     "RSRunOnRunPod": "RS Run on RunPod",
+    "RSImageStripAlpha": "RS Image Strip Alpha",
 }
 
 # MOSS-TTS nodes — only available if dependencies (transformers, huggingface_hub) are installed
