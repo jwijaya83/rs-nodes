@@ -160,6 +160,7 @@ class RSLTXVTrainLoRA:
                 "lr_cycle_decay":         ("FLOAT", {"default": 1.0, "min": 0.1, "max": 1.0, "step": 0.01,
                                                      "tooltip": "Multiply LR by this factor each cycle reset. 1.0 = no decay, 0.8 = 20% reduction per cycle."}),
                 "gradient_checkpointing": ("BOOLEAN", {"default": True}),
+                "layer_offloading":       ("BOOLEAN", {"default": True, "tooltip": "Stream transformer blocks CPU↔GPU one at a time. Saves ~10× VRAM but is much slower (PCIe-bound). Turn OFF if you have headroom (24GB+ recommended for off; 16GB may fit with fp8+gc — try off first, flip back on if OOM)."}),
                 "ffn_chunks":             ("INT",     {"default": 0, "min": 0, "max": 16, "step": 1, "tooltip": "Split FFN layers into N chunks along sequence dim to reduce peak VRAM. 0 = disabled, 4 = good default. Trades speed for memory."}),
                 # Quantization
                 "quantization": (["fp8-quanto", "int8-quanto", "int4-quanto", "none"], {"default": "fp8-quanto", "tooltip": "fp8 recommended (no C++ build tools needed). int4/int2 require 'pip install ninja' + C++ compiler."}),
@@ -257,6 +258,7 @@ class RSLTXVTrainLoRA:
         lr_cycle_steps: int = 0,
         lr_cycle_decay: float = 1.0,
         gradient_checkpointing: bool = True,
+        layer_offloading: bool = True,
         ffn_chunks: int = 0,
         quantization: str = "fp8-quanto",
         strategy: str = "text_to_video",
@@ -559,7 +561,7 @@ class RSLTXVTrainLoRA:
             vocoder=vocoder,
             seed=42,
             resume_checkpoint=self._find_latest_checkpoint(output_dir) if resume else "",
-            layer_offloading=True,
+            layer_offloading=layer_offloading,
             node_id=str(unique_id) if unique_id is not None else "",
             ffn_chunks=ffn_chunks,
         )
