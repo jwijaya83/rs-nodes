@@ -135,56 +135,82 @@ def _convert_node(node, link_by_dest, warnings):
     api_inputs = {}
     node_class = nodes.NODE_CLASS_MAPPINGS.get(node_type)
 
-    # Resolve every connection input first — these come straight from
-    # the link table by destination slot index, regardless of widget
-    # arithmetic. We use the workflow's inputs[] order for slot indices
-    # because that's what links reference.
-    inputs_by_name = {}
+    # ----- 1. Resolve connection inputs from the link table -----
+    # Use workflow inputs[] order for slot indices because that's the
+    # order links reference (link tuple stores dst_slot which is the
+    # workflow-side slot index, not the canonical INPUT_TYPES index).
     for slot_idx, inp in enumerate(workflow_inputs):
         name = inp.get("name")
         if not name:
             continue
-        inputs_by_name[name] = (slot_idx, inp)
         link_id = inp.get("link")
-        if link_id is not None:
-            src = link_by_dest.get((node_id, slot_idx))
-            if src is not None:
-                api_inputs[name] = [str(src[0]), int(src[1])]
+        if link_id is None:
+            continue
+        src = link_by_dest.get((node_id, slot_idx))
+        if src is not None:
+            api_inputs[name] = [str(src[0]), int(src[1])]
 
-    # Widget values: iterate the CANONICAL order (NODE_CLASS_MAPPINGS),
-    # falling back to the workflow's inputs[] ordering when the node
-    # class isn't installed (custom node we don't have on this pod).
-    canonical = _canonical_input_order(node_class) if node_class else None
-    if canonical is None:
-        # Fallback: derive widget order from workflow inputs that have
-        # a `widget` field. Less reliable but only fires for unknown
-        # custom nodes.
-        canonical = []
+    # ----- 2. Determine the widget order -----
+    # In the modern Comfy frontend (v3+), every widget-bound input is
+    # serialized into inputs[] with a `widget: {name}` tag, in the
+    # SAME order as widgets_values was written. That's the canonical
+    # source of truth for cursor walking: it's what the frontend
+    # actually wrote out.
+    #
+    # Older saves (or some custom nodes) DON'T tag widget inputs in
+    # inputs[]. For those we fall back to NODE_CLASS_MAPPINGS'
+    # INPUT_TYPES() iteration order — that's how the legacy frontend
+    # decided widget order too.
+    #
+    # Using INPUT_TYPES() as the primary order was the previous bug:
+    # for v3-IO custom nodes (DepthAnything_V3 et al.) the schema
+    # iteration order differs from the order the frontend actually
+    # serializes widgets in, so widget values landed on the wrong
+    # input names (normalization_mode getting resize_method's value,
+    # tile_size getting overlap's value, etc.).
+    tagged_widgets = [
+        inp for inp in workflow_inputs if inp.get("widget") is not None
+    ]
+    widget_order = []  # list of (name, is_promoted)
+    if tagged_widgets:
+        for inp in tagged_widgets:
+            name = inp.get("name") or (inp.get("widget") or {}).get("name")
+            if not name:
+                continue
+            widget_order.append((name, inp.get("link") is not None))
+    else:
+        # Legacy fallback: derive widget order from INPUT_TYPES.
+        canonical = _canonical_input_order(node_class) if node_class else None
+        if canonical is None:
+            # No class registered AND no widget tags — derive from
+            # widget-typed entries in workflow_inputs as a last resort.
+            canonical = []
+            for inp in workflow_inputs:
+                name = inp.get("name")
+                if not name:
+                    continue
+                if _is_widget_type(inp.get("type")):
+                    canonical.append((name, inp.get("type")))
+        # Build promotion lookup from workflow inputs[].
+        promoted = {}
         for inp in workflow_inputs:
             name = inp.get("name")
             if not name:
                 continue
-            decl_type = inp.get("type")
-            if inp.get("widget") is not None or _is_widget_type(decl_type):
-                canonical.append((name, decl_type))
-            else:
-                canonical.append((name, decl_type))  # connection — preserved for ordering, no widget value
+            promoted[name] = inp.get("link") is not None
+        for name, declared_type in canonical:
+            if not _is_widget_type(declared_type):
+                continue
+            widget_order.append((name, promoted.get(name, False)))
 
-    # Walk canonical inputs, mapping widget-typed entries to
-    # widgets_values positionally. Widgets that have been "promoted"
-    # to inputs (link != None) still occupy their widgets_values slot
-    # in the saved workflow, so the cursor advances either way.
+    # ----- 3. Walk widget_order against widgets_values -----
+    # Widgets promoted to inputs (link != None) still occupy a slot
+    # in widgets_values, so the cursor advances either way. The
+    # frontend writes the widget's current value into that slot even
+    # though the actual runtime value comes from the link.
     cursor = 0
-    for name, declared_type in canonical:
-        if not _is_widget_type(declared_type):
-            # Connection-only input — already resolved above (or not),
-            # nothing to do here. Cursor doesn't move.
-            continue
-
-        slot, inp = inputs_by_name.get(name, (None, None))
-        is_promoted = inp is not None and inp.get("link") is not None
+    for name, is_promoted in widget_order:
         if not is_promoted:
-            # Real widget — read its value from widgets_values.
             if cursor < len(widgets_values):
                 api_inputs[name] = widgets_values[cursor]
             else:
@@ -193,12 +219,13 @@ def _convert_node(node, link_by_dest, warnings):
                     f"requested cursor {cursor} but widgets_values has "
                     f"only {len(widgets_values)} entries"
                 )
-        # cursor advances whether the slot is real or promoted —
-        # ComfyUI keeps the slot in widgets_values either way.
         cursor += 1
         # Auto-injected control_after_generate sits after seed widgets
-        # in widgets_values without a corresponding INPUT_TYPES entry.
-        if _has_auto_control_after_generate(name):
+        # in widgets_values without a corresponding inputs[] / class
+        # entry, so we skip it. Modern saves include it as a tagged
+        # widget in inputs[] (handled by the main path above); this
+        # only kicks in for legacy saves where the tag is missing.
+        if not tagged_widgets and _has_auto_control_after_generate(name):
             cursor += 1
 
     return str(node_id), {
