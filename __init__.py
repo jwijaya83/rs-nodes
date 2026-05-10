@@ -114,4 +114,13 @@ try:
 except ImportError:
     pass
 
+# Side-effect import: registers the /rs/uitoapi server route used by
+# rs-studio for canonical UI workflow → API prompt conversion.
+# Tolerates failures so ComfyUI still loads if aiohttp is missing or
+# server.PromptServer.instance isn't ready.
+try:
+    from .nodes import uitoapi_route  # noqa: F401
+except Exception as _err:
+    print(f"[rs-nodes] uitoapi route not registered: {_err}")
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
