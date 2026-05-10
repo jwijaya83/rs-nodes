@@ -72,16 +72,48 @@ CONNECTION_TYPES = {
 }
 
 
+# Primitive widget types in ComfyUI. Anything OUTSIDE this set that's
+# also an uppercase string is treated as a connection. This is the
+# positive-allowlist pattern Seth Robinson's converter uses (and the
+# one ComfyUI's own frontend uses) — necessary to handle custom
+# connection types like DA3_MODEL / FLUX_GUIDER that aren't in
+# CONNECTION_TYPES but also aren't widgets.
+WIDGET_PRIMITIVES = {"INT", "FLOAT", "STRING", "BOOLEAN", "COMBO"}
+
 def _is_widget_type(declared):
-    """True when the declared type is a widget (not a connection slot)."""
-    if isinstance(declared, list):
-        # Enum: ["option_a", "option_b", ...] — always a widget.
+    """True when the declared type is a widget (consumes a slot in
+    widgets_values), False when it's a connection-only input.
+
+    Uses a positive allowlist instead of a CONNECTION_TYPES blocklist,
+    because custom node connection types (DA3_MODEL, FLUX_GUIDER,
+    etc.) aren't in any standard blocklist. Comfy's own widget vs
+    connection distinction comes down to:
+
+      - list / tuple of strings           → legacy combo widget
+      - "INT" / "FLOAT" / "STRING" / etc. → primitive widget
+      - "COMBO"                            → v3 combo widget
+      - "COMFY_*COMBO*"                    → v3 dynamic combo
+      - any other lowercase string         → custom widget type
+      - any other UPPERCASE string         → connection (skip)
+
+    The widget_source markers ("__WIDGET__" / "__CONNECTION__")
+    used by the v3-schema path bypass this and answer directly.
+    """
+    if declared == "__WIDGET__":
+        return True
+    if declared == "__CONNECTION__":
+        return False
+    if isinstance(declared, (list, tuple)):
         return True
     if isinstance(declared, str):
-        if declared in CONNECTION_TYPES:
-            return False
-        # Widget primitive (INT / FLOAT / STRING / BOOLEAN / etc.)
-        return True
+        if declared in WIDGET_PRIMITIVES:
+            return True
+        if declared.startswith("COMFY_") and "COMBO" in declared:
+            return True
+        # Lowercase custom widget types (rare but allowed by Comfy).
+        if not declared.isupper():
+            return True
+        return False
     return False
 
 
@@ -93,13 +125,75 @@ def _has_auto_control_after_generate(input_name):
     return input_name in ("seed", "noise_seed")
 
 
+def _get_v3_schema(node_class):
+    """Return the v3-IO schema for a node class, or None for v2 nodes
+    (or v3 nodes whose schema can't be loaded)."""
+    schema = getattr(node_class, "SCHEMA", None)
+    if schema is not None:
+        return schema
+    get_schema = getattr(node_class, "GET_SCHEMA", None) or getattr(
+        node_class, "FINALIZE_SCHEMA", None
+    )
+    if get_schema is None:
+        return None
+    try:
+        return get_schema()
+    except Exception:
+        return None
+
+
+def _v3_input_is_widget(inp):
+    """True when a v3 IO Input is a widget (has a widget_type, or is
+    a WidgetInput subclass). Connection inputs (IMAGE, MASK, MODEL,
+    custom types like DA3_MODEL) return False — they don't consume a
+    widgets_values slot.
+
+    The distinguishing trait: WidgetInput subclasses define a `default`
+    attribute set in __init__ (lines 198-201 in comfy_api/latest/_io.py).
+    Plain Input doesn't. We use that as a duck-type check so this works
+    regardless of which exact subclass is in use (FloatInput, ComboInput,
+    BooleanInput, custom widget input subclasses, etc.).
+    """
+    # WidgetInput has these attrs set in __init__; plain Input doesn't.
+    return hasattr(inp, "widget_type") or hasattr(inp, "default")
+
+
 def _canonical_input_order(node_class):
     """Return [(name, declared_type), ...] in the canonical order
     ComfyUI's frontend uses to lay out widgets / connections.
 
-    Required first, then optional. Hidden inputs are excluded — they
-    don't appear in widgets_values and aren't user-facing.
+    For v3-IO nodes, the schema's `inputs` list is in user-declared
+    order — that's what the frontend uses to build the widgets array,
+    and therefore the order widgets_values is serialized in.
+    INPUT_TYPES() re-groups required/optional, which corrupts that
+    order whenever required and optional aren't strictly contiguous
+    in declaration order. So we read the schema directly when
+    available and fall back to INPUT_TYPES() only for v2 nodes.
+
+    Each entry's declared_type is either:
+      - the literal string "__WIDGET__" — meaning the cursor walker
+        should consume a widgets_values slot for this input.
+      - the literal string "__CONNECTION__" — connection-only, no
+        widget value.
+      - or a raw type string from INPUT_TYPES (for the v2 fallback).
+    The walker uses _is_widget_type on the type to decide, so any of
+    these work, but the explicit __WIDGET__/__CONNECTION__ tokens
+    skip the string-based classification which can't tell custom
+    connection types (DA3_MODEL, FLUX_GUIDER, etc.) from widgets.
     """
+    schema = _get_v3_schema(node_class)
+    schema_inputs = getattr(schema, "inputs", None) if schema is not None else None
+    if isinstance(schema_inputs, list) and schema_inputs:
+        order = []
+        for inp in schema_inputs:
+            name = getattr(inp, "id", None)
+            if not name:
+                continue
+            order.append((name, "__WIDGET__" if _v3_input_is_widget(inp) else "__CONNECTION__"))
+        return order
+
+    # v2 / legacy path: pull from INPUT_TYPES(). Required first, then
+    # optional — matches how the legacy frontend laid widgets out.
     try:
         spec = node_class.INPUT_TYPES()
     except Exception:
@@ -108,7 +202,6 @@ def _canonical_input_order(node_class):
     for section in ("required", "optional"):
         section_dict = spec.get(section, {}) or {}
         for name, decl in section_dict.items():
-            # decl is usually a tuple/list: (TYPE, {options...}) or just (TYPE,)
             declared_type = decl[0] if isinstance(decl, (list, tuple)) and decl else None
             order.append((name, declared_type))
     return order
