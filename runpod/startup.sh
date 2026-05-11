@@ -230,6 +230,57 @@ else
     fi
 fi
 
+# -----------------------------------------------------------------------------
+# Framework deps (torch cu130 + NVIDIA libs + sageattention) — install ONCE
+# per fresh volume, never again. Even an "Already satisfied" `pip install
+# --upgrade torch` against the cu130 index takes 60-120s for the network
+# round-trip; running it on every boot just because rs-nodes added a node
+# burns minutes for no reason.
+#
+# Marker: /workspace/.framework_installed. Auto-detect existing good
+# installs (writes marker without reinstall). To force a fresh framework
+# install (e.g. moving to a newer torch wheel), delete the marker and
+# restart.
+# -----------------------------------------------------------------------------
+FRAMEWORK_MARKER="$WORKSPACE/.framework_installed"
+if [ ! -f "$FRAMEWORK_MARKER" ]; then
+    # Detect: torch at cu130 + sageattention importable = framework is good,
+    # just missing the marker (e.g. installed by older bootstrap). Skip the
+    # reinstall and write the marker so next boot fast-paths.
+    if python -c "
+import sys, torch
+import sageattention  # noqa
+assert 'cu130' in torch.__version__, f'torch is {torch.__version__}, not cu130'
+" 2>/dev/null; then
+        log "Framework already installed (torch cu130 + sageattention detected); writing marker."
+        touch "$FRAMEWORK_MARKER"
+    else
+        log "Installing framework stack (one-time, ~60-120s)..."
+        log "  PyTorch cu130 wheels..."
+        pip install --upgrade --no-cache-dir \
+            --index-url https://download.pytorch.org/whl/cu130 \
+            torch torchvision torchaudio || \
+            log "WARN: PyTorch cu130 upgrade failed; running on stock cu128"
+
+        log "  NVIDIA CUDA runtime libraries (NVRTC + cuDNN + cuBLAS)..."
+        pip install --no-cache-dir \
+            nvidia-cuda-nvrtc \
+            nvidia-cuda-runtime \
+            nvidia-cublas \
+            nvidia-cudnn || \
+            log "WARN: CUDA runtime libs install failed; JIT kernels may crash"
+
+        log "  SageAttention..."
+        pip install --no-cache-dir sageattention || \
+            log "WARN: SageAttention install failed; using stock PyTorch attention"
+
+        touch "$FRAMEWORK_MARKER"
+        log "Framework marker written: $FRAMEWORK_MARKER"
+    fi
+fi
+
+# App requirements (ComfyUI + rs-nodes + rose-opt) — hash-gated. Re-run
+# only when one of the requirements.txt files actually changes.
 if [ "$FAST_PATH" != "1" ]; then
     log "Installing ComfyUI Python deps..."
     pip install --no-cache-dir -r "$COMFY_DIR/requirements.txt" || \
@@ -245,33 +296,6 @@ if [ "$FAST_PATH" != "1" ]; then
     log "Ensuring ROSE optimizer..."
     pip install --no-cache-dir rose-opt || \
         log "WARN: ROSE install failed (only needed for training)"
-
-    # Performance stack:
-    #   * Upgrade PyTorch to cu130 wheels — Blackwell (RTX 50xx / PRO 6000)
-    #     hardware fp8 paths and comfy-kitchen's cuda+triton backends require
-    #     it. Stock RunPod pytorch image ships cu128 which leaves these
-    #     disabled (only the slow eager backend runs). Idempotent: pip
-    #     skips when already at the right version.
-    #   * SageAttention — 30-50% faster attention than vanilla PyTorch SDPA.
-    #     ComfyUI auto-detects and uses it.
-    log "Ensuring PyTorch cu130 wheels (Blackwell perf path)..."
-    pip install --upgrade --no-cache-dir \
-        --index-url https://download.pytorch.org/whl/cu130 \
-        torch torchvision torchaudio || \
-        log "WARN: PyTorch cu130 upgrade failed; running on stock cu128"
-
-    # cu130 PyTorch needs the matching NVRTC + companion runtime libs
-    # for JIT-compiled kernels (e.g. torchaudio spectrogram's complex abs).
-    # Without these, runs crash with "failed to open libnvrtc-builtins.so.13.0".
-    # NVIDIA deprecated the -cu13 suffixed packages; use the unsuffixed
-    # names which now ship the cu13-compatible builds.
-    log "Ensuring NVIDIA CUDA runtime libraries..."
-    pip install --no-cache-dir \
-        nvidia-cuda-nvrtc \
-        nvidia-cuda-runtime \
-        nvidia-cublas \
-        nvidia-cudnn || \
-        log "WARN: CUDA runtime libs install failed; JIT kernels may crash"
 fi
 
 # LD_LIBRARY_PATH must be computed every boot — env vars don't persist
@@ -340,27 +364,44 @@ if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ]; then
     nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
         ollama serve >/workspace/ollama.log 2>&1 &
 
-    # First-time-only: wait for ollama to be up, pull required models,
-    # write a marker. On all subsequent boots, skip the wait+pull
-    # entirely — models are already on the volume, and Ollama itself
-    # comes up in the background; ComfyUI doesn't need to wait for it.
-    # Saves up to 30s on every warm boot.
+    # Ollama models marker — only do first-time wait+pull if the marker
+    # is missing AND the models aren't already on disk. Auto-detects
+    # pre-existing model directories on the volume (from a previous
+    # bootstrap that didn't write the marker) and writes the marker
+    # without re-pulling.
     OLLAMA_READY_MARKER="$WORKSPACE/.ollama_ready"
+    OLLAMA_MODEL_LIST="${OLLAMA_MODEL:-gemma4:31b gemma4:26b}"
     if [ ! -f "$OLLAMA_READY_MARKER" ]; then
-        OLLAMA_MODEL_LIST="${OLLAMA_MODEL:-gemma4:31b gemma4:26b}"
-        log "First-time ollama setup — waiting for server then pulling: $OLLAMA_MODEL_LIST"
-        for i in $(seq 1 15); do
-            curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1 && break
-            sleep 2
-        done
+        # Quick filesystem check: do the model blob dirs exist on the volume?
+        # If so, no need to wait+pull; just write the marker.
+        ALL_PRESENT=1
         for model in $OLLAMA_MODEL_LIST; do
-            if ! ollama list | awk 'NR>1 {print $1}' | grep -Fxq "$model"; then
-                log "Pulling Ollama model: $model"
-                ollama pull "$model" || log "WARN: pull failed for $model"
+            # ollama stores model manifest under ~/.ollama/models/manifests/registry.ollama.ai/library/<model>/<tag>
+            name="${model%%:*}"
+            tag="${model##*:}"
+            if [ ! -f "$OLLAMA_MODELS/manifests/registry.ollama.ai/library/$name/$tag" ]; then
+                ALL_PRESENT=0
+                break
             fi
         done
-        touch "$OLLAMA_READY_MARKER"
-        log "Wrote ollama ready marker."
+        if [ "$ALL_PRESENT" = "1" ]; then
+            log "Ollama models already on volume; writing ready marker without pull."
+            touch "$OLLAMA_READY_MARKER"
+        else
+            log "First-time ollama setup — waiting for server then pulling: $OLLAMA_MODEL_LIST"
+            for i in $(seq 1 15); do
+                curl -fsS "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1 && break
+                sleep 2
+            done
+            for model in $OLLAMA_MODEL_LIST; do
+                if ! ollama list | awk 'NR>1 {print $1}' | grep -Fxq "$model"; then
+                    log "Pulling Ollama model: $model"
+                    ollama pull "$model" || log "WARN: pull failed for $model"
+                fi
+            done
+            touch "$OLLAMA_READY_MARKER"
+            log "Wrote ollama ready marker."
+        fi
     fi
 fi
 
