@@ -35,7 +35,7 @@ _DEBUG = True
 
 # Bumped whenever the conversion logic changes — printed on import so
 # the operator can confirm which version Comfy actually loaded.
-_VERSION = "2"
+_VERSION = "3"
 print(f"[rs/uitoapi] version {_VERSION} loaded (debug={_DEBUG})")
 
 
@@ -276,14 +276,21 @@ def _convert_node(node, link_by_dest, warnings):
     tagged_widgets = [
         inp for inp in workflow_inputs if inp.get("widget") is not None
     ]
-    widget_order = []  # list of (name, is_promoted)
+    # widget_order entries are (name, is_promoted, declared_type).
+    # declared_type is needed for the type-aware padding skip below
+    # — ComfyUI v3-IO custom nodes serialize widgets_values with
+    # extra '' padding slots scattered between real widget values,
+    # and we need the expected type to know when to skip them.
+    widget_order = []
     widget_source = "tagged_widgets"
     if tagged_widgets:
         for inp in tagged_widgets:
             name = inp.get("name") or (inp.get("widget") or {}).get("name")
             if not name:
                 continue
-            widget_order.append((name, inp.get("link") is not None))
+            widget_order.append(
+                (name, inp.get("link") is not None, inp.get("type"))
+            )
     else:
         # Legacy fallback: derive widget order from INPUT_TYPES.
         widget_source = "input_types_fallback"
@@ -309,7 +316,9 @@ def _convert_node(node, link_by_dest, warnings):
         for name, declared_type in canonical:
             if not _is_widget_type(declared_type):
                 continue
-            widget_order.append((name, promoted.get(name, False)))
+            widget_order.append(
+                (name, promoted.get(name, False), declared_type)
+            )
 
     if _DEBUG:
         print(
@@ -325,30 +334,82 @@ def _convert_node(node, link_by_dest, warnings):
     # in widgets_values, so the cursor advances either way. The
     # frontend writes the widget's current value into that slot even
     # though the actual runtime value comes from the link.
+    #
+    # ComfyUI v3-IO custom nodes (RSLTXVGenerate etc.) serialize
+    # extra '' padding slots between real widget values — observed
+    # 9 extras in a 54-entry array for a 45-widget node. To stay
+    # aligned we type-check each slot: when the expected widget type
+    # is numeric / boolean / combo, an empty string is treated as
+    # padding and skipped.
+    #
+    # Also handles ComfyUI's auto-injected control_after_generate
+    # widget that gets inserted into widgets_values after every
+    # seed / noise_seed INT widget but is NOT tagged in inputs[].
     cursor = 0
-    for name, is_promoted in widget_order:
-        if not is_promoted:
-            if cursor < len(widgets_values):
+    for name, is_promoted, declared_type in widget_order:
+        # Skip over any padding slots that can't be this widget's value.
+        while cursor < len(widgets_values) and not _value_matches_type(
+            widgets_values[cursor], declared_type
+        ):
+            cursor += 1
+        if cursor < len(widgets_values):
+            if not is_promoted:
                 api_inputs[name] = widgets_values[cursor]
-            else:
-                warnings.append(
-                    f"node {node_id} ({node_type}): widget '{name}' "
-                    f"requested cursor {cursor} but widgets_values has "
-                    f"only {len(widgets_values)} entries"
-                )
-        cursor += 1
-        # Auto-injected control_after_generate sits after seed widgets
-        # in widgets_values without a corresponding inputs[] / class
-        # entry, so we skip it. Modern saves include it as a tagged
-        # widget in inputs[] (handled by the main path above); this
-        # only kicks in for legacy saves where the tag is missing.
-        if not tagged_widgets and _has_auto_control_after_generate(name):
+            cursor += 1
+        elif not is_promoted:
+            warnings.append(
+                f"node {node_id} ({node_type}): widget '{name}' "
+                f"requested cursor {cursor} but widgets_values has "
+                f"only {len(widgets_values)} entries"
+            )
+        # Auto-injected control_after_generate sits after every seed /
+        # noise_seed widget in widgets_values regardless of whether
+        # it's tagged in inputs[]. Always skip the slot — the value is
+        # a frontend-only "fixed / increment / decrement / randomize"
+        # control that the runner doesn't need.
+        if _has_auto_control_after_generate(name):
             cursor += 1
 
     return str(node_id), {
         "class_type": node_type,
         "inputs": api_inputs,
     }
+
+
+def _value_matches_type(value, declared_type):
+    """Return True when `value` could plausibly be the saved widget
+    value for an input of `declared_type`. Used to step the
+    widgets_values cursor past padding slots that v3-IO nodes
+    sometimes serialize between real widget values.
+
+    The padding pattern we've observed: empty strings ('') wedged
+    between numeric / boolean / combo widgets. Real values for
+    those types are never empty strings, so '' is a strong padding
+    signal. STRING-typed widgets legitimately allow empty values
+    (guide_index_list defaults to ''), so we accept anything there.
+    """
+    # Booleans must be Python bool — empty strings / numbers / etc.
+    # are all padding.
+    if declared_type == "BOOLEAN":
+        return isinstance(value, bool)
+    # Numeric — int / float (but NOT bool, which is a numeric
+    # subtype in Python).
+    if declared_type in ("INT", "FLOAT"):
+        if isinstance(value, bool):
+            return False
+        return isinstance(value, (int, float))
+    # Combo (inline list of strings OR "COMBO" string from v3 IO).
+    # Real combo values are non-empty strings.
+    if isinstance(declared_type, (list, tuple)) or declared_type == "COMBO":
+        if isinstance(value, str) and value == "":
+            return False
+        return True
+    # STRING — anything (including '') is valid.
+    if declared_type == "STRING":
+        return True
+    # Custom widget types (lowercase strings) — accept anything,
+    # we don't have enough type info to discriminate.
+    return True
 
 
 def convert_ui_to_api(workflow):
