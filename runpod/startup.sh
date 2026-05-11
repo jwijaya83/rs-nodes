@@ -116,41 +116,87 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 1. ComfyUI install (one-time clone, every-boot pull)
+# 1+2. ComfyUI + rs-nodes — clone if missing, pull on every boot.
+#      Capture pre/post HEADs so we can detect whether anything actually
+#      changed. If nothing changed, the express path below skips every
+#      dependency check and launches ComfyUI in seconds.
 # -----------------------------------------------------------------------------
 if [ ! -d "$COMFY_DIR/.git" ]; then
     log "Cloning ComfyUI into $COMFY_DIR ..."
     git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
+    COMFY_PRE=""
 else
-    log "ComfyUI already present; pulling latest..."
-    git -C "$COMFY_DIR" pull --ff-only || \
-        log "WARN: git pull failed; continuing with current revision"
+    COMFY_PRE=$(git -C "$COMFY_DIR" rev-parse HEAD 2>/dev/null || echo "")
+    log "ComfyUI: pulling latest..."
+    git -C "$COMFY_DIR" pull --ff-only 2>&1 | sed 's/^/  /' || \
+        log "WARN: ComfyUI pull failed; continuing with current revision"
 fi
+COMFY_POST=$(git -C "$COMFY_DIR" rev-parse HEAD 2>/dev/null || echo "")
 
-# -----------------------------------------------------------------------------
-# 2. rs-nodes install (one-time clone, every-boot pull)
-# -----------------------------------------------------------------------------
 if [ ! -d "$RS_NODES_DIR/.git" ]; then
     log "Cloning rs-nodes into $RS_NODES_DIR ..."
     git clone https://github.com/richservo/rs-nodes.git "$RS_NODES_DIR"
+    RS_PRE=""
 else
-    log "rs-nodes already present; pulling latest..."
-    git -C "$RS_NODES_DIR" pull --ff-only || \
+    RS_PRE=$(git -C "$RS_NODES_DIR" rev-parse HEAD 2>/dev/null || echo "")
+    log "rs-nodes: pulling latest..."
+    git -C "$RS_NODES_DIR" pull --ff-only 2>&1 | sed 's/^/  /' || \
         log "WARN: rs-nodes pull failed; continuing with current revision"
 fi
-log "Updating rs-nodes submodules..."
-git -C "$RS_NODES_DIR" submodule update --init --recursive || \
+RS_POST=$(git -C "$RS_NODES_DIR" rev-parse HEAD 2>/dev/null || echo "")
+git -C "$RS_NODES_DIR" submodule update --init --recursive 2>&1 | sed 's/^/  /' || \
     log "WARN: submodule update failed"
 
-# Mirror pod-side helper scripts from rs-nodes/runpod/ to /workspace/
-# so Container Start Command + manual runs find them at the documented
-# paths even on a fresh container disk. git pull is the delivery channel
-# (works around wedged sshd / scp).
+# Mirror pod-side helper scripts so Container Start Command + manual runs
+# find them at the documented paths even on a fresh container disk.
 if [ -d "$RS_NODES_DIR/runpod" ]; then
-    log "Mirroring rs-nodes/runpod scripts to /workspace/"
     cp -f "$RS_NODES_DIR/runpod/"*.sh /workspace/ 2>/dev/null || true
     chmod +x /workspace/*.sh 2>/dev/null || true
 fi
+
+# -----------------------------------------------------------------------------
+# Express path — git tells us the truth about "did anything change?"
+# If neither ComfyUI nor rs-nodes moved AND all setup markers are
+# present, there is literally nothing to do except launch ComfyUI.
+# Skip every dependency check, every pip call, every ollama wait.
+#
+# Activate venv, compute LD_LIBRARY_PATH (env vars don't survive
+# container restarts), spawn ollama in background, exec ComfyUI.
+# -----------------------------------------------------------------------------
+if [ -n "$COMFY_PRE" ] && [ -n "$RS_PRE" ] && \
+   [ "$COMFY_PRE" = "$COMFY_POST" ] && [ "$RS_PRE" = "$RS_POST" ] && \
+   [ -f "$VENV/bin/python" ] && \
+   [ -f "$WORKSPACE/.framework_installed" ] && \
+   [ -f "$WORKSPACE/.provision_hash" ] && \
+   [ -f "$WORKSPACE/.ollama_ready" ]; then
+    log "Express path: no git updates + all markers present. Launching ComfyUI immediately."
+    # shellcheck disable=SC1091
+    source "$VENV/bin/activate"
+
+    # LD_LIBRARY_PATH must be recomputed every boot (env vars don't persist).
+    NV_LIB_PATHS=$(python -c "
+import nvidia, os
+r = os.path.dirname(nvidia.__file__)
+print(':'.join(os.path.join(r, d, 'lib') for d in sorted(os.listdir(r))
+               if os.path.isdir(os.path.join(r, d, 'lib'))))
+" 2>/dev/null || echo "")
+    [ -n "$NV_LIB_PATHS" ] && export LD_LIBRARY_PATH="$NV_LIB_PATHS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+    # Spawn ollama in background (best effort)
+    if [ "${RS_INSTALL_OLLAMA:-1}" = "1" ] && command -v ollama >/dev/null 2>&1; then
+        export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
+        export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+        nohup env OLLAMA_MODELS="$OLLAMA_MODELS" OLLAMA_HOST="$OLLAMA_HOST" \
+            ollama serve >/workspace/ollama.log 2>&1 &
+    fi
+
+    cd "$COMFY_DIR"
+    COMFY_EXTRA_ARGS="${COMFY_EXTRA_ARGS:---highvram}"
+    log "Launching ComfyUI on 0.0.0.0:${PORT}  (express, args: $COMFY_EXTRA_ARGS)"
+    exec "$VENV/bin/python" main.py --listen 0.0.0.0 --port "$PORT" $COMFY_EXTRA_ARGS "$@"
+fi
+
+log "Updates or missing markers detected — running full setup pass."
 
 # -----------------------------------------------------------------------------
 # 2.6. Persistent venv on the network volume
