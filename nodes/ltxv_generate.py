@@ -200,10 +200,22 @@ class RSLTXVGenerate:
         base_shift=0.95,
         **kwargs,
     ):
-        # The frontend (web/ltxv_generate.js) resolves seed_mode before queue
-        # submission so the rolled seed lives in the workflow JSON / embedded
-        # output metadata. Backend just trusts noise_seed as-is.
-        seed = noise_seed
+        # Roll seed_mode in the backend BEFORE inference. The JS pre-roll
+        # in web/seed_roll.js only fires when queueing from ComfyUI's
+        # browser UI; API-driven clients (rs-studio, scripts, anything
+        # POSTing to /prompt directly) bypass that, so seed_mode would
+        # otherwise be a no-op for them. Doing the roll here makes
+        # seed_mode='random' / 'increment' / 'decrement' actually do what
+        # the name says regardless of how the prompt was submitted.
+        SEED_MAX = 0xffffffffffffffff
+        if seed_mode == "random":
+            seed = random.randint(0, SEED_MAX)
+        elif seed_mode == "increment" and self._last_seed is not None:
+            seed = (self._last_seed + 1) % SEED_MAX
+        elif seed_mode == "decrement" and self._last_seed is not None:
+            seed = (self._last_seed - 1) % SEED_MAX
+        else:
+            seed = noise_seed
         self._last_seed = seed
         logger.info(f"Starting generation (seed={seed}, mode={seed_mode})")
         try:
