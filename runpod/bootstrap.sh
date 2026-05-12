@@ -158,8 +158,19 @@ banner "Phase 2/7  Python deps (ComfyUI + rs-nodes + ROSE)"
 # Persistent venv on the network volume so installs survive container
 # resets. --system-site-packages inherits CUDA / system libs from the
 # base image while letting us override pkg versions in the venv.
-if [ ! -f "$VENV/bin/python" ]; then
-    log "Creating venv at $VENV (one-time)"
+#
+# Check BOTH python and activate — `python3 -m venv` isn't atomic, so
+# a container restart mid-creation leaves bin/python without bin/
+# activate, which then boot-loops the pod (Phase 2 skips creation,
+# fails on source activate, container exits, restart, repeat). If
+# either file is missing or empty, wipe and rebuild.
+if [ ! -s "$VENV/bin/python" ] || [ ! -s "$VENV/bin/activate" ]; then
+    if [ -e "$VENV" ]; then
+        log "Existing venv at $VENV is incomplete (bin/python or bin/activate missing); rebuilding"
+        rm -rf "$VENV"
+    else
+        log "Creating venv at $VENV (one-time)"
+    fi
     python3 -m venv --system-site-packages "$VENV"
 fi
 # shellcheck disable=SC1091
