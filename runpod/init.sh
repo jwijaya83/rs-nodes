@@ -31,17 +31,28 @@ mkdir -p "$WORKSPACE"
 # account-level Settings -> SSH Public Keys) lose SSH access entirely.
 # Re-implement the hook here, before the fast-path branch, so it runs
 # whether we go straight to startup.sh or fall through to bootstrap.sh.
-if [ -n "${PUBLIC_KEY:-}" ]; then
-    mkdir -p /root/.ssh /workspace/.ssh
-    chmod 700 /root/.ssh /workspace/.ssh
-    touch /root/.ssh/authorized_keys
-    chmod 600 /root/.ssh/authorized_keys
-    if ! grep -qxF "$PUBLIC_KEY" /root/.ssh/authorized_keys 2>/dev/null; then
-        echo "[init] Installing PUBLIC_KEY env-var pubkey into authorized_keys"
-        echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
+#
+# Picks up ANY env var starting with PUBLIC_KEY — so PUBLIC_KEY plus
+# PUBLIC_KEY_2, PUBLIC_KEY_BOB, etc. all get added. Lets you share a
+# pod with another artist without touching account-level settings:
+# just add their pubkey as another PUBLIC_KEY_* env var.
+mkdir -p /root/.ssh /workspace/.ssh
+chmod 700 /root/.ssh /workspace/.ssh
+touch /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+keys_added=0
+for var in $(compgen -e | grep -E '^PUBLIC_KEY' | sort); do
+    key="${!var}"
+    [ -z "$key" ] && continue
+    if ! grep -qxF "$key" /root/.ssh/authorized_keys 2>/dev/null; then
+        echo "[init] Installing $var pubkey into authorized_keys"
+        echo "$key" >> /root/.ssh/authorized_keys
+        keys_added=$((keys_added + 1))
     fi
-    # Mirror to the volume so bootstrap.sh Phase 0.5 picks it up as the
-    # canonical source instead of overwriting it.
+done
+if [ "$keys_added" -gt 0 ]; then
+    # Mirror to the volume so bootstrap.sh Phase 0.5 picks it up as
+    # the canonical source instead of overwriting it.
     cp /root/.ssh/authorized_keys /workspace/.ssh/authorized_keys
     chmod 600 /workspace/.ssh/authorized_keys
 fi
