@@ -24,6 +24,65 @@ DONE_MARKER="$WORKSPACE/.bootstrap_done"
 
 mkdir -p "$WORKSPACE"
 
+# Honor RunPod's PUBLIC_KEY env-var convention on every boot. RunPod's
+# stock init copies $PUBLIC_KEY into /root/.ssh/authorized_keys, but
+# our init.sh replaces the stock start command so that hook never
+# fires — meaning users who set the pubkey via env var (instead of
+# account-level Settings -> SSH Public Keys) lose SSH access entirely.
+# Re-implement the hook here, before the fast-path branch, so it runs
+# whether we go straight to startup.sh or fall through to bootstrap.sh.
+#
+# Picks up ANY env var starting with PUBLIC_KEY — so PUBLIC_KEY plus
+# PUBLIC_KEY_2, PUBLIC_KEY_BOB, etc. all get added. Lets you share a
+# pod with another artist without touching account-level settings:
+# just add their pubkey as another PUBLIC_KEY_* env var.
+#
+# Behavior is REBUILD, not append: every boot we reconstruct
+# /root/.ssh/authorized_keys from the union of (whatever was already
+# there — typically RunPod's account-level injection) + (all
+# PUBLIC_KEY* env vars), dedupe, then mirror to /workspace
+# unconditionally. This way:
+#   * stale /workspace cache can't override fresh env-var changes
+#     via bootstrap.sh Phase 0.5's restore-from-volume logic
+#   * a PUBLIC_KEY env var change (rotate, add another artist) takes
+#     effect on the next pod restart with no manual intervention
+#   * account-level RunPod pubkeys (if any) survive
+#   * Windows-paste artifacts (CRLF, trailing spaces) get sanitized
+#     so sshd doesn't silently reject them
+mkdir -p /root/.ssh /workspace/.ssh
+chmod 700 /root/.ssh /workspace/.ssh
+
+AK_TMP=$(mktemp)
+# Start with whatever's already in /root/.ssh/authorized_keys —
+# that's where RunPod's account-level Settings keys land (if the
+# user is using that mechanism in addition to env vars).
+[ -f /root/.ssh/authorized_keys ] && cat /root/.ssh/authorized_keys >> "$AK_TMP" || true
+# Add every PUBLIC_KEY* env var, one per line, with line endings
+# normalized (strip \r so a CRLF-pasted value doesn't end up with
+# a literal \r in the comment, which sshd silently rejects).
+for var in $(compgen -e | grep -E '^PUBLIC_KEY' || true); do
+    key="${!var}"
+    [ -z "$key" ] && continue
+    # tr -d '\r' strips Windows CRs; sed trims trailing whitespace
+    sanitized=$(printf '%s\n' "$key" | tr -d '\r' | sed 's/[[:space:]]*$//')
+    [ -z "$sanitized" ] && continue
+    echo "[init] Installing $var pubkey into authorized_keys"
+    printf '%s\n' "$sanitized" >> "$AK_TMP"
+done
+# Dedupe (drop blank lines + exact duplicates, preserve order)
+awk 'NF && !seen[$0]++' "$AK_TMP" > /root/.ssh/authorized_keys
+rm -f "$AK_TMP"
+chmod 600 /root/.ssh/authorized_keys
+
+# ALWAYS mirror to the volume — bootstrap.sh Phase 0.5 restores
+# authorized_keys from /workspace, so /workspace must reflect the
+# fresh /root we just built. Without this, a stale /workspace copy
+# from a previous bootstrap can wipe out the env-var keys.
+cp /root/.ssh/authorized_keys /workspace/.ssh/authorized_keys
+chmod 600 /workspace/.ssh/authorized_keys
+
+echo "[init] authorized_keys has $(wc -l < /root/.ssh/authorized_keys) key(s)"
+
 # Subsequent-boot fast path: bootstrap fully completed at least once
 # (marker written by bootstrap.sh at the end of Phase 6).
 #
