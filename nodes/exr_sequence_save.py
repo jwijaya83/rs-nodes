@@ -5,6 +5,11 @@ auto-incrementing directory under the ComfyUI output folder. Float32
 pixel values are preserved (no clamping), so HDR / LogC content keeps
 its full dynamic range. Daisy-chain compatible: passes images and audio
 through so a ProRes/MP4 saver can follow the same graph.
+
+Backend: official OpenEXR Python bindings (`pip install OpenEXR Imath`).
+Uses those rather than cv2 because opencv-python's prebuilt wheels ship
+with the EXR codec disabled, and there's no way to enable it after cv2
+is imported (the codec state is baked in at C-extension load time).
 """
 
 import logging
@@ -67,14 +72,26 @@ class RSEXRSequenceSave:
                           bit_depth="16", compression="zip",
                           frame_padding=6, runpod=False,
                           pull_server_url="http://localhost:8765/pull"):
-        import cv2
         import numpy as np
         import folder_paths
         from ..utils import runpod_staging
 
-        # OpenCV needs the OPENCV_IO_ENABLE_OPENEXR flag on some builds —
-        # set it before writing in case the calling process hasn't.
-        os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+        # Use the official OpenEXR Python bindings instead of cv2.
+        # cv2's prebuilt wheels (opencv-python 4.13.0 on Windows in
+        # particular) ship with the OpenEXR codec disabled at build
+        # time — you get a runtime "OpenEXR codec is disabled" error
+        # that no env var can fix once cv2 is loaded. OpenEXR is the
+        # canonical pure-EXR library, has prebuilt wheels for every
+        # major platform, and doesn't care about cv2's state.
+        try:
+            import OpenEXR
+            import Imath
+        except ImportError as e:
+            raise RuntimeError(
+                "RSEXRSequenceSave requires the OpenEXR Python lib. Install it in "
+                "your ComfyUI venv:  pip install OpenEXR Imath\n"
+                f"(Underlying error: {e})"
+            ) from e
 
         # Resolve base output path. runpod=True overrides to a per-run
         # staging directory; the user-specified output_dir is captured
@@ -130,26 +147,25 @@ class RSEXRSequenceSave:
         out_dir = os.path.join(base, dirname)
         os.makedirs(out_dir, exist_ok=True)
 
-        # Compression + pixel type constants, guarded so we fall back to
-        # sane defaults if the OpenCV build doesn't expose them.
-        def _cv2const(name, default):
-            return getattr(cv2, name, default)
-
-        compression_map = {
-            "none": _cv2const("IMWRITE_EXR_COMPRESSION_NO", 0),
-            "rle": _cv2const("IMWRITE_EXR_COMPRESSION_RLE", 1),
-            "zips": _cv2const("IMWRITE_EXR_COMPRESSION_ZIPS", 2),
-            "zip": _cv2const("IMWRITE_EXR_COMPRESSION_ZIP", 3),
-            "piz": _cv2const("IMWRITE_EXR_COMPRESSION_PIZ", 4),
-            "pxr24": _cv2const("IMWRITE_EXR_COMPRESSION_PXR24", 5),
+        # OpenEXR compression map. Strings line up with the node's UI
+        # dropdown; falls back to ZIP if the build doesn't have a
+        # particular variant (unlikely for the standard set).
+        comp_map = {
+            "none": Imath.Compression.NO_COMPRESSION,
+            "rle": Imath.Compression.RLE_COMPRESSION,
+            "zips": Imath.Compression.ZIPS_COMPRESSION,
+            "zip": Imath.Compression.ZIP_COMPRESSION,
+            "piz": Imath.Compression.PIZ_COMPRESSION,
+            "pxr24": Imath.Compression.PXR24_COMPRESSION,
         }
-        cv2_compression = compression_map.get(compression, compression_map["zip"])
-        exr_type = (
-            _cv2const("IMWRITE_EXR_TYPE_HALF", 1) if bit_depth == "16"
-            else _cv2const("IMWRITE_EXR_TYPE_FLOAT", 2)
+        exr_compression = Imath.Compression(comp_map.get(compression, comp_map["zip"]))
+        # half (16) = Imath.PixelType.HALF, full (32) = FLOAT.
+        pixel_type = Imath.PixelType(
+            Imath.PixelType.HALF if bit_depth == "16" else Imath.PixelType.FLOAT
         )
-        type_key = _cv2const("IMWRITE_EXR_TYPE", 48)
-        compression_key = _cv2const("IMWRITE_EXR_COMPRESSION", 49)
+        # numpy dtype matching the EXR per-pixel storage; we encode at
+        # that precision so the writer doesn't have to convert.
+        np_dtype = np.float16 if bit_depth == "16" else np.float32
 
         # Per-frame write. Pixel values are NOT clamped — HDR / LogC
         # content above 1.0 is preserved exactly as it came off the model.
@@ -157,29 +173,35 @@ class RSEXRSequenceSave:
         has_alpha = images.shape[-1] == 4
         padding = max(3, int(frame_padding))
         wrote = 0
+        # Channel set (DataWindow + Channels) is the same for every frame
+        # in a sequence, so build the header template once.
         for i in range(num_frames):
             frame = images[i].to(device="cpu", dtype=torch.float32).numpy()
-            # Tensor is RGB(A); OpenCV writes BGR(A). Reverse the colour
-            # axis in place with a view, then .copy() so imwrite gets a
-            # contiguous buffer.
-            if has_alpha:
-                frame = frame[..., [2, 1, 0, 3]].copy()
-            else:
-                frame = frame[..., [2, 1, 0]].copy()
+            # Tensor is RGB(A) in [B,H,W,C]. OpenEXR wants per-channel
+            # contiguous byte strings — slice each channel, cast to the
+            # target precision, then call .tobytes().
+            h, w = frame.shape[:2]
+            header = OpenEXR.Header(w, h)
+            header["compression"] = exr_compression
+            channels = ["R", "G", "B"] + (["A"] if has_alpha else [])
+            header["channels"] = {ch: Imath.Channel(pixel_type) for ch in channels}
+
+            channel_data = {}
+            for ch_idx, ch_name in enumerate(channels):
+                arr = np.ascontiguousarray(frame[..., ch_idx].astype(np_dtype))
+                channel_data[ch_name] = arr.tobytes()
 
             frame_path = os.path.join(out_dir, f"{name_base}_{i:0{padding}d}.exr")
-            params = [
-                int(compression_key), int(cv2_compression),
-                int(type_key), int(exr_type),
-            ]
-            ok = cv2.imwrite(frame_path, frame, params)
-            if not ok:
+            try:
+                out = OpenEXR.OutputFile(frame_path, header)
+                try:
+                    out.writePixels(channel_data)
+                finally:
+                    out.close()
+            except Exception as e:
                 raise RuntimeError(
-                    f"cv2.imwrite failed for {frame_path}. OpenCV may have "
-                    f"been built without OpenEXR support. Install "
-                    f"opencv-python (not the headless variant) or use "
-                    f"`pip install opencv-contrib-python`."
-                )
+                    f"OpenEXR write failed for {frame_path}: {e}"
+                ) from e
             wrote += 1
 
         logger.info(

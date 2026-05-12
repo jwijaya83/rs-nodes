@@ -10,6 +10,12 @@ pyyaml
 pillow-heif
 imageio>=2.37.0
 imageio-ffmpeg>=0.6.0
+# RSEXRSequenceSave uses the official ASWF Python bindings instead of
+# cv2 because opencv-python's prebuilt wheels ship with the EXR codec
+# disabled (the OPENCV_IO_ENABLE_OPENEXR env var has to fire before
+# cv2 imports, and even then some builds simply lack the codec).
+OpenEXR
+Imath
 safetensors>=0.5.0
 scenedetect>=0.6.5.2
 av>=14.2.1
