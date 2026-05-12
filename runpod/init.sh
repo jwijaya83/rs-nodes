@@ -24,6 +24,28 @@ DONE_MARKER="$WORKSPACE/.bootstrap_done"
 
 mkdir -p "$WORKSPACE"
 
+# Honor RunPod's PUBLIC_KEY env-var convention on every boot. RunPod's
+# stock init copies $PUBLIC_KEY into /root/.ssh/authorized_keys, but
+# our init.sh replaces the stock start command so that hook never
+# fires — meaning users who set the pubkey via env var (instead of
+# account-level Settings -> SSH Public Keys) lose SSH access entirely.
+# Re-implement the hook here, before the fast-path branch, so it runs
+# whether we go straight to startup.sh or fall through to bootstrap.sh.
+if [ -n "${PUBLIC_KEY:-}" ]; then
+    mkdir -p /root/.ssh /workspace/.ssh
+    chmod 700 /root/.ssh /workspace/.ssh
+    touch /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    if ! grep -qxF "$PUBLIC_KEY" /root/.ssh/authorized_keys 2>/dev/null; then
+        echo "[init] Installing PUBLIC_KEY env-var pubkey into authorized_keys"
+        echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
+    fi
+    # Mirror to the volume so bootstrap.sh Phase 0.5 picks it up as the
+    # canonical source instead of overwriting it.
+    cp /root/.ssh/authorized_keys /workspace/.ssh/authorized_keys
+    chmod 600 /workspace/.ssh/authorized_keys
+fi
+
 # Subsequent-boot fast path: bootstrap fully completed at least once
 # (marker written by bootstrap.sh at the end of Phase 6).
 #
