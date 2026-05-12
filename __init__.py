@@ -1,3 +1,11 @@
+# OpenCV reads OPENCV_IO_ENABLE_OPENEXR at IMPORT time — setting it
+# later (inside the EXR save node's function body) is too late on
+# the opencv-python builds that ship with this disabled by default.
+# Setting it here, before any node module imports cv2 transitively,
+# guarantees the EXR codec is registered when imwrite runs.
+import os
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
 from .nodes.prompt_parser import RSPromptParser
 from .nodes.audio_concat import RSAudioConcat
 from .nodes.prompt_formatter import RSPromptFormatter
